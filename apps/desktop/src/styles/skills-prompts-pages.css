@@ -673,10 +673,6 @@
   border-color: #5944d5;
 }
 
-.cx-prompts-heading > p {
-  color: var(--cx-prompt-accent);
-}
-
 .cx-prompts-mode-panel {
   position: relative;
   min-width: 0;

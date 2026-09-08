@@ -1,3 +1,6 @@
+use super::official_profiles::{
+    has_named_profiles, selected_profile_id, DEFAULT_OFFICIAL_PROFILE_ID,
+};
 use crate::backups::{action_backup_root, BackupMeta};
 use crate::error::{CodexxError, Result};
 use crate::file_io::{ensure_directory, io_err, parse_toml_document, write_private_json};
@@ -27,10 +30,10 @@ pub(crate) struct OfficialConfigCandidate {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OfficialConfigDraft {
-    auth_json: String,
-    config_text: String,
-    model: Option<String>,
-    source: String,
+    pub(crate) auth_json: String,
+    pub(crate) config_text: String,
+    pub(crate) model: Option<String>,
+    pub(crate) source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,11 +63,29 @@ fn canonical_identity(path: &Path) -> String {
 }
 
 pub(crate) fn official_snapshot_path(codex_dir: &Path) -> Result<PathBuf> {
+    let profile_id = selected_profile_id(codex_dir)?;
+    official_snapshot_path_for_profile(codex_dir, &profile_id)
+}
+
+pub(crate) fn official_snapshot_path_for_profile(
+    codex_dir: &Path,
+    profile_id: &str,
+) -> Result<PathBuf> {
+    if profile_id.trim().is_empty() {
+        return Err(CodexxError::Config("官方配置 ID 不能为空".to_string()));
+    }
     let identity = canonical_identity(codex_dir);
     let digest = Sha256::digest(identity.as_bytes());
-    Ok(app_home()?
-        .join("official-configs")
-        .join(format!("{digest:x}.json")))
+    let root = app_home()?.join("official-configs");
+    if profile_id == DEFAULT_OFFICIAL_PROFILE_ID {
+        // The built-in profile keeps the legacy recovery path so existing
+        // installations can restore their saved official login unchanged.
+        return Ok(root.join(format!("{digest:x}.json")));
+    }
+    let profile_digest = Sha256::digest(profile_id.as_bytes());
+    Ok(root
+        .join(format!("{digest:x}"))
+        .join(format!("{profile_digest:x}.json")))
 }
 
 fn value_has_material(value: &Value) -> bool {
@@ -306,7 +327,26 @@ fn write_snapshot(
     model: Option<String>,
     auth: Option<Value>,
 ) -> Result<()> {
-    let path = official_snapshot_path(codex_dir)?;
+    let profile_id = selected_profile_id(codex_dir)?;
+    write_official_profile_snapshot(codex_dir, &profile_id, config, model, auth)
+}
+
+pub(crate) fn write_official_profile_snapshot(
+    codex_dir: &Path,
+    profile_id: &str,
+    config: Option<String>,
+    model: Option<String>,
+    auth: Option<Value>,
+) -> Result<()> {
+    if auth
+        .as_ref()
+        .is_some_and(|auth| !auth.is_object() || !auth_value_has_material(auth))
+    {
+        return Err(CodexxError::Config(
+            "官方 auth.json 没有可用认证信息，请先完成官方登录".to_string(),
+        ));
+    }
+    let path = official_snapshot_path_for_profile(codex_dir, profile_id)?;
     if let Some(parent) = path.parent() {
         ensure_directory(parent)?;
     }
@@ -329,14 +369,10 @@ pub(crate) fn save_official_config_snapshot(
     model: Option<String>,
     auth: &Value,
 ) -> Result<()> {
-    if !auth.is_object() || !auth_value_has_material(auth) {
-        return Err(CodexxError::Config(
-            "官方 auth.json 没有可用认证信息，请先完成官方登录".to_string(),
-        ));
-    }
     write_snapshot(codex_dir, config, model, Some(auth.clone()))
 }
 
+#[cfg(test)]
 pub(crate) fn mark_official_config_reset(
     codex_dir: &Path,
     config: Option<String>,
@@ -370,7 +406,8 @@ pub(crate) fn capture_live_official_config_before_provider_switch(
         is_chatgpt_auth(auth) || (has_explicit_official_route && has_openai_api_key(auth))
     });
 
-    let previous = match load_snapshot(codex_dir)? {
+    let profile_id = selected_profile_id(codex_dir)?;
+    let previous = match load_snapshot_for_profile(codex_dir, &profile_id)? {
         SnapshotState::Ready(candidate) | SnapshotState::Reset(candidate) => Some(candidate),
         SnapshotState::Missing => None,
     };
@@ -387,11 +424,18 @@ pub(crate) fn capture_live_official_config_before_provider_switch(
     let previous_auth = previous
         .as_ref()
         .and_then(|candidate| candidate.auth.clone());
-    let auth = prefer_chatgpt_auth(live_auth, previous_auth);
+    let auth = if profile_id == DEFAULT_OFFICIAL_PROFILE_ID {
+        prefer_chatgpt_auth(live_auth, previous_auth)
+    } else {
+        // A named profile is the user's selected working configuration. Its
+        // current official login belongs to that profile, including an
+        // intentional change between OAuth and API-key authentication.
+        live_auth.or(previous_auth)
+    };
     if config.is_none() && auth.is_none() {
         return Ok(false);
     }
-    write_snapshot(codex_dir, config, model, auth)?;
+    write_official_profile_snapshot(codex_dir, &profile_id, config, model, auth)?;
     Ok(true)
 }
 
@@ -424,8 +468,8 @@ pub(crate) fn capture_live_chatgpt_config(codex_dir: &Path) -> Result<bool> {
     capture_live_official_auth(codex_dir, is_chatgpt_auth)
 }
 
-fn load_snapshot(codex_dir: &Path) -> Result<SnapshotState> {
-    let path = official_snapshot_path(codex_dir)?;
+fn load_snapshot_for_profile(codex_dir: &Path, profile_id: &str) -> Result<SnapshotState> {
+    let path = official_snapshot_path_for_profile(codex_dir, profile_id)?;
     if !path.is_file() {
         return Ok(SnapshotState::Missing);
     }
@@ -438,6 +482,18 @@ fn load_snapshot(codex_dir: &Path) -> Result<SnapshotState> {
     // truncated, stale, or incompatible cache must never block startup or a
     // provider switch; valid live auth/history can repair it on the next write.
     Ok(snapshot_state(codex_dir, &path, snapshot).unwrap_or(SnapshotState::Missing))
+}
+
+pub(crate) fn saved_official_profile_candidate(
+    codex_dir: &Path,
+    profile_id: &str,
+) -> Result<Option<OfficialConfigCandidate>> {
+    // Explicit account selection must never consult the live login or an
+    // unrelated historical backup, even when the requested snapshot is empty.
+    match load_snapshot_for_profile(codex_dir, profile_id)? {
+        SnapshotState::Ready(candidate) | SnapshotState::Reset(candidate) => Ok(Some(candidate)),
+        SnapshotState::Missing => Ok(None),
+    }
 }
 
 fn prefer_chatgpt_auth(primary: Option<Value>, fallback: Option<Value>) -> Option<Value> {
@@ -606,8 +662,11 @@ fn live_auth_candidate(
     }))
 }
 
-fn live_chatgpt_candidate(codex_dir: &Path) -> Result<Option<OfficialConfigCandidate>> {
-    live_auth_candidate(codex_dir, false, is_chatgpt_auth)
+fn live_chatgpt_candidate(
+    codex_dir: &Path,
+    allow_proxy_route: bool,
+) -> Result<Option<OfficialConfigCandidate>> {
+    live_auth_candidate(codex_dir, !allow_proxy_route, is_chatgpt_auth)
 }
 
 fn live_official_auth_candidate(codex_dir: &Path) -> Result<Option<OfficialConfigCandidate>> {
@@ -639,18 +698,42 @@ fn complete_candidate_config(
     Ok(candidate)
 }
 
+fn selected_named_profile_candidate(
+    codex_dir: &Path,
+    profile_id: &str,
+) -> Result<Option<OfficialConfigCandidate>> {
+    let saved = saved_official_profile_candidate(codex_dir, profile_id)?;
+    // The selected profile owns login/refreshes only while its official
+    // route is active. OAuth left under a proxy route may belong to a
+    // different account and must never replace an explicitly saved login.
+    if let Some(live) = live_official_auth_candidate(codex_dir)? {
+        return complete_candidate_config(codex_dir, live, saved.as_ref()).map(Some);
+    }
+    saved
+        .map(|candidate| complete_candidate_config(codex_dir, candidate, None))
+        .transpose()
+}
+
 pub(crate) fn official_config_candidate(
     codex_dir: &Path,
     include_history_after_reset: bool,
 ) -> Result<Option<OfficialConfigCandidate>> {
-    match load_snapshot(codex_dir)? {
+    let profile_id = selected_profile_id(codex_dir)?;
+    if profile_id != DEFAULT_OFFICIAL_PROFILE_ID {
+        return selected_named_profile_candidate(codex_dir, &profile_id);
+    }
+    // Legacy backups and OAuth left under proxy routes do not record which
+    // account they belong to. Keep their old recovery behavior only while
+    // there are no named accounts that they could be confused with.
+    let allow_legacy_recovery = !has_named_profiles(codex_dir)?;
+    match load_snapshot_for_profile(codex_dir, &profile_id)? {
         SnapshotState::Ready(candidate) => {
             // A third-party route may deliberately keep the user's ChatGPT
             // login in auth.json and carry its own key in
-            // experimental_bearer_token. Prefer that live OAuth value so a
-            // token refresh during proxy use is not replaced by an older
-            // official snapshot when switching back.
-            if let Some(live) = live_chatgpt_candidate(codex_dir)? {
+            // experimental_bearer_token. In legacy single-account mode,
+            // preserve token refreshes made during proxy use. With named
+            // profiles, only trust live OAuth under the official route.
+            if let Some(live) = live_chatgpt_candidate(codex_dir, allow_legacy_recovery)? {
                 return complete_candidate_config(codex_dir, live, Some(&candidate)).map(Some);
             }
             // Never let an API-key-only live file silently downgrade a trusted
@@ -664,11 +747,11 @@ pub(crate) fn official_config_candidate(
             }
             return complete_candidate_config(codex_dir, candidate, None).map(Some);
         }
-        SnapshotState::Reset(reset) if !include_history_after_reset => {
+        SnapshotState::Reset(reset) if !include_history_after_reset || !allow_legacy_recovery => {
             if let Some(live) = live_official_auth_candidate(codex_dir)? {
                 return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
             }
-            if let Some(live) = live_chatgpt_candidate(codex_dir)? {
+            if let Some(live) = live_chatgpt_candidate(codex_dir, allow_legacy_recovery)? {
                 return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
             }
             return complete_candidate_config(codex_dir, reset, None).map(Some);
@@ -677,7 +760,7 @@ pub(crate) fn official_config_candidate(
             if let Some(live) = live_official_auth_candidate(codex_dir)? {
                 return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
             }
-            if let Some(live) = live_chatgpt_candidate(codex_dir)? {
+            if let Some(live) = live_chatgpt_candidate(codex_dir, allow_legacy_recovery)? {
                 return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
             }
             if let Some(mut backup) = latest_official_backup(codex_dir)? {
@@ -692,8 +775,12 @@ pub(crate) fn official_config_candidate(
         SnapshotState::Missing => {}
     }
 
-    let backup = latest_official_backup(codex_dir)?;
-    if let Some(candidate) = live_chatgpt_candidate(codex_dir)? {
+    let backup = if allow_legacy_recovery {
+        latest_official_backup(codex_dir)?
+    } else {
+        None
+    };
+    if let Some(candidate) = live_chatgpt_candidate(codex_dir, allow_legacy_recovery)? {
         return complete_candidate_config(codex_dir, candidate, backup.as_ref()).map(Some);
     }
     backup
@@ -702,13 +789,17 @@ pub(crate) fn official_config_candidate(
 }
 
 pub(crate) fn official_auth_available(codex_dir: &Path) -> Result<bool> {
-    match load_snapshot(codex_dir)? {
+    let profile_id = selected_profile_id(codex_dir)?;
+    match load_snapshot_for_profile(codex_dir, &profile_id)? {
         SnapshotState::Ready(_) => return Ok(true),
         SnapshotState::Reset(_) => return Ok(live_official_auth_candidate(codex_dir)?.is_some()),
         SnapshotState::Missing => {}
     }
     if live_official_auth_candidate(codex_dir)?.is_some() {
         return Ok(true);
+    }
+    if profile_id != DEFAULT_OFFICIAL_PROFILE_ID || has_named_profiles(codex_dir)? {
+        return Ok(false);
     }
     if let Some(auth) = read_auth_value(&auth_path(codex_dir))? {
         if is_chatgpt_auth(&auth) {
@@ -720,6 +811,7 @@ pub(crate) fn official_auth_available(codex_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(test)]
 pub(crate) fn get_official_config_draft_inner(
     config_dir: Option<String>,
 ) -> Result<Option<OfficialConfigDraft>> {
@@ -740,6 +832,7 @@ pub(crate) fn get_official_config_draft_inner(
     official_config_draft(candidate).map(Some)
 }
 
+#[cfg(test)]
 fn official_config_draft(candidate: OfficialConfigCandidate) -> Result<OfficialConfigDraft> {
     let auth_json = candidate
         .auth
@@ -765,6 +858,302 @@ pub(crate) fn official_snapshot_path_for_test(codex_dir: &Path) -> Result<PathBu
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn profile_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codex-x-official-profile-{name}-{}-{}",
+            std::process::id(),
+            Local::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create profile test Codex directory");
+        path
+    }
+
+    #[test]
+    fn profile_snapshot_paths_keep_legacy_default_and_isolate_accounts_and_homes() {
+        let codex_dir = profile_test_dir("paths");
+        let other_home = profile_test_dir("other-home");
+        let digest = Sha256::digest(canonical_identity(&codex_dir).as_bytes());
+        let default_path =
+            official_snapshot_path_for_profile(&codex_dir, DEFAULT_OFFICIAL_PROFILE_ID)
+                .expect("default snapshot path");
+        assert_eq!(
+            default_path,
+            app_home()
+                .unwrap()
+                .join("official-configs")
+                .join(format!("{digest:x}.json"))
+        );
+        let first = official_snapshot_path_for_profile(&codex_dir, "account-a").unwrap();
+        let second = official_snapshot_path_for_profile(&codex_dir, "account-b").unwrap();
+        let elsewhere = official_snapshot_path_for_profile(&other_home, "account-a").unwrap();
+        assert_ne!(first, default_path);
+        assert_ne!(first, second);
+        assert_ne!(first, elsewhere);
+        assert_eq!(first.parent(), second.parent());
+        assert!(official_snapshot_path_for_profile(&codex_dir, " ").is_err());
+        fs::remove_dir_all(codex_dir).unwrap();
+        fs::remove_dir_all(other_home).unwrap();
+    }
+
+    #[test]
+    fn explicit_profile_snapshot_reads_never_borrow_other_auth_and_preserve_resets() {
+        let codex_dir = profile_test_dir("explicit-read");
+        let live_auth = json!({"tokens": {"access_token": "other-account"}});
+        fs::write(
+            config_path(&codex_dir),
+            "model_provider = \"openai\"\nmodel = \"live-model\"\n",
+        )
+        .unwrap();
+        fs::write(
+            auth_path(&codex_dir),
+            serde_json::to_vec(&live_auth).unwrap(),
+        )
+        .unwrap();
+        write_official_profile_snapshot(
+            &codex_dir,
+            DEFAULT_OFFICIAL_PROFILE_ID,
+            None,
+            None,
+            Some(live_auth),
+        )
+        .unwrap();
+        assert!(
+            saved_official_profile_candidate(&codex_dir, "missing-account")
+                .unwrap()
+                .is_none()
+        );
+
+        let profile_id = "saved-account";
+        let saved_auth = json!({"tokens": {"access_token": "saved-account"}});
+        write_official_profile_snapshot(
+            &codex_dir,
+            profile_id,
+            None,
+            Some("saved-model".to_string()),
+            Some(saved_auth.clone()),
+        )
+        .unwrap();
+        let candidate = saved_official_profile_candidate(&codex_dir, profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.auth, Some(saved_auth));
+        assert!(candidate.config_text.is_none());
+        assert_eq!(candidate.model.as_deref(), Some("saved-model"));
+
+        let path = official_snapshot_path_for_profile(&codex_dir, profile_id).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(write_official_profile_snapshot(
+            &codex_dir,
+            profile_id,
+            None,
+            None,
+            Some(json!({"auth_mode": "chatgpt"})),
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let reset_config = "model_provider = \"openai\"\nmodel = \"reset-model\"\n";
+        write_official_profile_snapshot(
+            &codex_dir,
+            profile_id,
+            Some(reset_config.to_string()),
+            Some("reset-model".to_string()),
+            None,
+        )
+        .unwrap();
+        let reset = saved_official_profile_candidate(&codex_dir, profile_id)
+            .unwrap()
+            .unwrap();
+        assert!(reset.auth.is_none());
+        assert_eq!(reset.config_text.as_deref(), Some(reset_config));
+
+        fs::remove_file(path).unwrap();
+        fs::remove_file(
+            official_snapshot_path_for_profile(&codex_dir, DEFAULT_OFFICIAL_PROFILE_ID).unwrap(),
+        )
+        .unwrap();
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn selected_named_profile_accepts_official_refresh_but_ignores_proxy_login() {
+        let codex_dir = profile_test_dir("refresh");
+        let profile_id = "selected-account";
+        let saved_config = "model_provider = \"openai\"\nmodel = \"saved-model\"\n";
+        let saved_auth = json!({"tokens": {"access_token": "saved-token"}});
+        let refreshed_auth = json!({"tokens": {"access_token": "refreshed-token"}});
+        write_official_profile_snapshot(
+            &codex_dir,
+            profile_id,
+            Some(saved_config.to_string()),
+            Some("saved-model".to_string()),
+            Some(saved_auth.clone()),
+        )
+        .unwrap();
+        fs::write(
+            config_path(&codex_dir),
+            "model_provider = \"custom\"\nmodel = \"proxy-model\"\n[model_providers.custom]\nname = \"Proxy\"\nbase_url = \"https://proxy.example/v1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            auth_path(&codex_dir),
+            serde_json::to_vec(&refreshed_auth).unwrap(),
+        )
+        .unwrap();
+        let candidate = selected_named_profile_candidate(&codex_dir, profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.auth, Some(saved_auth));
+        assert_eq!(candidate.config_text.as_deref(), Some(saved_config));
+
+        write_official_profile_snapshot(
+            &codex_dir,
+            profile_id,
+            Some(saved_config.to_string()),
+            Some("saved-model".to_string()),
+            None,
+        )
+        .unwrap();
+        assert!(selected_named_profile_candidate(&codex_dir, profile_id)
+            .unwrap()
+            .unwrap()
+            .auth
+            .is_none());
+
+        let live_config = "model_provider = \"openai\"\nmodel = \"fresh-model\"\n";
+        fs::write(config_path(&codex_dir), live_config).unwrap();
+        let refreshed = selected_named_profile_candidate(&codex_dir, profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.auth, Some(refreshed_auth));
+        assert_eq!(refreshed.config_text.as_deref(), Some(live_config));
+        let api_key_auth = json!({"OPENAI_API_KEY": "official-key"});
+        fs::write(
+            auth_path(&codex_dir),
+            serde_json::to_vec(&api_key_auth).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            selected_named_profile_candidate(&codex_dir, profile_id)
+                .unwrap()
+                .unwrap()
+                .auth,
+            Some(api_key_auth)
+        );
+        fs::remove_file(official_snapshot_path_for_profile(&codex_dir, profile_id).unwrap())
+            .unwrap();
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn default_profile_ignores_proxy_oauth_once_named_profiles_exist() {
+        let codex_dir = profile_test_dir("default-proxy-isolation");
+        let default_auth = json!({"tokens": {"access_token": "default-account"}});
+        let proxy_auth = json!({"tokens": {"access_token": "other-account"}});
+        let official_config = "model_provider = \"openai\"\nmodel = \"official-model\"\n";
+        fs::write(
+            config_path(&codex_dir),
+            "model_provider = \"custom\"\n[model_providers.custom]\nname = \"Proxy\"\nbase_url = \"https://proxy.example/v1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            auth_path(&codex_dir),
+            serde_json::to_vec(&proxy_auth).unwrap(),
+        )
+        .unwrap();
+        write_official_profile_snapshot(
+            &codex_dir,
+            DEFAULT_OFFICIAL_PROFILE_ID,
+            Some(official_config.to_string()),
+            Some("official-model".to_string()),
+            Some(default_auth.clone()),
+        )
+        .unwrap();
+
+        // Preserve existing single-account recovery of OAuth refreshed while
+        // a proxy route is active.
+        assert!(!has_named_profiles(&codex_dir).unwrap());
+        assert_eq!(
+            official_config_candidate(&codex_dir, false)
+                .unwrap()
+                .unwrap()
+                .auth,
+            Some(proxy_auth.clone())
+        );
+
+        let conn = crate::providers::open_store().unwrap();
+        let scope = crate::paths::normalized_path_scope(&codex_dir);
+        conn.execute(
+            "INSERT INTO official_profiles (codex_dir, id, provider_name, created_at, updated_at)
+             VALUES (?1, 'another-account', 'Another account', 'test', 'test')",
+            [&scope],
+        )
+        .unwrap();
+        assert!(has_named_profiles(&codex_dir).unwrap());
+        assert_eq!(
+            selected_profile_id(&codex_dir).unwrap(),
+            DEFAULT_OFFICIAL_PROFILE_ID
+        );
+        let saved = official_config_candidate(&codex_dir, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.auth, Some(default_auth));
+        assert_eq!(saved.config_text.as_deref(), Some(official_config));
+
+        write_official_profile_snapshot(
+            &codex_dir,
+            DEFAULT_OFFICIAL_PROFILE_ID,
+            Some(official_config.to_string()),
+            Some("official-model".to_string()),
+            None,
+        )
+        .unwrap();
+        for include_history in [false, true] {
+            assert!(official_config_candidate(&codex_dir, include_history)
+                .unwrap()
+                .unwrap()
+                .auth
+                .is_none());
+        }
+        assert!(!official_auth_available(&codex_dir).unwrap());
+
+        let default_path =
+            official_snapshot_path_for_profile(&codex_dir, DEFAULT_OFFICIAL_PROFILE_ID).unwrap();
+        fs::remove_file(default_path).unwrap();
+        for include_history in [false, true] {
+            assert!(official_config_candidate(&codex_dir, include_history)
+                .unwrap()
+                .is_none());
+        }
+        assert!(!official_auth_available(&codex_dir).unwrap());
+
+        // Login and refreshes performed in the selected official profile
+        // remain usable after multiple accounts have been added.
+        fs::write(config_path(&codex_dir), official_config).unwrap();
+        assert_eq!(
+            official_config_candidate(&codex_dir, false)
+                .unwrap()
+                .unwrap()
+                .auth,
+            Some(proxy_auth)
+        );
+        assert!(official_auth_available(&codex_dir).unwrap());
+        conn.execute(
+            "DELETE FROM official_profiles WHERE codex_dir = ?1",
+            [&scope],
+        )
+        .unwrap();
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
 
     #[test]
     fn legacy_oauth_without_auth_mode_is_trusted() {

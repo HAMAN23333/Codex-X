@@ -37,9 +37,10 @@ When you use Codex Desktop, the CLI, third-party APIs, and multiple prompts toge
 You can use it to:
 
 - Choose from the prompt library or import your own `.md`, then keep the existing prompt or replace it
-- Save, test, and switch between OpenAI Official and third-party APIs, including Providers imported from cc-switch
+- Manage multiple named official Codex login profiles and third-party APIs, duplicate or switch them with a click, and import Providers from cc-switch
 - Search and organize local sessions by project, check / automatically repair problems, and precisely delete sessions you no longer need
 - Manage Skills and MCP in one place, and inspect the current `config.toml`, `auth.json`, and operation backups
+- Explore token usage by date and model in Settings, with subagent usage attributed to its main conversation
 
 ## Preview
 
@@ -117,7 +118,7 @@ You can use it to:
   </tr>
   <tr>
     <td align="center">⚡ <b>Switch APIs / relays</b></td>
-    <td align="left">Save, test, and enable multiple third-party Providers, or import them from cc-switch; entries with the same endpoint and Key are merged automatically. Create or reopen a session after switching to apply the change without restarting the entire Codex client.</td>
+    <td align="left">Save multiple named official Codex login profiles alongside third-party Providers, with one-click duplication and switching. Third-party Providers support connection checks, model discovery / testing, and imports from cc-switch.</td>
   </tr>
   <tr>
     <td align="center">💬 <b>Organize local sessions</b></td>
@@ -129,7 +130,11 @@ You can use it to:
   </tr>
   <tr>
     <td align="center">📝 <b>Manage config and login</b></td>
-    <td align="left">Inspect the active Codex <code>config.toml</code> and <code>auth.json</code> in one place, with a clear distinction between official login credentials and third-party API Keys. Important writes are backed up automatically and can be restored when needed.</td>
+    <td align="left">Inspect <code>config.toml</code> and <code>auth.json</code> in one place. Both official and third-party profile editors offer an “Enable 1M context window” checkbox beside <code>config.toml>; it applies on save and requires model support. Important writes are backed up automatically.</td>
+  </tr>
+  <tr>
+    <td align="center">📊 <b>Track token usage</b></td>
+    <td align="left">Switch between General and Usage statistics in Settings. Filter local usage by date and model, explore daily trends, cache hit rate, and model distribution, and view the 10 most recent main conversations. Subagent usage is attributed to its main conversation and does not count as a separate session.</td>
   </tr>
   <tr>
     <td align="center">📦 <b>Use it across platforms</b></td>
@@ -238,7 +243,8 @@ A backup is created automatically before every enable or disable action. In addi
 > [!NOTE]
 > After enabling a new third-party Provider, create or reopen a Codex session to use the new relay. You do not need to restart the entire Codex client.
 
-- Save multiple third-party Providers and always see which one is currently active
+- Save multiple named official Codex login profiles and third-party Providers, and always see which one is currently active
+- Duplicate a profile immediately with one click, without a confirmation dialog or opening the editor; rename it whenever needed
 - Test an API endpoint before switching, and save or enable a configuration separately
 - Edit the Base URL, API Key, Model, Wire API, and complete TOML on the same page
 - cc-switch imports report added, updated, merged, and skipped entries; the same URL + Key is no longer shown more than once

@@ -38,9 +38,10 @@
 
 - 像管理插件一样管理提示词：分类、导入 Markdown、自定义编辑、一键启用 / 禁用
 - 内置 5 套提示词模板，同时支持用户把自己的提示词变成可视化模板库
-- 保存、测试并切换 OpenAI Official 与第三方 API，还能从 cc-switch 导入现有供应商
+- 管理多个可命名的官方 Codex 登录与第三方 API，一键复制、切换，并从 cc-switch 导入现有供应商
 - 同步、检查、搜索和删除本地会话，按项目路径整理 Codex 历史记录
 - 集中管理 Skills 与 MCP，查看当前 `config.toml`、`auth.json` 和操作备份
+- 在设置中按日期、模型查看 Token 用量趋势，子代理用量归入所属主会话
 
 ## 软件预览
 
@@ -97,7 +98,7 @@
   </tr>
   <tr>
     <td align="center"><b>Provider / API</b></td>
-    <td align="left">添加、编辑、启用、删除第三方供应商；支持连接检测、模型获取 / 测试、从 cc-switch 导入，并可在 OpenAI Official 与中转 API 之间切换。</td>
+    <td align="left">保存多个可命名的官方 Codex 登录配置，与第三方供应商统一管理、一键复制和切换；第三方供应商支持连接检测、模型获取 / 测试及从 cc-switch 导入。</td>
   </tr>
   <tr>
     <td align="center"><b>会话管理</b></td>
@@ -109,7 +110,11 @@
   </tr>
   <tr>
     <td align="center"><b>配置与登录</b></td>
-    <td align="left">集中查看 Codex 当前使用的 <code>config.toml</code> 与 <code>auth.json</code>，区分官方登录态和第三方 API Key；重要写入前自动备份。</td>
+    <td align="left">集中查看 <code>config.toml</code> 与 <code>auth.json</code>；官方登录和第三方供应商编辑页均可在 <code>config.toml</code> 旁勾选“开启 1M 上下文窗口”，保存后生效，需模型支持；重要写入前自动备份。</td>
+  </tr>
+  <tr>
+    <td align="center"><b>用量统计</b></td>
+    <td align="left">设置页提供“通用设置 / 用量统计”标签，按日期与模型筛选本地 Token 用量，查看每日趋势、缓存命中率、模型分布及最近 10 个主会话；子代理用量归入所属主会话，不单独计为会话。</td>
   </tr>
   <tr>
     <td align="center"><b>跨平台使用</b></td>
@@ -230,7 +235,8 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 > [!NOTE]
 > 启用新的第三方供应商后，新建或重新打开 Codex 会话即可使用新的中转，不需要重启整个 Codex 客户端。
 
-- 保存多个第三方供应商，随时查看当前正在使用哪一个
+- 保存多个可命名的官方 Codex 登录配置与第三方供应商，随时查看当前正在使用哪一个
+- 点击“复制”直接新增独立副本，无需确认或进入编辑页；名称可稍后修改
 - 切换前可检测连接，并可获取模型进行测试
 - 在同一页面编辑 Base URL、API Key、Model、Wire API 和完整 TOML
 - 从 cc-switch 导入时自动区分新增、更新、合并与跳过；相同 URL + Key 不再重复显示

@@ -18,6 +18,7 @@ mod backups;
 mod ccswitch;
 mod config_migration;
 mod constants;
+mod context_config;
 mod desktop_lifecycle;
 mod error;
 mod file_io;
@@ -33,6 +34,7 @@ mod sqlite_utils;
 mod state;
 mod toml_utils;
 mod updates;
+mod usage;
 
 use backups::{
     action_backup_root, backups, create_backup, validate_backup_codex_dir, BackupEntry, BackupMeta,
@@ -70,25 +72,32 @@ use prompts::{
     prompt_content_source_urls, stable_remote_prompt_id, stale_cached_prompt_ids,
     uninstall_managed_agents_block, CachedBuiltinPrompt, GithubContentEntry,
 };
+use providers::official_profiles::{
+    delete_official_profile_inner, duplicate_official_profile_inner, get_official_profile_inner,
+    list_official_profiles_inner, save_official_profile_inner, switch_official_profile_inner,
+    OfficialProfileActionResult, OfficialProfileDetail, OfficialProfileInput,
+    OfficialProfileSummary,
+};
 #[cfg(test)]
 use providers::{
     build_ccswitch_codex_provider, canonical_provider_base_url, codex_sections_from_config,
     consolidate_legacy_provider_duplicates_on_connection, detected_live_custom_provider,
-    is_official_ccswitch_row, list_saved_providers_on_connection, normalize_saved_provider,
-    official_snapshot_path_for_test, provider_by_id_on_connection, provider_identity,
-    provider_status_result, read_ccswitch_codex_rows, save_manual_provider_on_connection,
-    save_provider_toml_config_with_pre_persist, switch_official_provider_with_pre_persist,
+    get_official_config_draft_inner, is_official_ccswitch_row, list_saved_providers_on_connection,
+    normalize_saved_provider, official_snapshot_path_for_test, provider_by_id_on_connection,
+    provider_identity, provider_status_result, read_ccswitch_codex_rows,
+    reset_official_provider_inner, restore_official_provider_inner,
+    save_manual_provider_on_connection, save_provider_toml_config_with_pre_persist,
+    switch_official_provider_inner, switch_official_provider_with_pre_persist,
     switch_provider_with_pre_persist, upsert_ccswitch_provider_on_connection,
     upsert_provider_on_connection, CcSwitchCodexRow, ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
     build_provider_toml_draft_inner, clear_active_provider_on_connection,
-    delete_saved_provider_inner, fetch_provider_models_inner, get_official_config_draft_inner,
+    delete_saved_provider_inner, fetch_provider_models_inner,
     import_ccswitch_codex_providers_inner, list_saved_providers_inner, open_store,
     read_ccswitch_official_auth_inner, remember_active_provider_on_connection,
-    reset_official_provider_inner, restore_official_provider_inner, save_active_provider_inner,
-    save_official_config_inner, save_provider_inner, save_provider_toml_config_inner,
-    switch_official_provider_inner, switch_provider_inner, test_provider_connection_inner,
+    save_active_provider_inner, save_official_config_inner, save_provider_inner,
+    save_provider_toml_config_inner, switch_provider_inner, test_provider_connection_inner,
     ImportResult, OfficialAuthCandidate, OfficialConfigDraft, OfficialConfigInput,
     ProviderConnectionResult, ProviderInput, ProviderModelsResult, ProviderTomlInput,
     SavedProvider,
@@ -902,21 +911,21 @@ fn finish_provider_selection(
     {
         return result;
     }
-    match &update {
-        ActiveProviderSelectionUpdate::Set(provider_id) => {
-            result.state.active_saved_provider_id = Some(provider_id.clone());
-        }
-        ActiveProviderSelectionUpdate::ClearIfOfficial => {
-            result.state.active_saved_provider_id = None;
-        }
-    }
-
     let codex_dir = PathBuf::from(&result.state.codex_dir);
     let refreshed_state = (|| -> Result<CodexState> {
         let conn = open_store()?;
         match update {
             ActiveProviderSelectionUpdate::Set(provider_id) => {
-                remember_active_provider_on_connection(&conn, &codex_dir, &provider_id)?;
+                let saved = providers::list_saved_providers_on_connection(&conn)?;
+                let matches = providers::detected_live_custom_provider(&codex_dir)?
+                    .map(|live| providers::matching_saved_provider_ids_for_live(&live, &saved))
+                    .unwrap_or_default();
+                // A detected UI row can carry a provisional ID. Adoption may
+                // allocate a different ID, so only honor an explicit selection
+                // that actually matches the now-active saved configuration.
+                if matches.contains(&provider_id) {
+                    remember_active_provider_on_connection(&conn, &codex_dir, &provider_id)?;
+                }
             }
             ActiveProviderSelectionUpdate::ClearIfOfficial => {
                 clear_active_provider_on_connection(&conn, &codex_dir)?;
@@ -960,6 +969,42 @@ async fn save_provider(provider: SavedProvider) -> Result<SavedProvider> {
 }
 
 #[tauri::command]
+async fn duplicate_provider(
+    config_dir: Option<String>,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+) -> Result<providers::DuplicateProviderResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        providers::duplicate_provider_inner(config_dir, provider_id, provider_name)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("复制供应商失败: {error}")))?
+}
+
+#[tauri::command]
+async fn update_codex_context_window(
+    config_text: String,
+    enabled: Option<bool>,
+    previous_values: Option<context_config::ContextWindowValues>,
+) -> Result<context_config::ContextWindowConfig> {
+    context_config::update_codex_context_window_inner(config_text, enabled, previous_values)
+}
+
+#[tauri::command]
+async fn get_usage_statistics(
+    config_dir: Option<String>,
+    range: Option<String>,
+    model: Option<String>,
+    force_refresh: Option<bool>,
+) -> Result<usage::UsageStatistics> {
+    tauri::async_runtime::spawn_blocking(move || {
+        usage::get_usage_statistics_inner(config_dir, range, model, force_refresh)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("读取用量统计失败: {error}")))?
+}
+
+#[tauri::command]
 async fn save_active_provider(
     provider: SavedProvider,
     config_dir: Option<String>,
@@ -998,7 +1043,10 @@ fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
 #[tauri::command]
 async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = switch_official_provider_inner(config_dir)?;
+        let result = switch_official_profile_inner(
+            config_dir,
+            providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
+        )?;
         Ok(finish_provider_selection(
             result,
             ActiveProviderSelectionUpdate::ClearIfOfficial,
@@ -1012,15 +1060,85 @@ async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionRe
 async fn get_official_config_draft(
     config_dir: Option<String>,
 ) -> Result<Option<OfficialConfigDraft>> {
-    tauri::async_runtime::spawn_blocking(move || get_official_config_draft_inner(config_dir))
+    tauri::async_runtime::spawn_blocking(move || {
+        let detail = get_official_profile_inner(
+            config_dir,
+            providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
+        )?;
+        Ok(Some(OfficialConfigDraft {
+            auth_json: detail.auth_json,
+            config_text: detail.config_text,
+            model: detail.profile.model,
+            source: detail.source,
+        }))
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("读取官方配置快照失败: {e}")))?
+}
+
+#[tauri::command]
+async fn list_official_profiles(config_dir: Option<String>) -> Result<Vec<OfficialProfileSummary>> {
+    tauri::async_runtime::spawn_blocking(move || list_official_profiles_inner(config_dir))
         .await
-        .map_err(|e| CodexxError::Config(format!("读取官方配置快照失败: {e}")))?
+        .map_err(|error| CodexxError::Config(format!("读取官方配置列表失败: {error}")))?
+}
+
+#[tauri::command]
+async fn get_official_profile(
+    config_dir: Option<String>,
+    profile_id: String,
+) -> Result<OfficialProfileDetail> {
+    tauri::async_runtime::spawn_blocking(move || get_official_profile_inner(config_dir, profile_id))
+        .await
+        .map_err(|error| CodexxError::Config(format!("读取官方配置失败: {error}")))?
+}
+
+#[tauri::command]
+async fn save_official_profile(input: OfficialProfileInput) -> Result<OfficialProfileActionResult> {
+    tauri::async_runtime::spawn_blocking(move || save_official_profile_inner(input))
+        .await
+        .map_err(|error| CodexxError::Config(format!("保存官方配置失败: {error}")))?
+}
+
+#[tauri::command]
+async fn duplicate_official_profile(
+    config_dir: Option<String>,
+    profile_id: String,
+    provider_name: Option<String>,
+) -> Result<OfficialProfileActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        duplicate_official_profile_inner(config_dir, profile_id, provider_name)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("复制官方配置失败: {error}")))?
+}
+
+#[tauri::command]
+async fn switch_official_profile(
+    config_dir: Option<String>,
+    profile_id: String,
+) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        switch_official_profile_inner(config_dir, profile_id)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("切换官方配置失败: {error}")))?
+}
+
+#[tauri::command]
+async fn delete_official_profile(config_dir: Option<String>, profile_id: String) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_official_profile_inner(config_dir, profile_id)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("删除官方配置失败: {error}")))?
 }
 
 #[tauri::command]
 async fn restore_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = restore_official_provider_inner(config_dir)?;
+        let result =
+            providers::official_profiles::restore_default_official_profile_inner(config_dir)?;
         Ok(finish_provider_selection(
             result,
             ActiveProviderSelectionUpdate::ClearIfOfficial,
@@ -1033,8 +1151,7 @@ async fn restore_official_provider(config_dir: Option<String>) -> Result<ActionR
 #[tauri::command]
 async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result =
-            reset_official_provider_inner(input.config_dir, input.model, input.config_text)?;
+        let result = providers::official_profiles::reset_default_official_profile_inner(input)?;
         Ok(finish_provider_selection(
             result,
             ActiveProviderSelectionUpdate::ClearIfOfficial,
@@ -1501,11 +1618,20 @@ pub fn run() {
             list_saved_providers,
             build_provider_toml_draft,
             save_provider,
+            duplicate_provider,
+            update_codex_context_window,
+            get_usage_statistics,
             save_active_provider,
             delete_saved_provider,
             get_codex_state,
             switch_official_provider,
             get_official_config_draft,
+            list_official_profiles,
+            get_official_profile,
+            save_official_profile,
+            duplicate_official_profile,
+            switch_official_profile,
+            delete_official_profile,
             restore_official_provider,
             reset_official_provider,
             save_official_config,

@@ -33,6 +33,30 @@ export type SavedProvider = {
   requiresOpenaiAuth: boolean;
 };
 
+export type OfficialProfileSummary = {
+  id: string;
+  providerName: string;
+  model: string | null;
+  hasAuth: boolean;
+  isDefault: boolean;
+  isCurrent: boolean;
+};
+
+export type OfficialProfileDetail = OfficialProfileSummary & {
+  authJson: string;
+  configText: string;
+};
+
+export type OfficialProfileActionResult = ActionResult & {
+  profile: OfficialProfileSummary;
+};
+
+export type DuplicateProviderResult = {
+  provider: SavedProvider;
+  providers: SavedProvider[];
+  activeProviderId: string | null;
+};
+
 export type SavedPrompt = {
   id: string;
   title: string;
@@ -90,6 +114,7 @@ export type CodexState = {
   instructionTemplateKey?: string;
   agentsPath: string;
   activeSavedProviderId?: string;
+  activeOfficialProfileId?: string | null;
   providers: ProviderSummary[];
   configText: string;
   authPreview?: unknown;

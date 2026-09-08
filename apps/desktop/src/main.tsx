@@ -38,6 +38,10 @@ import type {
   Lang,
   OfficialAuthCandidate,
   OfficialConfigDraft,
+  OfficialProfileActionResult,
+  OfficialProfileDetail,
+  OfficialProfileSummary,
+  DuplicateProviderResult,
   PromptInjectionMode,
   ProviderConnectionResult,
   ProviderModel,
@@ -67,6 +71,7 @@ const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
 const ACTIVE_PROVIDER_KEY = "codexx.activeProviderId";
 const PROMPT_INJECTION_MODE_KEY = "codexx.promptInjectionMode";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
+const DEFAULT_OFFICIAL_PROFILE_ID = "openai-official";
 
 type ThemeTransitionDocument = Document & {
   startViewTransition?: (update: () => void | Promise<void>) => { finished: Promise<void> };
@@ -176,7 +181,7 @@ const dict = {
     },
     provider: {
       title: "供应商列表",
-      subtitle: "像 cc-switch 一样管理 Codex 第三方 API。点击卡片可切换，点击 + 添加新供应商。",
+      subtitle: "管理多个官方 Codex 登录与第三方 API，按名称区分账号并随时切换。",
       add: "添加供应商",
       importCc: "从 cc-switch 导入",
       edit: "编辑",
@@ -196,7 +201,7 @@ const dict = {
       officialUrl: "官方入口",
       formAdd: "添加新供应商",
       formEdit: "编辑供应商",
-      formHint: "保存后会写入供应商列表，并同步写入 Codex live 配置。下方可预览将生成的 config.toml。",
+      formHint: "选择供应商类型并填写配置。新增配置保存到列表，点击启用后生效。",
       name: "供应商名称",
       baseUrl: "Base URL",
       model: "模型",
@@ -277,7 +282,7 @@ const dict = {
     },
     provider: {
       title: "Provider list",
-      subtitle: "Manage Codex third-party APIs like cc-switch. Click a row to switch; use + to add a provider.",
+      subtitle: "Manage named Codex sign-in profiles and third-party APIs, and switch between them.",
       add: "Add provider",
       importCc: "Import from cc-switch",
       edit: "Edit",
@@ -297,7 +302,7 @@ const dict = {
       officialUrl: "Official URL",
       formAdd: "Add provider",
       formEdit: "Edit provider",
-      formHint: "Save writes the provider to the list and applies it to the Codex live config. The generated config.toml is previewed below.",
+      formHint: "Choose a provider type and enter its settings. New profiles are saved to the list; enable one to use it.",
       name: "Provider name",
       baseUrl: "Base URL",
       model: "Model",
@@ -365,8 +370,8 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
       ? `“${providerName}”将从供应商列表中删除，此操作无法撤销。`
       : `“${providerName}” will be removed from the provider list. This cannot be undone.`,
     deleteCurrentDescription: (providerName) => isChinese
-      ? `“${providerName}”当前正在使用。删除前会先热切换到 OpenAI Official，确定继续吗？`
-      : `“${providerName}” is currently active. Codex-X will hot-switch to OpenAI Official before deleting it. Continue?`,
+      ? `“${providerName}”当前正在使用。删除前会先切换到默认官方登录配置，确定继续吗？`
+      : `“${providerName}” is currently active. Codex-X will switch to the default official sign-in profile before deleting it. Continue?`,
     deleteCancelLabel: isChinese ? "取消" : "Cancel",
     deleteConfirmLabel: isChinese ? "确认删除" : "Delete",
     noBaseUrlLabel: "no base_url",
@@ -381,13 +386,13 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     officialSaveLabel: isChinese ? "保存官方配置" : "Save official config",
     loadCcSwitchOfficialLabel: isChinese ? "从 CC Switch 载入" : "Load from CC Switch",
     restoreOfficialLabel: isChinese ? "读取已保存配置" : "Load saved config",
-    resetOfficialLabel: isChinese ? "新建官方配置" : "Create official config",
-    resetOfficialTitle: isChinese ? "新建官方配置" : "Create official config",
+    resetOfficialLabel: isChinese ? "重置默认官方配置" : "Reset default official config",
+    resetOfficialTitle: isChinese ? "重置默认官方配置" : "Reset default official config",
     resetOfficialDescription: isChinese
       ? "这会切换到 OpenAI Official、清除当前 live auth.json，并要求你在 Codex 中重新登录。操作前会自动备份当前配置。"
       : "This switches to OpenAI Official, removes the live auth.json, and requires a new Codex login. The current files are backed up first.",
     resetOfficialCancelLabel: isChinese ? "取消" : "Cancel",
-    resetOfficialConfirmLabel: isChinese ? "清除并新建" : "Clear and create",
+    resetOfficialConfirmLabel: isChinese ? "确认重置" : "Reset",
     cancelLabel: t.provider.cancel,
     formEyebrow: "Provider",
     formAddTitle: t.provider.formAdd,
@@ -744,6 +749,10 @@ function App() {
   const [editingPromptId, setEditingPromptId] = React.useState<string | null>(null);
   const [editingBuiltinPrompt, setEditingBuiltinPrompt] = React.useState<BuiltinPromptDetail | null>(null);
   const [savedProviders, setSavedProviders] = React.useState<SavedProvider[]>([]);
+  const [officialProfiles, setOfficialProfiles] = React.useState<OfficialProfileSummary[]>([]);
+  const [editingOfficialProfileId, setEditingOfficialProfileId] = React.useState<string | null>(DEFAULT_OFFICIAL_PROFILE_ID);
+  const [creatingProvider, setCreatingProvider] = React.useState(false);
+  const [officialAuthDirty, setOfficialAuthDirty] = React.useState(false);
   const [activeProviderId, setActiveProviderId] = React.useState(() => localStorage.getItem(ACTIVE_PROVIDER_KEY) || "");
   const [savedPrompts, setSavedPrompts] = React.useState<SavedPrompt[]>([]);
   const [builtinPromptStatus, setBuiltinPromptStatus] = React.useState<BuiltinPromptStatus[]>([]);
@@ -785,9 +794,11 @@ function App() {
   const [skillsMcpNoteBusy, setSkillsMcpNoteBusy] = React.useState("");
   const [restartCodexBusy, setRestartCodexBusy] = React.useState(false);
   const [promptSyncing, setPromptSyncing] = React.useState(false);
+  const [promptDetailLoading, setPromptDetailLoading] = React.useState(false);
   const [promptCatalogReady, setPromptCatalogReady] = React.useState(false);
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
   const [officialForm, setOfficialForm] = React.useState({
+    providerName: "OpenAI Official",
     model: "gpt-5.5",
     authJson: "",
     configText: buildOfficialTomlPreview("gpt-5.5"),
@@ -802,6 +813,8 @@ function App() {
   const providerModelsRequestRef = React.useRef(0);
   const providerDraftRequestRef = React.useRef(0);
   const officialDraftRequestRef = React.useRef(0);
+  const officialProfilesRequestRef = React.useRef(0);
+  const savedProvidersRequestRef = React.useRef(0);
   const loadingGenerationRef = React.useRef(0);
   const loadingTokensRef = React.useRef(new Set<number>());
   const actionBusyGenerationRef = React.useRef(0);
@@ -810,6 +823,7 @@ function App() {
   const restartCodexBusyRef = React.useRef(false);
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
   const promptRefreshRequestRef = React.useRef(0);
+  const promptDetailRequestRef = React.useRef(0);
   const refreshRequestRef = React.useRef(0);
   const aboutLoadKeyRef = React.useRef("");
   const sessionAutoLoadKeyRef = React.useRef("");
@@ -884,6 +898,15 @@ function App() {
     }
     if (changed) syncActionBusy();
   }, [syncActionBusy]);
+
+  const invalidatePromptDetail = React.useCallback(() => {
+    promptDetailRequestRef.current += 1;
+    setPromptDetailLoading(false);
+  }, []);
+  const commitSavedProviders = React.useCallback((providers: SavedProvider[]) => {
+    savedProvidersRequestRef.current += 1;
+    setSavedProviders(providers);
+  }, []);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile, instructionTemplates);
   const releaseStatusLabel = React.useMemo(() => {
     if (updater.state.phase === "downloading") return lang === "zh" ? "下载中" : "Downloading";
@@ -1128,20 +1151,34 @@ function App() {
     }));
   }, [effectiveActiveProviderId, savedProviders]);
 
-  const providerRows = React.useMemo(() => {
-    const officialRow = {
-      id: "openai-official",
-      source: "official" as const,
+  const currentOfficialProfileId = state?.isOfficialProvider
+    ? state.activeOfficialProfileId || DEFAULT_OFFICIAL_PROFILE_ID
+    : "";
+  const currentOfficialProfile = officialProfiles.find((profile) => profile.id === currentOfficialProfileId);
+  const providerRows = React.useMemo<ProviderRow[]>(() => {
+    const defaultProfile = officialProfiles.find((profile) => profile.isDefault) || {
+      id: DEFAULT_OFFICIAL_PROFILE_ID,
       providerName: "OpenAI Official",
+      model: null,
+      isDefault: true,
+      hasAuth: Boolean(state?.officialAuthAvailable),
+    };
+    const officialRow = (profile: typeof defaultProfile): ProviderRow => ({
+      id: profile.id,
+      source: "official",
+      providerName: profile.providerName,
       baseUrl: "https://chatgpt.com/codex",
-      model: state?.model || "official",
+      model: profile.model || "official",
       apiKey: "",
       wireApi: "official",
-      requiresOpenaiAuth: false,
-      isCurrent: Boolean(state?.isOfficialProvider),
-    };
-    return orderProviderRows(officialRow, detectedRows, localRows);
-  }, [detectedRows, localRows, state?.isOfficialProvider, state?.model]);
+      requiresOpenaiAuth: true,
+      isCurrent: profile.id === currentOfficialProfileId,
+      isDefaultOfficial: profile.isDefault,
+      meta: !profile.hasAuth ? (lang === "zh" ? "待登录" : "Sign-in required") : undefined,
+    });
+    const rows = orderProviderRows(officialRow(defaultProfile), detectedRows, localRows);
+    return [rows[0], ...officialProfiles.filter((profile) => !profile.isDefault).map(officialRow), ...rows.slice(1)];
+  }, [currentOfficialProfileId, detectedRows, lang, localRows, officialProfiles, state?.officialAuthAvailable]);
 
   const findLocalProviderForRow = React.useCallback((row: ProviderRow) => {
     if (row.source === "official") return undefined;
@@ -1180,10 +1217,12 @@ function App() {
       wireApi: row.wireApi,
       requiresOpenaiAuth: row.requiresOpenaiAuth,
       isCurrent: row.isCurrent,
+      isDefaultOfficial: row.isDefaultOfficial,
+      meta: row.meta,
       sourceLabel: row.source === "official" ? (lang === "zh" ? "Codex 登录" : "Codex login") : undefined,
       editable: row.source === "official" || Boolean(local) || row.source === "detected",
-      duplicable: Boolean(providerCopySourceForRow(row)),
-      deletable: Boolean(local),
+      duplicable: row.source === "official" || Boolean(providerCopySourceForRow(row)),
+      deletable: row.source === "official" ? !row.isDefaultOfficial : Boolean(local),
       testable: row.source !== "official",
       testingKey: `${row.source}-${row.id}`,
     };
@@ -1263,7 +1302,10 @@ function App() {
   }, [beginLoading, endLoading]);
 
   const refresh = React.useCallback((includeDiagnostics: boolean) => {
+    invalidatePromptDetail();
     const requestId = ++refreshRequestRef.current;
+    const profilesRequestId = ++officialProfilesRequestRef.current;
+    const providersRequestId = ++savedProvidersRequestRef.current;
     officialDraftRequestRef.current += 1;
     clearActionBusy("loadOfficialDraft");
     skillsMcpRequestRef.current += 1;
@@ -1275,6 +1317,7 @@ function App() {
     setRefreshing(true);
     setError("");
     setState(null);
+    setOfficialProfiles([]);
     setSessionStatus(null);
     setSkillsMcpState(null);
     setSkillsMcpImportOpen(false);
@@ -1303,6 +1346,8 @@ function App() {
           providerModelsRequestRef.current += 1;
           setProviderMode("list");
           setEditingProviderId(null);
+          setEditingOfficialProfileId(null);
+          setCreatingProvider(false);
           setEditingDetectedProvider(false);
           setProviderTomlDirty(false);
           setProviderTomlDraft("");
@@ -1319,9 +1364,14 @@ function App() {
           invoke<SavedProvider[]>("list_saved_providers"),
           invoke<SavedPrompt[]>("list_saved_prompts"),
           invoke<BuiltinPromptStatus[]>("get_builtin_prompt_status"),
-        ]).then(([providers, prompts, promptStatus]) => {
+          invoke<OfficialProfileSummary[]>("list_official_profiles", { configDir: next.codexDir }),
+        ]).then(([providers, prompts, promptStatus, profiles]) => {
           if (requestId !== refreshRequestRef.current) return;
-          if (providers.status === "fulfilled") setSavedProviders(providers.value);
+          if (providersRequestId === savedProvidersRequestRef.current && providers.status === "fulfilled") setSavedProviders(providers.value);
+          if (profilesRequestId === officialProfilesRequestRef.current) {
+            if (profiles.status === "fulfilled") setOfficialProfiles(profiles.value);
+            else setError(String(profiles.reason));
+          }
           if (prompts.status === "fulfilled") setSavedPrompts(prompts.value);
           if (promptStatus.status === "fulfilled") {
             setBuiltinPromptStatus(uniqueBuiltinPromptStatuses(promptStatus.value));
@@ -1333,7 +1383,7 @@ function App() {
         setRefreshing(false);
         setError(String(nextError));
       });
-  }, [clearActionBusy, configDir, configDirDraft, state?.codexDir]);
+  }, [clearActionBusy, configDir, configDirDraft, invalidatePromptDetail, state?.codexDir]);
 
   React.useEffect(() => {
     refresh(startupWizardOpen);
@@ -1387,18 +1437,26 @@ function App() {
   }, [activeProviderId, inferredActiveProviderId, liveProviderId, savedProviders, state]);
 
   const handleActionResult = (result: ActionResult) => {
+    const profilesRequestId = ++officialProfilesRequestRef.current;
+    const providersRequestId = ++savedProvidersRequestRef.current;
     setState(result.state);
     setSessionStatus(null);
     sessionAutoLoadKeyRef.current = "";
     sessionLoadRequestRef.current += 1;
     setToast(result.message);
-    void Promise.allSettled([
+    return Promise.allSettled([
       invoke<SavedPrompt[]>("list_saved_prompts"),
       invoke<SavedProvider[]>("list_saved_providers"),
+      invoke<OfficialProfileSummary[]>("list_official_profiles", { configDir: result.state.codexDir }),
     ])
-      .then(([prompts, providers]) => {
+      .then(([prompts, providers, profiles]) => {
+        if (normalizedConfigDirForComparison(result.state.codexDir) !== activeConfigDirKeyRef.current) return;
         if (prompts.status === "fulfilled") setSavedPrompts(prompts.value);
-        if (providers.status === "fulfilled") setSavedProviders(providers.value);
+        if (providersRequestId === savedProvidersRequestRef.current && providers.status === "fulfilled") setSavedProviders(providers.value);
+        if (profilesRequestId === officialProfilesRequestRef.current) {
+          if (profiles.status === "fulfilled") setOfficialProfiles(profiles.value);
+          else setError(String(profiles.reason));
+        }
       })
       .catch(() => undefined);
   };
@@ -1422,6 +1480,7 @@ function App() {
     );
 
   const openAddPrompt = () => {
+    invalidatePromptDetail();
     setEditingPromptId(null);
     setEditingBuiltinPrompt(null);
     setPromptForm({ ...blankPromptForm });
@@ -1429,27 +1488,36 @@ function App() {
   };
 
   const openEditPrompt = (prompt: SavedPrompt) => {
+    invalidatePromptDetail();
     setEditingPromptId(prompt.id);
     setEditingBuiltinPrompt(null);
     setPromptForm(prompt);
     setInstructionMode("form");
   };
 
-  const openEditBuiltinPrompt = (templateId: string) =>
-    call(
-      () => invoke<BuiltinPromptDetail>("get_builtin_prompt_detail", { templateId }),
-      (detail) => {
-        setEditingPromptId(null);
-        setEditingBuiltinPrompt(detail);
-        setPromptForm({
-          id: detail.id,
-          title: detail.title,
-          filename: detail.filename,
-          content: detail.content,
-        });
-        setInstructionMode("form");
-      },
-    );
+  const openEditBuiltinPrompt = async (templateId: string) => {
+    const requestId = ++promptDetailRequestRef.current;
+    // A local template read must not disable provider or other page actions.
+    setPromptDetailLoading(true);
+    setError("");
+    try {
+      const detail = await invoke<BuiltinPromptDetail>("get_builtin_prompt_detail", { templateId });
+      if (requestId !== promptDetailRequestRef.current) return;
+      setEditingPromptId(null);
+      setEditingBuiltinPrompt(detail);
+      setPromptForm({
+        id: detail.id,
+        title: detail.title,
+        filename: detail.filename,
+        content: detail.content,
+      });
+      setInstructionMode("form");
+    } catch (detailError) {
+      if (requestId === promptDetailRequestRef.current) setError(String(detailError));
+    } finally {
+      if (requestId === promptDetailRequestRef.current) setPromptDetailLoading(false);
+    }
+  };
 
   const normalizedPromptForm = (): SavedPrompt => {
     const existing = savedPrompts.filter((item) => item.id !== editingPromptId);
@@ -1670,7 +1738,7 @@ function App() {
       },
       ({ applied, providerList }) => {
         if (applied) handleActionResult(applied);
-        setSavedProviders(providerList);
+        commitSavedProviders(providerList);
         setProviderMode("list");
         setEditingProviderId(null);
         setEditingDetectedProvider(false);
@@ -1752,9 +1820,9 @@ function App() {
 
   const saveProviderConfig = saveProviderOnly;
 
-  const switchOfficialProvider = () =>
+  const switchOfficialProvider = (profileId = DEFAULT_OFFICIAL_PROFILE_ID) =>
     call(
-      () => invoke<ActionResult>("switch_official_provider", { configDir: configDir || null }),
+      () => invoke<ActionResult>("switch_official_profile", { configDir: configDir || null, profileId }),
       (result) => {
         localStorage.removeItem(ACTIVE_PROVIDER_KEY);
         setActiveProviderId("");
@@ -1773,7 +1841,9 @@ function App() {
       },
       ({ result, draft }) => {
         if (draft) {
+          setOfficialAuthDirty(false);
           setOfficialForm({
+            providerName: officialForm.providerName,
             model: draft.model || "gpt-5.5",
             authJson: draft.authJson,
             configText: draft.configText || buildOfficialTomlPreview(draft.model || "gpt-5.5"),
@@ -1797,7 +1867,9 @@ function App() {
         setToast(lang === "zh" ? "未找到 CC Switch 官方配置" : "No CC Switch official config found");
         return;
       }
+      setOfficialAuthDirty(true);
       setOfficialForm((current) => ({
+        ...current,
         model: candidate.model || current.model || state?.model || "gpt-5.5",
         authJson: candidate.authJson,
         configText: candidate.configText || current.configText,
@@ -1823,9 +1895,11 @@ function App() {
       (result) => {
         localStorage.removeItem(ACTIVE_PROVIDER_KEY);
         setActiveProviderId("");
+        setOfficialAuthDirty(false);
         setOfficialForm({
+          providerName: officialForm.providerName,
           model: result.state.model || officialForm.model || "gpt-5.5",
-          authJson: officialAuthPlaceholder,
+          authJson: "",
           configText: result.state.configText
             || officialForm.configText
             || buildOfficialTomlPreview(result.state.model || officialForm.model || "gpt-5.5"),
@@ -1848,11 +1922,11 @@ function App() {
         : `cc-switch import complete: ${result.added} added, ${result.updated} updated, ${result.merged} merged${warningText}; current provider unchanged`;
       try {
         const nextState = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
-        setSavedProviders(result.providers);
+        commitSavedProviders(result.providers);
         setState(nextState);
         setToast(successText);
       } catch (refreshError) {
-        setSavedProviders(result.providers);
+        commitSavedProviders(result.providers);
         setToast(lang === "zh"
           ? `${successText}；状态刷新失败，请手动刷新：${String(refreshError)}`
           : `${successText}; state refresh failed, refresh manually: ${String(refreshError)}`);
@@ -2173,61 +2247,143 @@ function App() {
     }
   };
 
-  const officialAuthPlaceholder = '{\n  "OPENAI_API_KEY": null,\n  "auth_mode": "chatgpt",\n  "tokens": {\n    "access_token": "",\n    "refresh_token": "",\n    "id_token": ""\n  }\n}';
-
-  const openOfficialEdit = async () => {
+  const openOfficialEdit = async (profileId = DEFAULT_OFFICIAL_PROFILE_ID) => {
     const requestId = ++officialDraftRequestRef.current;
     const actionToken = beginActionBusy("loadOfficialDraft");
-    const liveIsOfficial = Boolean(state?.isOfficialProvider);
-    const fallbackModel = state?.model || "gpt-5.5";
-    const fallbackConfigText = liveIsOfficial && state?.configText?.trim()
-      ? state.configText
-      : "";
+    const profile = officialProfiles.find((item) => item.id === profileId);
     setEditingDetectedProvider(false);
+    setEditingOfficialProfileId(profileId);
+    setCreatingProvider(false);
+    setOfficialAuthDirty(false);
     setOfficialForm({
-      model: fallbackModel,
-      authJson: liveIsOfficial && state?.authText ? state.authText : officialAuthPlaceholder,
-      configText: fallbackConfigText,
+      providerName: profile?.providerName || "OpenAI Official",
+      model: profile?.model || "gpt-5.5",
+      authJson: "",
+      configText: "",
     });
     setProviderMode("official");
     setError("");
     try {
-      const draft = await invoke<OfficialConfigDraft | null>("get_official_config_draft", {
+      const draft = await invoke<OfficialProfileDetail>("get_official_profile", {
         configDir: configDir || null,
+        profileId,
       });
       if (requestId !== officialDraftRequestRef.current) return;
-      if (draft) {
-        setOfficialForm({
-          model: draft.model || fallbackModel,
-          authJson: draft.authJson,
-          configText: draft.configText || fallbackConfigText,
-        });
-      }
+      setOfficialForm({
+        providerName: draft.providerName,
+        model: draft.model || "gpt-5.5",
+        authJson: draft.authJson,
+        configText: draft.configText,
+      });
     } catch (e) {
-      if (requestId === officialDraftRequestRef.current) setError(String(e));
+      if (requestId === officialDraftRequestRef.current) {
+        setError(String(e));
+        setProviderMode("list");
+      }
     } finally {
       endActionBusy(actionToken);
     }
   };
 
-  const saveOfficialConfig = () =>
-    call(
+  const saveOfficialConfig = () => {
+    if (!officialForm.providerName.trim()) {
+      setError(lang === "zh" ? "请填写供应商名称" : "Provider name is required");
+      return;
+    }
+    return call(
       () =>
-        invoke<ActionResult>("save_official_config", {
+        invoke<OfficialProfileActionResult>("save_official_profile", {
           input: {
             configDir: configDir || null,
+            id: editingOfficialProfileId,
+            providerName: officialForm.providerName.trim(),
             model: officialForm.model,
-            authJson: officialForm.authJson,
+            authJson: officialAuthDirty || editingOfficialProfileId === null ? officialForm.authJson : null,
             configText: officialForm.configText,
           },
         }),
       (result) => {
         handleActionResult(result);
+        setCreatingProvider(false);
         setProviderMode("list");
       },
     );
+  };
+
+  const loadCurrentOfficial = async () => {
+    const requestId = ++officialDraftRequestRef.current;
+    const actionToken = beginActionBusy("loadCurrentOfficial");
+    setError("");
+    try {
+      const current = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
+      if (requestId !== officialDraftRequestRef.current) return;
+      if (!current.isOfficialProvider) {
+        throw new Error(lang === "zh" ? "请先在 Codex 中切换到官方登录" : "Switch Codex to official sign-in first");
+      }
+      setOfficialAuthDirty(true);
+      setOfficialForm((form) => ({
+        ...form,
+        model: current.model || form.model,
+        configText: current.configText,
+        authJson: current.authText || "",
+      }));
+      setToast(lang === "zh" ? "已读取当前官方登录，保存后保留到此配置" : "Current sign-in loaded. Save to keep it in this profile.");
+    } catch (loadError) {
+      if (requestId === officialDraftRequestRef.current) setError(String(loadError));
+    } finally {
+      endActionBusy(actionToken);
+    }
+  };
+
+  const duplicateOfficialProfile = (row: ProviderRow) => {
+    const providerName = `${row.providerName}${lang === "zh" ? " 副本" : " Copy"}`;
+    return call(
+      () => invoke<OfficialProfileActionResult>("duplicate_official_profile", {
+        configDir: configDir || null, profileId: row.id, providerName,
+      }),
+      (result) => {
+        if (normalizedConfigDirForComparison(result.state.codexDir) !== activeConfigDirKeyRef.current) return;
+        handleActionResult(result);
+        setToast(lang === "zh" ? `已复制为“${result.profile.providerName}”` : `Created “${result.profile.providerName}”`);
+      },
+    );
+  };
+
+  const changeProviderKind = async (kind: "api" | "official") => {
+    const requestId = ++officialDraftRequestRef.current;
+    clearActionBusy("loadOfficialDraft");
+    if (kind === "api") {
+      setProviderMode("form");
+      return;
+    }
+    setEditingOfficialProfileId(null);
+    setProviderMode("official");
+    if (officialForm.configText.trim()) return;
+    // Start with a complete official template so a context-window toggle does
+    // not turn an otherwise empty draft into a two-line replacement config.
+    const actionToken = beginActionBusy("loadOfficialDraft");
+    try {
+      const template = await invoke<OfficialProfileDetail>("get_official_profile", {
+        configDir: configDir || null, profileId: DEFAULT_OFFICIAL_PROFILE_ID,
+      });
+      if (requestId !== officialDraftRequestRef.current) return;
+      setOfficialForm((form) => ({ ...form, configText: template.configText, model: template.model || form.model }));
+    } catch (templateError) {
+      if (requestId === officialDraftRequestRef.current) {
+        setError(String(templateError));
+        setProviderMode("list");
+      }
+    } finally {
+      endActionBusy(actionToken);
+    }
+  };
 
   const openAddProvider = () => {
+    officialDraftRequestRef.current += 1;
+    setCreatingProvider(true);
+    setEditingOfficialProfileId(null);
+    setOfficialAuthDirty(false);
+    setOfficialForm({ providerName: "", model: state?.model || "gpt-5.5", configText: "", authJson: "" });
     const liveToml = state?.configText?.trim() || "";
     const next = {
       ...blankProviderForm,
@@ -2246,6 +2402,7 @@ function App() {
   };
 
   const openEditProvider = (provider: SavedProvider) => {
+    setCreatingProvider(false);
     resetAvailableProviderModels();
     setEditingProviderId(provider.id);
     setEditingDetectedProvider(false);
@@ -2255,21 +2412,30 @@ function App() {
     setProviderMode("form");
   };
 
-  const openDuplicateProvider = (provider: SavedProvider) => {
-    resetAvailableProviderModels();
-    const duplicate = {
-      ...provider,
-      id: uniqueId(provider.id || provider.providerName, savedProviders.map((item) => item.id)),
-    };
-    setEditingProviderId(null);
-    setEditingDetectedProvider(false);
-    setProviderForm(duplicate);
-    setProviderTomlDraft(duplicate.tomlConfig?.trim() || buildProviderTomlPreview(duplicate));
-    setProviderTomlDirty(false);
-    setProviderMode("form");
+  const duplicateProvider = (row: ProviderRow) => {
+    const requestedDirKey = activeConfigDirKeyRef.current;
+    return call(
+      () => invoke<DuplicateProviderResult>("duplicate_provider", {
+        configDir: configDir || null,
+        providerId: findLocalProviderForRow(row)?.id || null,
+        providerName: `${row.providerName}${lang === "zh" ? " 副本" : " Copy"}`,
+      }),
+      (result) => {
+        if (requestedDirKey !== activeConfigDirKeyRef.current) return;
+        commitSavedProviders(result.providers);
+        if (result.activeProviderId) {
+          setActiveProviderId(result.activeProviderId);
+          localStorage.setItem(ACTIVE_PROVIDER_KEY, result.activeProviderId);
+          setState((current) => current && !current.isOfficialProvider
+            ? { ...current, activeSavedProviderId: result.activeProviderId || undefined } : current);
+        }
+        setToast(lang === "zh" ? `已复制为“${result.provider.providerName}”` : `Created “${result.provider.providerName}”`);
+      },
+    );
   };
 
   const openEditDetectedProvider = (provider: { id: string; providerName: string; baseUrl: string; model: string; apiKey?: string; wireApi: string; requiresOpenaiAuth: boolean }) => {
+    setCreatingProvider(false);
     resetAvailableProviderModels();
     const id = uniqueId(
       customProviderId(provider.providerName || provider.baseUrl),
@@ -2305,11 +2471,35 @@ function App() {
       }
       await invoke<void>("delete_saved_provider", { id, configDir: configDir || null });
       const providerList = await invoke<SavedProvider[]>("list_saved_providers");
-      setSavedProviders(providerList);
+      commitSavedProviders(providerList);
       setToast(lang === "zh" ? "供应商已删除" : "Provider deleted");
       return true;
     } catch (e) {
       setError(String(e));
+      return false;
+    } finally {
+      endLoading(loadingToken);
+    }
+  };
+
+  const removeOfficialProfile = async (id: string, isCurrent: boolean) => {
+    const loadingToken = beginLoading();
+    setError("");
+    try {
+      if (isCurrent) {
+        const result = await invoke<ActionResult>("switch_official_profile", {
+          configDir: configDir || null, profileId: DEFAULT_OFFICIAL_PROFILE_ID,
+        });
+        await handleActionResult(result);
+      }
+      await invoke<void>("delete_official_profile", { configDir: configDir || null, profileId: id });
+      const profilesRequestId = ++officialProfilesRequestRef.current;
+      const profiles = await invoke<OfficialProfileSummary[]>("list_official_profiles", { configDir: configDir || null });
+      if (profilesRequestId === officialProfilesRequestRef.current) setOfficialProfiles(profiles);
+      setToast(lang === "zh" ? "官方登录配置已删除" : "Official sign-in profile deleted");
+      return true;
+    } catch (deleteError) {
+      setError(String(deleteError));
       return false;
     } finally {
       endLoading(loadingToken);
@@ -2452,8 +2642,10 @@ function App() {
   };
 
   const changeTab = (nextTab: Tab) => {
+    if (nextTab !== "instruction") invalidatePromptDetail();
     if (nextTab !== "provider") {
       officialDraftRequestRef.current += 1;
+      if (actionBusy === "loadOfficialDraft") setProviderMode("list");
       clearActionBusy("loadOfficialDraft");
     }
     setTab(nextTab);
@@ -2535,7 +2727,7 @@ function App() {
                 configDir={configDirDraft}
                 resolvedCodexDir={state?.codexDir || ""}
                 configExists={Boolean(state?.configExists)}
-                providerLabel={currentProvider?.name || state?.modelProvider}
+                providerLabel={currentOfficialProfile?.providerName || currentProvider?.name || state?.modelProvider}
                 instructionEnabled={Boolean(state?.instructionEnabled)}
                 authExists={Boolean(state?.authExists)}
                 officialAuthAvailable={Boolean(state?.officialAuthAvailable)}
@@ -2560,6 +2752,11 @@ function App() {
                 lang={lang}
                 copy={getProviderPageCopy(lang)}
                 mode={providerMode}
+                creatingProvider={creatingProvider}
+                providerKind={providerMode === "official" ? "official" : "api"}
+                onProviderKindChange={changeProviderKind}
+                officialProfileIsDefault={editingOfficialProfileId === DEFAULT_OFFICIAL_PROFILE_ID}
+                canLoadCurrentOfficial={Boolean(state.isOfficialProvider)}
                 providerRows={providerPageRows}
                 loading={loading}
                 testingId={providerTestingId}
@@ -2579,7 +2776,7 @@ function App() {
                 officialInfo={{
                   officialUrl: "https://chatgpt.com/codex",
                   authPath: state.authPath,
-                  current: state.isOfficialProvider ? "OpenAI Official" : state.modelProvider,
+                  current: state.isOfficialProvider ? currentOfficialProfile?.providerName || "OpenAI Official" : state.modelProvider,
                 }}
                 providerAuthPreview={<JsonPreview text={providerAuthPreview} />}
                 providerTomlDraft={providerTomlDraft}
@@ -2592,7 +2789,7 @@ function App() {
                 onLoadCcSwitchOfficial={() => void loadCcSwitchOfficial()}
                 onEnableProvider={(row) => {
                   if (row.source === "official") {
-                    switchOfficialProvider();
+                    switchOfficialProvider(row.id);
                     return;
                   }
                   const local = findLocalProviderForRow(row);
@@ -2613,7 +2810,7 @@ function App() {
                 }}
                 onEditProvider={(row) => {
                   if (row.source === "official") {
-                    void openOfficialEdit();
+                    void openOfficialEdit(row.id);
                     return;
                   }
                   const local = findLocalProviderForRow(row);
@@ -2621,10 +2818,14 @@ function App() {
                   else if (row.source === "detected") openEditDetectedProvider(row);
                 }}
                 onDuplicateProvider={(row) => {
-                  const copySource = providerCopySourceForRow(row);
-                  if (copySource) openDuplicateProvider(copySource);
+                  if (row.source === "official") {
+                    void duplicateOfficialProfile(row);
+                    return;
+                  }
+                  void duplicateProvider(row);
                 }}
                 onDeleteProvider={(row) => {
+                  if (row.source === "official") return removeOfficialProfile(row.id, row.isCurrent);
                   const local = findLocalProviderForRow(row);
                   return local ? removeProvider(local.id, row.isCurrent) : Promise.resolve(false);
                 }}
@@ -2633,11 +2834,17 @@ function App() {
                 onCancelMode={() => {
                   officialDraftRequestRef.current += 1;
                   setProviderMode("list");
+                  setCreatingProvider(false);
                   setEditingDetectedProvider(false);
                   setProviderTomlDirty(false);
                 }}
                 onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
-                onOfficialAuthChange={(value) => setOfficialForm((current) => ({ ...current, authJson: value }))}
+                onOfficialNameChange={(value) => setOfficialForm((current) => ({ ...current, providerName: value }))}
+                onLoadCurrentOfficial={() => void loadCurrentOfficial()}
+                onOfficialAuthChange={(value) => {
+                  setOfficialAuthDirty(true);
+                  setOfficialForm((current) => ({ ...current, authJson: value }));
+                }}
                 onOfficialConfigChange={(value) => setOfficialForm((current) => ({ ...current, configText: value }))}
                 onSaveOfficial={saveOfficialConfig}
                 onApiKeyChange={(value) => {
@@ -2758,7 +2965,7 @@ function App() {
                 promptForm={promptForm}
                 editingPromptId={editingPromptId}
                 editingBuiltinPrompt={editingBuiltinPrompt}
-                loading={loading}
+                loading={loading || promptDetailLoading}
                 actionBusy={actionBusy}
                 promptSyncing={promptSyncing}
                 promptCatalogReady={promptCatalogReady}
@@ -2803,7 +3010,10 @@ function App() {
                 onSyncBuiltinPrompts={() => refreshBuiltinPrompts()}
                 onImportPrompt={importPromptMd}
                 onAddPrompt={openAddPrompt}
-                onInstructionModeChange={setInstructionMode}
+                onInstructionModeChange={(mode) => {
+                  invalidatePromptDetail();
+                  setInstructionMode(mode);
+                }}
                 onPromptInjectionModeChange={setPromptInjectionMode}
                 onTogglePromptModeHelp={() => setPromptModeHelpOpen((open) => !open)}
                 onEnableBuiltinPrompt={switchInstructionTemplate}
@@ -2882,6 +3092,7 @@ function App() {
             {tab === "settings" && (
               <SettingsPage
                 lang={lang}
+                configDir={configDir}
                 copy={{
                   eyebrow: "Settings",
                   title: t.settings.title,

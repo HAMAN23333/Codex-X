@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 3;
+const APP_DB_SCHEMA_VERSION: i64 = 4;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -205,6 +205,19 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS active_provider_selections (
             codex_dir TEXT PRIMARY KEY,
             provider_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS official_profiles (
+            codex_dir TEXT NOT NULL,
+            id TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(codex_dir, id)
+        );
+        CREATE TABLE IF NOT EXISTS official_profile_selections (
+            codex_dir TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );",
     )

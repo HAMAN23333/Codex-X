@@ -1,5 +1,6 @@
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
   AlertTriangle,
@@ -36,6 +37,7 @@ export type ProviderRow = {
   wireApi: string;
   requiresOpenaiAuth: boolean;
   isCurrent: boolean;
+  isDefaultOfficial?: boolean;
   sourceLabel?: string;
   editable?: boolean;
   duplicable?: boolean;
@@ -55,6 +57,7 @@ export type ProviderFormValue = {
 };
 
 export type OfficialFormValue = {
+  providerName: string;
   model: string;
   authJson: string;
   configText: string;
@@ -138,8 +141,12 @@ export type ProvidersPageProps = {
   testingId: string;
   actionBusy?: string;
   editingProviderId: string | null;
+  creatingProvider: boolean;
+  providerKind: "api" | "official";
   providerForm: ProviderFormValue;
   officialForm: OfficialFormValue;
+  officialProfileIsDefault: boolean;
+  canLoadCurrentOfficial: boolean;
   officialAuthRef?: Ref<HTMLTextAreaElement>;
   officialTomlRef?: Ref<HTMLTextAreaElement>;
   officialInfo: ProviderOfficialInfo;
@@ -151,7 +158,9 @@ export type ProvidersPageProps = {
   fetchingModels: boolean;
   onImportCcSwitch: () => void;
   onAddProvider: () => void;
+  onProviderKindChange: (kind: "api" | "official") => void;
   onLoadCcSwitchOfficial: () => void;
+  onLoadCurrentOfficial: () => void;
   onRestoreOfficial: () => void;
   onResetOfficial: () => void;
   onEnableProvider: (row: ProviderRow) => void;
@@ -160,6 +169,7 @@ export type ProvidersPageProps = {
   onDuplicateProvider: (row: ProviderRow) => void;
   onDeleteProvider: (row: ProviderRow) => Promise<boolean>;
   onCancelMode: () => void;
+  onOfficialNameChange: (value: string) => void;
   onOfficialModelChange: (value: string) => void;
   onOfficialAuthChange: (value: string) => void;
   onOfficialConfigChange: (value: string) => void;
@@ -189,6 +199,145 @@ function Field({ label, children, className }: FieldProps) {
       <span>{label}</span>
       {children}
     </label>
+  );
+}
+
+type ContextWindowValues = {
+  contextWindow: number | null;
+  compactTokenLimit: number | null;
+};
+
+type ContextWindowConfig = ContextWindowValues & {
+  configText: string;
+  enabled: boolean;
+};
+
+function ContextWindowControl({
+  lang,
+  configText,
+  disabled,
+  onConfigChange,
+  onBusyChange,
+}: {
+  lang: "zh" | "en";
+  configText: string;
+  disabled: boolean;
+  onConfigChange: (text: string) => void;
+  onBusyChange: (busy: boolean) => void;
+}) {
+  const [settings, setSettings] = useState<ContextWindowConfig | null>(null);
+  const [error, setError] = useState("");
+  const [changing, setChanging] = useState(false);
+  const currentText = useRef(configText);
+  const requestId = useRef(0);
+  const previousValues = useRef<ContextWindowValues | null>(null);
+  currentText.current = configText;
+
+  useEffect(() => {
+    const id = ++requestId.current;
+    let mounted = true;
+    setError("");
+    const timer = setTimeout(() => {
+      void invoke<ContextWindowConfig>("update_codex_context_window", {
+        configText,
+        enabled: null,
+        previousValues: null,
+      }).then((result) => {
+        if (mounted && requestId.current === id && currentText.current === configText) {
+          setSettings(result);
+        }
+      }).catch((cause: unknown) => {
+        if (mounted && requestId.current === id && currentText.current === configText) {
+          setSettings(null);
+          setError(String(cause));
+        }
+      });
+    }, 100);
+    return () => {
+      mounted = false;
+      ++requestId.current;
+      clearTimeout(timer);
+    };
+  }, [configText]);
+
+  const toggle = async (enabled: boolean) => {
+    if (disabled || changing || !settings || settings.configText !== configText) return;
+    const originalText = configText;
+    const id = ++requestId.current;
+    setChanging(true);
+    onBusyChange(true);
+    setError("");
+    try {
+      const result = await invoke<ContextWindowConfig>("update_codex_context_window", {
+        configText: originalText,
+        enabled,
+        previousValues: enabled ? null : previousValues.current,
+      });
+      if (requestId.current !== id || currentText.current !== originalText) return;
+      previousValues.current = enabled
+        ? { contextWindow: settings.contextWindow, compactTokenLimit: settings.compactTokenLimit }
+        : null;
+      setSettings(result);
+      onConfigChange(result.configText);
+    } catch (cause: unknown) {
+      if (requestId.current === id && currentText.current === originalText) setError(String(cause));
+    } finally {
+      setChanging(false);
+      onBusyChange(false);
+    }
+  };
+
+  return (
+    <div className="cx-providers-context-control">
+      <Checkbox
+        className="cx-providers-checkbox cx-providers-context-checkbox"
+        label={lang === "zh" ? "开启 1M 上下文窗口" : "Enable 1M context window"}
+        checked={Boolean(settings?.enabled)}
+        onCheckedChange={(enabled) => void toggle(enabled)}
+        disabled={disabled || changing || !settings || settings.configText !== configText}
+      />
+      {error ? (
+        <span className="cx-providers-context-error" role="status" title={error}>
+          {lang === "zh" ? "请先修正 config.toml 的格式或上下文字段" : "Check the TOML syntax and context settings first"}
+        </span>
+      ) : settings?.enabled && settings.configText === configText ? (
+        <span className="cx-providers-context-hint">
+          {settings.compactTokenLimit !== null
+            ? lang === "zh"
+              ? `自动压缩阈值：${settings.compactTokenLimit.toLocaleString("zh-CN")} tokens`
+              : `Auto-compact at ${settings.compactTokenLimit.toLocaleString("en-US")} tokens`
+            : lang === "zh" ? "自动压缩使用 Codex 默认值" : "Codex determines the compaction limit"}
+        </span>
+      ) : (
+        <span className="cx-providers-context-hint">
+          {lang === "zh" ? "保存后生效，需模型支持" : "Applies on save; requires model support"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ProviderKindSelect({
+  lang,
+  creatingProvider,
+  providerKind,
+  onProviderKindChange,
+  disabled,
+}: Pick<ProvidersPageProps, "lang" | "creatingProvider" | "providerKind" | "onProviderKindChange"> & { disabled: boolean }) {
+  if (!creatingProvider) return null;
+  return (
+    <div className="cx-providers-form-grid cx-providers-form-grid--single">
+      <Field label={lang === "zh" ? "供应商类型" : "Provider type"}>
+        <select
+          value={providerKind}
+          onChange={(event) => onProviderKindChange(event.target.value === "official" ? "official" : "api")}
+          disabled={disabled}
+        >
+          <option value="api">{lang === "zh" ? "第三方 API" : "Third-party API"}</option>
+          <option value="official">{lang === "zh" ? "官方 Codex 登录" : "Official Codex login"}</option>
+        </select>
+      </Field>
+    </div>
   );
 }
 
@@ -323,7 +472,7 @@ function ListPage({
                 >
                   {copy.enableLabel}
                 </button>
-                {row.source === "official" && (
+                {row.source === "official" && row.isDefaultOfficial && (
                   <ActionIconButton
                     icon={RotateCcw}
                     label={copy.restoreOfficialLabel}
@@ -407,52 +556,81 @@ function ModeHeader({ eyebrow, title, description, cancelLabel, onCancel, disabl
 }
 
 function OfficialForm({
+  lang,
   copy,
+  creatingProvider,
+  providerKind,
+  onProviderKindChange,
   officialForm,
+  officialProfileIsDefault,
+  canLoadCurrentOfficial,
   officialAuthRef,
   officialTomlRef,
   officialInfo,
   loading,
   actionBusy,
   onCancelMode,
+  onOfficialNameChange,
   onOfficialModelChange,
   onOfficialAuthChange,
   onOfficialConfigChange,
   onSaveOfficial,
   onLoadCcSwitchOfficial,
+  onLoadCurrentOfficial,
   onRestoreOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "providerKind" | "onProviderKindChange" | "officialForm" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
-  const formBusy = loading || actionBusy === "loadOfficialDraft" || loadingCcSwitch;
+  const loadingCurrent = actionBusy === "loadCurrentOfficial";
+  const formBusy = loading || actionBusy === "loadOfficialDraft" || loadingCcSwitch || loadingCurrent || contextWindowBusy;
+  const showDefaultActions = officialProfileIsDefault && !creatingProvider;
+  const profileHint = lang === "zh"
+    ? "认证内容可留空；保存并启用后，在 Codex 中完成登录。复制官方供应商会保留原认证，并可修改名称。"
+    : "Authentication may be left empty. Save and enable this provider, then sign in through Codex. A copied official provider keeps its authentication and can be renamed.";
 
   const confirmReset = () => {
+    if (!showDefaultActions || formBusy) return;
     setResetConfirmOpen(false);
     onResetOfficial();
   };
 
   return (
     <>
-      <ModeHeader eyebrow={copy.officialEyebrow} title={copy.officialTitle} description={copy.officialHint} cancelLabel={copy.cancelLabel} onCancel={onCancelMode} disabled={formBusy} />
+      <ModeHeader
+        eyebrow={copy.officialEyebrow}
+        title={creatingProvider ? copy.formAddTitle : copy.officialTitle}
+        description={showDefaultActions ? `${copy.officialHint} ${profileHint}` : profileHint}
+        cancelLabel={copy.cancelLabel}
+        onCancel={onCancelMode}
+        disabled={formBusy}
+      />
+      <ProviderKindSelect lang={lang} creatingProvider={creatingProvider} providerKind={providerKind} onProviderKindChange={onProviderKindChange} disabled={formBusy} />
       <div className="cx-providers-info-grid">
         <div><span>{copy.officialUrlLabel}</span><code>{officialInfo.officialUrl}</code></div>
         <div><span>{copy.authPathLabel}</span><code>{officialInfo.authPath}</code></div>
         <div><span>{copy.officialCurrentLabel}</span><code>{officialInfo.current}</code></div>
       </div>
       <div className="cx-providers-form-grid cx-providers-form-grid--single">
+        <Field label={copy.nameLabel}><input value={officialForm.providerName} onChange={(event) => onOfficialNameChange(event.target.value)} disabled={formBusy} /></Field>
         <Field label={copy.modelLabel}><input value={officialForm.model} onChange={(event) => onOfficialModelChange(event.target.value)} disabled={formBusy} /></Field>
       </div>
-      <Field label={copy.officialTomlLabel} className="cx-providers-editor-field">
+      <div className="cx-providers-editor-field">
+        <div className="cx-providers-context-heading">
+          <span>{copy.officialTomlLabel}</span>
+          <ContextWindowControl lang={lang} configText={officialForm.configText} onConfigChange={onOfficialConfigChange} disabled={formBusy} onBusyChange={setContextWindowBusy} />
+        </div>
         <textarea
           ref={officialTomlRef}
           className="cx-providers-code-editor cx-providers-toml-editor"
           value={officialForm.configText}
+          aria-label={copy.officialTomlLabel}
           onChange={(event) => onOfficialConfigChange(event.target.value)}
           disabled={formBusy}
           spellCheck={false}
         />
-      </Field>
+      </div>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
         <textarea
           ref={officialAuthRef}
@@ -465,22 +643,32 @@ function OfficialForm({
         />
       </Field>
       <div className="cx-providers-form-actions cx-providers-form-actions--save cx-providers-official-actions">
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCurrentOfficial} disabled={formBusy || !canLoadCurrentOfficial}>
+          {loadingCurrent
+            ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
+            : <Download size={15} aria-hidden="true" />}
+          {lang === "zh" ? "读取当前官方登录" : "Load current official login"}
+        </button>
         <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCcSwitchOfficial} disabled={formBusy}>
           {loadingCcSwitch
             ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
             : <Download size={15} aria-hidden="true" />}
           {copy.loadCcSwitchOfficialLabel}
         </button>
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={formBusy}>
-          <RotateCcw size={15} aria-hidden="true" />{copy.restoreOfficialLabel}
-        </button>
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
-          <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
-        </button>
+        {showDefaultActions && (
+          <>
+            <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={formBusy}>
+              <RotateCcw size={15} aria-hidden="true" />{copy.restoreOfficialLabel}
+            </button>
+            <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
+              <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
+            </button>
+          </>
+        )}
         <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
       </div>
       <ModalShell
-        open={resetConfirmOpen}
+        open={resetConfirmOpen && showDefaultActions}
         onClose={() => setResetConfirmOpen(false)}
         title={copy.resetOfficialTitle}
         description={copy.resetOfficialDescription}
@@ -503,7 +691,11 @@ function OfficialForm({
 }
 
 function ProviderForm({
+  lang,
   copy,
+  creatingProvider,
+  providerKind,
+  onProviderKindChange,
   providerForm,
   loading,
   editingProviderId,
@@ -525,10 +717,11 @@ function ProviderForm({
   onProviderTomlDraftChange,
   onResetProviderToml,
   onSaveProvider,
-}: Pick<ProvidersPageProps, "copy" | "providerForm" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onResetProviderToml" | "onSaveProvider">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "providerKind" | "onProviderKindChange" | "providerForm" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onResetProviderToml" | "onSaveProvider">) {
   const modelListId = useId();
+  const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const canFetchModels = Boolean(providerForm.baseUrl.trim() && providerForm.apiKey.trim());
-  const formBusy = loading || fetchingModels;
+  const formBusy = loading || fetchingModels || contextWindowBusy;
 
   return (
     <>
@@ -540,6 +733,7 @@ function ProviderForm({
         onCancel={onCancelMode}
         disabled={formBusy}
       />
+      <ProviderKindSelect lang={lang} creatingProvider={creatingProvider} providerKind={providerKind} onProviderKindChange={onProviderKindChange} disabled={formBusy} />
 
       <section className="cx-providers-form-section">
         <div className="cx-providers-section-heading">
@@ -629,9 +823,12 @@ function ProviderForm({
       <section className="cx-providers-form-section">
         <div className="cx-providers-section-heading cx-providers-section-heading--with-action">
           <div><h3>{copy.tomlTitle}</h3><p>{copy.tomlDescription}</p></div>
-          <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={onResetProviderToml} disabled={formBusy}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
+          <div className="cx-providers-context-actions">
+            <ContextWindowControl lang={lang} configText={providerTomlDraft} onConfigChange={onProviderTomlDraftChange} disabled={formBusy} onBusyChange={setContextWindowBusy} />
+            <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={onResetProviderToml} disabled={formBusy}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
+          </div>
         </div>
-        <textarea ref={providerTomlRef} className="cx-providers-code-editor cx-providers-toml-editor" value={providerTomlDraft} onChange={(event) => onProviderTomlDraftChange(event.target.value)} disabled={formBusy} spellCheck={false} />
+        <textarea ref={providerTomlRef} className="cx-providers-code-editor cx-providers-toml-editor" aria-label={copy.tomlTitle} value={providerTomlDraft} onChange={(event) => onProviderTomlDraftChange(event.target.value)} disabled={formBusy} spellCheck={false} />
       </section>
 
       <div className="cx-providers-form-actions cx-providers-form-actions--save">

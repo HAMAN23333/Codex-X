@@ -23,7 +23,8 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-static BUILTIN_PROMPT_CACHE_LOCK: Mutex<()> = Mutex::new(());
+// Only serialize remote syncs. Local reads must stay available during downloads.
+static BUILTIN_PROMPT_SYNC_LOCK: Mutex<()> = Mutex::new(());
 const CATALOG_CDN_KEY: &str = "模板 CDN";
 const CATALOG_GITHUB_KEY: &str = "GitHub 模板目录";
 const PROMPT_CDN_KEY: &str = "模板 CDN";
@@ -305,6 +306,13 @@ pub(crate) fn delete_cached_prompt_ids(
 
 fn prune_builtin_prompt_cache(active_ids: &HashSet<String>) -> Result<usize> {
     let mut conn = open_db()?;
+    prune_builtin_prompt_cache_on_connection(&mut conn, active_ids)
+}
+
+fn prune_builtin_prompt_cache_on_connection(
+    conn: &mut Connection,
+    active_ids: &HashSet<String>,
+) -> Result<usize> {
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -315,7 +323,14 @@ fn prune_builtin_prompt_cache(active_ids: &HashSet<String>) -> Result<usize> {
     let mut deleted = 0;
     for id in stale_ids {
         deleted += transaction
-            .execute("DELETE FROM builtin_prompt_cache WHERE id = ?1", [id])
+            .execute(
+                "DELETE FROM builtin_prompt_cache
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM builtin_prompt_overrides WHERE template_id = ?1
+                   )",
+                [id],
+            )
             .map_err(|e| CodexxError::Database(e.to_string()))?;
     }
     transaction
@@ -678,6 +693,24 @@ fn mark_customized_prompt_statuses(
     }
 }
 
+fn include_customized_prompt_statuses(
+    statuses: &mut Vec<BuiltinPromptStatus>,
+    customized_ids: &HashSet<String>,
+    caches: Vec<CachedBuiltinPrompt>,
+) {
+    for cache in caches {
+        if customized_ids.contains(&cache.id)
+            && !statuses.iter().any(|status| status.id == cache.id)
+        {
+            statuses.push(prompt_status_from_cache(
+                cache,
+                "本地已修改，GitHub 同步已跳过",
+            ));
+        }
+    }
+    mark_customized_prompt_statuses(statuses, customized_ids);
+}
+
 fn should_sync_prompt_content(id: &str, customized_ids: &HashSet<String>) -> bool {
     !customized_ids.contains(id)
 }
@@ -733,7 +766,7 @@ pub(crate) fn builtin_prompt_status_inner() -> Result<Vec<BuiltinPromptStatus>> 
 pub(crate) fn refresh_builtin_prompts_with_active(
     active_remote_builtin_prompt_id: impl FnOnce() -> Option<String>,
 ) -> Result<Vec<BuiltinPromptStatus>> {
-    let _cache_guard = BUILTIN_PROMPT_CACHE_LOCK
+    let _sync_guard = BUILTIN_PROMPT_SYNC_LOCK
         .lock()
         .map_err(|_| CodexxError::Database("提示词缓存锁已损坏".to_string()))?;
     let customized_ids = builtin_prompt_override_ids_inner()?;
@@ -828,7 +861,10 @@ pub(crate) fn refresh_builtin_prompts_with_active(
     if catalog_confirmation_failed {
         mark_catalog_confirmation_failed(&mut statuses);
     }
-    mark_customized_prompt_statuses(&mut statuses, &customized_ids);
+    // Local edits can finish while remote requests are pending. Use their
+    // latest IDs and retained cache entries when returning the catalog.
+    let customized_ids = builtin_prompt_override_ids_inner()?;
+    include_customized_prompt_statuses(&mut statuses, &customized_ids, cached_builtin_prompts()?);
     let order = bundled_prompt_metas()
         .into_iter()
         .enumerate()
@@ -849,9 +885,8 @@ pub(crate) fn refresh_builtin_prompts_with_active(
 pub(crate) fn builtin_prompt_content(
     template_id: &str,
 ) -> Result<(String, String, String, String)> {
-    let _cache_guard = BUILTIN_PROMPT_CACHE_LOCK
-        .lock()
-        .map_err(|_| CodexxError::Database("提示词缓存锁已损坏".to_string()))?;
+    // Editing and enabling a template are local operations. Network refreshes
+    // update SQLite separately, whose reads see the last committed cache entry.
     let id = if template_id.trim().is_empty() {
         "gpt5.5-unrestricted"
     } else {
@@ -872,19 +907,6 @@ pub(crate) fn builtin_prompt_content(
             "本地已修改".to_string(),
         ));
     }
-    let trust = PromptContentTrust {
-        cached: cached.as_ref().map(|item| item.content.as_str()),
-        bundled: bundled.map(|item| item.content),
-    };
-    if let Ok((remote, source_url)) = fetch_remote_prompt(&filename, trust) {
-        save_builtin_prompt_cache(id, &filename, &source_url, &remote)?;
-        return Ok((
-            filename.clone(),
-            format!("./{filename}"),
-            remote,
-            "在线最新".to_string(),
-        ));
-    }
     if let Some(cache) = cached {
         return Ok((
             cache.filename.clone(),
@@ -894,7 +916,9 @@ pub(crate) fn builtin_prompt_content(
         ));
     }
     let bundled = bundled.ok_or_else(|| {
-        CodexxError::Config(format!("无法下载提示词且没有可用缓存: {template_id}"))
+        CodexxError::Config(format!(
+            "提示词尚无本地内容，请先同步 GitHub 模板: {template_id}"
+        ))
     })?;
     Ok((
         bundled.filename.to_string(),
@@ -925,6 +949,91 @@ pub(crate) fn builtin_prompt_detail_inner(template_id: &str) -> Result<BuiltinPr
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_prompt_detail_does_not_wait_for_background_sync() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let id = "github-detail-during-sync";
+        save_builtin_prompt_cache(
+            id,
+            "detail-during-sync.md",
+            "https://example.test/prompt.md",
+            "cached content",
+        )
+        .expect("cache template");
+        super::super::store::save_builtin_prompt_override_inner(id, "local edit")
+            .expect("save local edit");
+
+        let sync_guard = BUILTIN_PROMPT_SYNC_LOCK
+            .lock()
+            .expect("simulate pending sync");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender.send(builtin_prompt_detail_inner(id)).unwrap();
+        });
+        let detail = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        // Release before asserting so a regression cannot leave a blocked worker.
+        drop(sync_guard);
+        reader.join().expect("finish detail reader");
+        let conn = open_db().expect("open test store");
+        conn.execute(
+            "DELETE FROM builtin_prompt_overrides WHERE template_id = ?1",
+            [id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM builtin_prompt_cache WHERE id = ?1", [id])
+            .unwrap();
+
+        let detail = detail
+            .expect("local detail must finish while sync is pending")
+            .unwrap();
+        assert_eq!(detail.content, "local edit");
+        assert!(detail.customized);
+    }
+
+    #[test]
+    fn cached_and_bundled_prompt_content_stays_available_during_sync() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let id = "github-cached-content-during-sync";
+        save_builtin_prompt_cache(
+            id,
+            "cached-during-sync.md",
+            "https://example.test/prompt.md",
+            "last downloaded content",
+        )
+        .expect("cache online template");
+        let before = cached_builtin_prompt(id).unwrap().unwrap().checked_at;
+        let sync_guard = BUILTIN_PROMPT_SYNC_LOCK
+            .lock()
+            .expect("simulate pending sync");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = (|| -> Result<_> {
+                Ok((
+                    builtin_prompt_content(id)?,
+                    builtin_prompt_content("gpt5.5-unrestricted")?,
+                ))
+            })();
+            sender.send(result).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        drop(sync_guard);
+        reader.join().expect("finish content reader");
+        let after = cached_builtin_prompt(id).unwrap().unwrap().checked_at;
+        open_db()
+            .unwrap()
+            .execute("DELETE FROM builtin_prompt_cache WHERE id = ?1", [id])
+            .unwrap();
+
+        let (cached, bundled) = result
+            .expect("local content must not wait for sync")
+            .unwrap();
+        assert_eq!(cached.2, "last downloaded content");
+        assert_eq!(cached.3, "本地缓存");
+        assert_eq!(bundled.2, INSTRUCTION_CONTENT);
+        assert_eq!(bundled.3, "打包内置");
+        assert_eq!(before, after, "reading must not refresh the cache");
+    }
+
     const TEST_SOURCES: [RemoteSource<'static>; 2] = [
         RemoteSource::new(PROMPT_CDN_KEY, "https://cdn.test/prompt.md", None),
         RemoteSource::new(PROMPT_GITHUB_KEY, "https://github.test/prompt.md", None),
@@ -939,6 +1048,10 @@ mod tests {
                 content TEXT NOT NULL,
                 checked_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE builtin_prompt_overrides (
+                template_id TEXT PRIMARY KEY,
+                content TEXT NOT NULL
             );",
         )
         .expect("create prompt cache table");
@@ -948,6 +1061,65 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open prompt cache database");
         initialize_prompt_cache_schema(&conn);
         conn
+    }
+
+    #[test]
+    fn edit_saved_during_sync_survives_stale_catalog_pruning_and_returned_statuses() {
+        let mut conn = prompt_cache_connection();
+        for id in [
+            "removed-but-edited",
+            "removed-unedited",
+            "remote-still-present",
+        ] {
+            save_builtin_prompt_cache_on_connection(
+                &conn,
+                id,
+                &format!("{id}.md"),
+                "https://example.test/prompt.md",
+                "downloaded content",
+            )
+            .unwrap();
+        }
+        // Sync started before this edit, so its original retained IDs omit it.
+        let retained_at_sync_start = HashSet::from(["remote-still-present".to_string()]);
+        conn.execute(
+            "INSERT INTO builtin_prompt_overrides (template_id, content) VALUES (?1, ?2)",
+            ["removed-but-edited", "new local content"],
+        )
+        .unwrap();
+
+        let removed = prune_builtin_prompt_cache_on_connection(&mut conn, &retained_at_sync_start)
+            .expect("prune the old catalog after the local save");
+        assert_eq!(removed, 1);
+        let cache = cached_builtin_prompt_from_connection(&conn, "removed-but-edited")
+            .unwrap()
+            .expect("keep the filename needed to reopen the saved edit");
+        assert_eq!(cache.filename, "removed-but-edited.md");
+        assert!(
+            cached_builtin_prompt_from_connection(&conn, "removed-unedited")
+                .unwrap()
+                .is_none()
+        );
+
+        let mut statuses = vec![prompt_status_from_cache(
+            cached_builtin_prompt_from_connection(&conn, "remote-still-present")
+                .unwrap()
+                .unwrap(),
+            "synced",
+        )];
+        let customized_ids = HashSet::from(["removed-but-edited".to_string()]);
+        include_customized_prompt_statuses(
+            &mut statuses,
+            &customized_ids,
+            cached_builtin_prompts_from_connection(&conn).unwrap(),
+        );
+        assert_eq!(statuses.len(), 2);
+        let edited = statuses
+            .iter()
+            .find(|status| status.id == "removed-but-edited")
+            .expect("include the newly edited template in the sync response");
+        assert!(edited.customized);
+        assert!(edited.message.contains("本地已修改"));
     }
 
     #[test]

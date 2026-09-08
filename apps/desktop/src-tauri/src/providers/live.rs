@@ -1,18 +1,21 @@
 use super::ccswitch::codex_section_from_table;
+#[cfg(test)]
+use super::official_auth::mark_official_config_reset;
 use super::official_auth::{
     auth_value_has_material, build_official_config_text,
     capture_live_official_config_before_provider_switch, document_is_official,
-    live_config_is_official, mark_official_config_reset, official_config_candidate,
-    official_snapshot_path, save_official_config_snapshot, validate_official_config_text,
+    live_config_is_official, official_config_candidate, official_snapshot_path,
+    save_official_config_snapshot, validate_official_config_text,
 };
 use super::{
     custom_provider_id, delete_provider_inner, experimental_bearer_token_from_doc,
-    is_placeholder_provider, list_saved_providers_inner, list_saved_providers_on_connection,
+    is_placeholder_provider, list_saved_providers_on_connection,
     matching_saved_provider_ids_for_live, normalize_saved_provider,
     normalize_saved_provider_for_save, open_store, provider_template_from_document,
     reconcile_active_provider_on_connection, reserved_codex_provider_id,
-    rollback_provider_store_inner, save_provider_with_rollback_inner, strip_provider_bearer_tokens,
-    unique_saved_provider_id_for_live, ProviderStoreRollback, SavedProvider,
+    rollback_provider_store_inner, save_detected_provider_with_rollback_inner,
+    save_provider_with_rollback_inner, strip_provider_bearer_tokens, ProviderStoreRollback,
+    SavedProvider,
 };
 use crate::backups::create_backup;
 use crate::config_migration::migrate_legacy_prompt_config_locked;
@@ -62,7 +65,8 @@ pub(crate) struct OfficialConfigInput {
     pub(crate) config_text: Option<String>,
 }
 
-enum LiveAuthAction {
+pub(super) enum LiveAuthAction {
+    #[cfg(test)]
     Keep,
     Replace(Value),
     Remove,
@@ -149,7 +153,7 @@ fn live_auth_api_key(codex_dir: &Path) -> Result<Option<String>> {
 }
 
 #[derive(Debug)]
-struct AppliedLiveFiles {
+pub(super) struct AppliedLiveFiles {
     config_path: PathBuf,
     auth_path: PathBuf,
     old_config: Option<Vec<u8>>,
@@ -159,7 +163,7 @@ struct AppliedLiveFiles {
 }
 
 impl AppliedLiveFiles {
-    fn rollback(&self) -> Result<()> {
+    pub(super) fn rollback(&self) -> Result<()> {
         ensure_file_snapshot_unchanged(&self.config_path, Some(self.new_config.as_slice()))?;
         if let Some(new_auth) = &self.new_auth {
             ensure_file_snapshot_unchanged(&self.auth_path, new_auth.as_deref())?;
@@ -378,6 +382,7 @@ where
     let auth = auth_path(codex_dir);
     let new_config = config_text.as_bytes().to_vec();
     let new_auth = match auth_action {
+        #[cfg(test)]
         LiveAuthAction::Keep => None,
         LiveAuthAction::Replace(value) => Some(Some(json_bytes(&auth, value)?)),
         LiveAuthAction::Remove => Some(None),
@@ -549,25 +554,13 @@ pub(crate) fn detected_live_custom_provider(codex_dir: &Path) -> Result<Option<S
     }))
 }
 
-fn persist_detected_live_custom_provider(
+pub(super) fn persist_detected_live_custom_provider(
     codex_dir: &Path,
 ) -> Result<Option<ProviderStoreRollback>> {
-    let Some(mut live) = detected_live_custom_provider(codex_dir)? else {
+    let Some(live) = detected_live_custom_provider(codex_dir)? else {
         return Ok(None);
     };
-    let saved = list_saved_providers_inner()?;
-    let Some(saved_id) = unique_saved_provider_id_for_live(&live, &saved) else {
-        return Ok(None);
-    };
-    if live.api_key.is_none() {
-        live.api_key = saved
-            .iter()
-            .find(|provider| provider.id == saved_id)
-            .and_then(|provider| provider.api_key.clone());
-    }
-    live.id = saved_id;
-    let (_, rollback) = save_provider_with_rollback_inner(live)?;
-    Ok(Some(rollback))
+    save_detected_provider_with_rollback_inner(live)
 }
 
 pub(crate) fn build_provider_toml_draft_inner(
@@ -616,7 +609,7 @@ pub(crate) fn build_provider_toml_draft_inner(
         .ok_or_else(|| CodexxError::Config("无法生成供应商 TOML".to_string()))
 }
 
-fn apply_official_config_locked(
+pub(super) fn apply_official_config_locked(
     codex_dir: &Path,
     config_text: Option<&str>,
     model: Option<&str>,
@@ -624,10 +617,38 @@ fn apply_official_config_locked(
     auth_action: LiveAuthAction,
     action: &str,
 ) -> Result<(Option<String>, AppliedLiveFiles)> {
-    let cfg = config_path(codex_dir);
-    let auth = auth_path(codex_dir);
-    let old_config = read_file_snapshot(&cfg)?;
-    let old_auth = read_file_snapshot(&auth)?;
+    apply_official_config_with_snapshot_locked(
+        codex_dir,
+        config_text,
+        model,
+        clear_model_if_none,
+        auth_action,
+        action,
+        read_live_file_snapshot(codex_dir)?,
+    )
+}
+
+pub(super) struct LiveFileSnapshot {
+    config: Option<Vec<u8>>,
+    auth: Option<Vec<u8>>,
+}
+
+pub(super) fn read_live_file_snapshot(codex_dir: &Path) -> Result<LiveFileSnapshot> {
+    Ok(LiveFileSnapshot {
+        config: read_file_snapshot(&config_path(codex_dir))?,
+        auth: read_file_snapshot(&auth_path(codex_dir))?,
+    })
+}
+
+pub(super) fn apply_official_config_with_snapshot_locked(
+    codex_dir: &Path,
+    config_text: Option<&str>,
+    model: Option<&str>,
+    clear_model_if_none: bool,
+    auth_action: LiveAuthAction,
+    action: &str,
+    before: LiveFileSnapshot,
+) -> Result<(Option<String>, AppliedLiveFiles)> {
     let backup_id = create_backup(codex_dir, action)?;
 
     let config_text = match config_text.map(str::trim).filter(|text| !text.is_empty()) {
@@ -638,7 +659,13 @@ fn apply_official_config_locked(
         }
     };
 
-    let applied = write_live_files(codex_dir, old_config, old_auth, &config_text, &auth_action)?;
+    let applied = write_live_files(
+        codex_dir,
+        before.config,
+        before.auth,
+        &config_text,
+        &auth_action,
+    )?;
     Ok((backup_id, applied))
 }
 
@@ -665,6 +692,7 @@ fn finish_live_action(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn switch_official_provider_with_pre_persist<F>(
     config_dir: Option<String>,
     pre_persist: F,
@@ -732,6 +760,7 @@ where
     finish_live_action(&codex_dir, message, backup_id, &live, snapshot.as_ref())
 }
 
+#[cfg(test)]
 pub(crate) fn switch_official_provider_inner(config_dir: Option<String>) -> Result<ActionResult> {
     let mut provider_rollback = None;
     let result = switch_official_provider_with_pre_persist(config_dir, |codex_dir| {
@@ -843,6 +872,7 @@ pub(crate) fn save_official_config_inner(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn restore_official_provider_inner(config_dir: Option<String>) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     ensure_directory(&codex_dir)?;
@@ -874,6 +904,7 @@ pub(crate) fn restore_official_provider_inner(config_dir: Option<String>) -> Res
     }
 }
 
+#[cfg(test)]
 fn reset_official_provider_with_pre_persist<F>(
     config_dir: Option<String>,
     model: Option<String>,
@@ -926,6 +957,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn reset_official_provider_inner(
     config_dir: Option<String>,
     model: Option<String>,
@@ -2343,5 +2375,228 @@ experimental_bearer_token = "sk-external"
 
         delete_provider_inner(&id).expect("delete adopted provider");
         fs::remove_dir_all(codex_dir).expect("remove detected provider test directory");
+    }
+
+    #[test]
+    fn detected_live_provider_survives_activation_and_later_provider_switches() {
+        let _db_guard = crate::app_db::test_db_guard();
+        for activate_first in [false, true] {
+            let tag = if activate_first { 40_001 } else { 40_002 };
+            let codex_dir = active_provider_test_dir("detected-retained", tag);
+            let config_dir = Some(codex_dir.display().to_string());
+            let name = format!("Detected {tag}");
+            let live = active_provider_fixture(tag, "custom", &name, "live-model", "sk-live");
+            write_active_provider_files(&codex_dir, &live);
+            let original_config = fs::read_to_string(config_path(&codex_dir)).unwrap();
+            let original_auth = fs::read(auth_path(&codex_dir)).unwrap();
+            let state = crate::get_codex_state_inner(config_dir.clone()).unwrap();
+            assert!(state.active_saved_provider_id.is_none());
+            assert!(list_saved_providers_inner()
+                .unwrap()
+                .iter()
+                .all(|provider| provider.base_url != live.base_url));
+            assert_eq!(
+                fs::read_to_string(config_path(&codex_dir)).unwrap(),
+                original_config
+            );
+            assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), original_auth);
+
+            if activate_first {
+                let activated = switch_provider_inner(ProviderInput {
+                    config_dir: config_dir.clone(),
+                    provider_id: Some(custom_provider_id(&live.provider_name)),
+                    provider_name: live.provider_name.clone(),
+                    base_url: live.base_url.clone(),
+                    model: live.model.clone(),
+                    api_key: live.api_key.clone(),
+                    wire_api: Some(live.wire_api.clone()),
+                    requires_openai_auth: Some(live.requires_openai_auth),
+                })
+                .expect("activate the detected CC Switch live configuration");
+                let adopted_id = activated.state.active_saved_provider_id.clone();
+                assert!(adopted_id.is_some());
+                let selected = crate::finish_provider_selection(
+                    activated,
+                    crate::ActiveProviderSelectionUpdate::Set(format!("provisional-{tag}")),
+                );
+                assert_eq!(selected.state.active_saved_provider_id, adopted_id);
+                assert!(!selected.message.contains("当前供应商状态记录失败"));
+            }
+            switch_official_provider_inner(config_dir.clone()).expect("switch to official");
+            let retained = list_saved_providers_inner()
+                .unwrap()
+                .into_iter()
+                .filter(|provider| provider.base_url == live.base_url)
+                .collect::<Vec<_>>();
+            assert_eq!(retained.len(), 1);
+            let retained = &retained[0];
+            assert_eq!(retained.api_key, live.api_key);
+            assert_eq!(retained.provider_name, name);
+            let retained_config = retained.toml_config.clone().unwrap();
+            assert!(retained_config.contains("approval_policy = \"never\""));
+            assert!(retained_config.contains("docs-server"));
+
+            save_provider_toml_config_inner(ProviderTomlInput {
+                config_dir: config_dir.clone(),
+                config_text: retained_config,
+                api_key: retained.api_key.clone(),
+            })
+            .expect("restore the retained provider");
+            assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), original_auth);
+
+            switch_provider_inner(ProviderInput {
+                config_dir,
+                provider_id: Some(format!("other-{tag}")),
+                provider_name: "Other".to_string(),
+                base_url: format!("https://other-{tag}.example.com/v1"),
+                model: "other-model".to_string(),
+                api_key: Some("sk-other".to_string()),
+                wire_api: Some("responses".to_string()),
+                requires_openai_auth: Some(true),
+            })
+            .expect("switch from the detected provider to another third party");
+            let final_rows = list_saved_providers_inner().unwrap();
+            assert_eq!(
+                final_rows
+                    .iter()
+                    .filter(|provider| provider.base_url == live.base_url)
+                    .count(),
+                1
+            );
+            assert_eq!(saved_provider(&retained.id).api_key, live.api_key);
+
+            delete_provider_inner(&retained.id).unwrap();
+            let _ = fs::remove_file(official_snapshot_path(&codex_dir).unwrap());
+            fs::remove_dir_all(codex_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn detected_live_provider_adoption_preserves_an_unrelated_colliding_id() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let tag = 40_003;
+        let codex_dir = active_provider_test_dir("detected-collision", tag);
+        let live = active_provider_fixture(tag, "custom", "Detected Collision", "live", "sk-live");
+        let existing = save_provider_inner(active_provider_fixture(
+            tag + 1,
+            &custom_provider_id(&live.provider_name),
+            "Existing",
+            "existing-model",
+            "sk-existing",
+        ))
+        .unwrap();
+        write_active_provider_files(&codex_dir, &live);
+
+        let activated = save_provider_toml_config_inner(ProviderTomlInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            config_text: fs::read_to_string(config_path(&codex_dir)).unwrap(),
+            api_key: live.api_key.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(saved_provider(&existing.id), existing);
+        let retained = list_saved_providers_inner()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.base_url == live.base_url)
+            .expect("retain detected provider beside the colliding saved ID");
+        assert_ne!(retained.id, existing.id);
+        assert_eq!(retained.api_key, live.api_key);
+        assert_eq!(
+            activated.state.active_saved_provider_id.as_deref(),
+            Some(retained.id.as_str())
+        );
+        let selected = crate::finish_provider_selection(
+            activated,
+            crate::ActiveProviderSelectionUpdate::Set(existing.id.clone()),
+        );
+        assert_eq!(
+            selected.state.active_saved_provider_id.as_deref(),
+            Some(retained.id.as_str())
+        );
+        assert!(!selected.message.contains("当前供应商状态记录失败"));
+        switch_official_provider_inner(Some(codex_dir.display().to_string())).unwrap();
+        assert_eq!(saved_provider(&existing.id), existing);
+        delete_provider_inner(&existing.id).unwrap();
+        delete_provider_inner(&retained.id).unwrap();
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_switch_rolls_back_new_detected_provider_adoption() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let tag = 40_005;
+        let codex_dir = active_provider_test_dir("detected-rollback", tag);
+        let live = active_provider_fixture(tag, "custom", "Detected Rollback", "live", "sk-live");
+        write_active_provider_files(&codex_dir, &live);
+        let config_before = fs::read(config_path(&codex_dir)).unwrap();
+        let auth_before = fs::read(auth_path(&codex_dir)).unwrap();
+
+        let error = switch_provider_inner(ProviderInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            provider_id: Some("missing-key".to_string()),
+            provider_name: "Missing Key".to_string(),
+            base_url: "https://missing-key.example.com/v1".to_string(),
+            model: "target-model".to_string(),
+            api_key: None,
+            wire_api: Some("responses".to_string()),
+            requires_openai_auth: Some(true),
+        })
+        .expect_err("reject target credentials after the pre-switch adoption");
+
+        assert!(error.to_string().contains("需要 API Key"));
+        assert!(list_saved_providers_inner()
+            .unwrap()
+            .iter()
+            .all(|provider| provider.base_url != live.base_url));
+        assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+        assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), auth_before);
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn detected_live_provider_does_not_overwrite_ambiguous_saved_copies() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let tag = 40_006;
+        let codex_dir = active_provider_test_dir("detected-ambiguous", tag);
+        let live = active_provider_fixture(tag, "custom", "Duplicate", "live", "sk-live");
+        let mut first = live.clone();
+        first.id = "detected-ambiguous-first".to_string();
+        let first = save_provider_inner(first).unwrap();
+        let mut second = live.clone();
+        second.id = "detected-ambiguous-second".to_string();
+        let second = save_provider_inner(second).unwrap();
+        write_active_provider_files(&codex_dir, &live);
+
+        let activated = save_provider_toml_config_inner(ProviderTomlInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            config_text: fs::read_to_string(config_path(&codex_dir)).unwrap(),
+            api_key: live.api_key.clone(),
+        })
+        .unwrap();
+        let selected = crate::finish_provider_selection(
+            activated,
+            crate::ActiveProviderSelectionUpdate::Set(second.id.clone()),
+        );
+        assert_eq!(
+            selected.state.active_saved_provider_id.as_deref(),
+            Some(second.id.as_str())
+        );
+
+        switch_official_provider_inner(Some(codex_dir.display().to_string())).unwrap();
+
+        assert_eq!(saved_provider(&first.id), first);
+        assert_eq!(saved_provider(&second.id), second);
+        assert_eq!(
+            list_saved_providers_inner()
+                .unwrap()
+                .iter()
+                .filter(|provider| provider.base_url == live.base_url)
+                .count(),
+            2
+        );
+        delete_provider_inner(&first.id).unwrap();
+        delete_provider_inner(&second.id).unwrap();
+        fs::remove_dir_all(codex_dir).unwrap();
     }
 }

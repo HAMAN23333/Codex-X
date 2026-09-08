@@ -282,7 +282,8 @@ pub(crate) fn matching_saved_provider_ids_for_live(
         .collect()
 }
 
-pub(crate) fn unique_saved_provider_id_for_live(
+#[cfg(test)]
+fn unique_saved_provider_id_for_live(
     live: &SavedProvider,
     providers: &[SavedProvider],
 ) -> Option<String> {
@@ -800,6 +801,98 @@ pub(crate) fn save_provider_inner(provider: SavedProvider) -> Result<SavedProvid
     save_manual_provider_on_connection(&conn, provider)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DuplicateProviderResult {
+    pub(crate) provider: SavedProvider,
+    pub(crate) providers: Vec<SavedProvider>,
+    pub(crate) active_provider_id: Option<String>,
+}
+
+pub(crate) fn duplicate_provider_inner(
+    config_dir: Option<String>,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+) -> Result<DuplicateProviderResult> {
+    let codex_dir = crate::resolve_codex_dir(config_dir)?;
+    let _lock = crate::live_config::acquire_live_config_lock(&codex_dir)?;
+    let live = super::live::detected_live_custom_provider(&codex_dir)?;
+    duplicate_provider_on_connection(
+        &mut open_db()?,
+        &codex_dir,
+        live,
+        provider_id.as_deref(),
+        provider_name.as_deref(),
+    )
+}
+
+fn duplicate_provider_on_connection(
+    conn: &mut Connection,
+    codex_dir: &std::path::Path,
+    live: Option<SavedProvider>,
+    provider_id: Option<&str>,
+    provider_name: Option<&str>,
+) -> Result<DuplicateProviderResult> {
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    let mut saved = list_saved_providers_on_connection(&transaction)?;
+    let source = if let Some(id) = provider_id {
+        provider_by_id_on_connection(&transaction, id)?
+            .ok_or_else(|| CodexxError::Config("供应商已不存在，请刷新列表后重试".to_string()))?
+    } else {
+        let mut detected = live.clone().ok_or_else(|| {
+            CodexxError::Config("当前第三方配置已变更，请刷新列表后重试".to_string())
+        })?;
+        // Adopt an unsaved detected original before adding its copy. Otherwise
+        // the copy would become the only matching row and appear to be enabled.
+        if matching_saved_provider_ids_for_live(&detected, &saved).is_empty() {
+            detected.id = unique_provider_id_on_connection(
+                &transaction,
+                &custom_provider_id(&detected.provider_name),
+            )?;
+            detected = save_manual_provider_on_connection(&transaction, detected)?;
+            saved.push(detected.clone());
+        }
+        detected
+    };
+    let active_provider_id = if let Some(live) = live.as_ref() {
+        super::reconcile_active_provider_on_connection(
+            &transaction,
+            codex_dir,
+            &matching_saved_provider_ids_for_live(live, &saved),
+        )?
+    } else {
+        None
+    };
+    let base_name = provider_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{} 副本", source.provider_name));
+    let mut copy = source.clone();
+    copy.id = unique_provider_id_on_connection(&transaction, &format!("{}-copy", source.id))?;
+    copy.provider_name = base_name.clone();
+    let mut suffix = 2;
+    while saved
+        .iter()
+        .any(|provider| provider.provider_name == copy.provider_name)
+    {
+        copy.provider_name = format!("{base_name} {suffix}");
+        suffix += 1;
+    }
+    let provider = save_manual_provider_on_connection(&transaction, copy)?;
+    let providers = list_saved_providers_on_connection(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    Ok(DuplicateProviderResult {
+        provider,
+        providers,
+        active_provider_id,
+    })
+}
+
 pub(crate) fn save_provider_with_rollback_inner(
     provider: SavedProvider,
 ) -> Result<(SavedProvider, ProviderStoreRollback)> {
@@ -814,6 +907,49 @@ pub(crate) fn save_provider_with_rollback_inner(
         .commit()
         .map_err(|error| CodexxError::Database(error.to_string()))?;
     Ok((saved, ProviderStoreRollback { before, after }))
+}
+
+pub(crate) fn save_detected_provider_with_rollback_inner(
+    mut live: SavedProvider,
+) -> Result<Option<ProviderStoreRollback>> {
+    let mut conn = open_db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    let before = stored_providers_on_connection(&transaction)?;
+    let saved = before
+        .iter()
+        .map(|stored| stored.provider.clone())
+        .collect::<Vec<_>>();
+    let matches = matching_saved_provider_ids_for_live(&live, &saved);
+    match matches.as_slice() {
+        [saved_id] => {
+            if live.api_key.is_none() {
+                live.api_key = saved
+                    .iter()
+                    .find(|provider| &provider.id == saved_id)
+                    .and_then(|provider| provider.api_key.clone());
+            }
+            live.id = saved_id.clone();
+        }
+        [] => {
+            // A detected live route is only a temporary UI row until a write
+            // action adopts it. Preserve it before replacing config/auth, and
+            // allocate its ID under the same transaction to avoid overwriting
+            // an unrelated manual profile or a concurrent adoption.
+            live.id = unique_provider_id_on_connection(
+                &transaction,
+                &custom_provider_id(&live.provider_name),
+            )?;
+        }
+        _ => return Ok(None),
+    }
+    save_manual_provider_on_connection(&transaction, live)?;
+    let after = stored_providers_on_connection(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    Ok(Some(ProviderStoreRollback { before, after }))
 }
 
 fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<()> {
@@ -986,6 +1122,117 @@ mod tests {
 
     fn provider_count(conn: &Connection) -> usize {
         list_saved_providers_on_connection(conn).unwrap().len()
+    }
+
+    fn copy_test_connection() -> Connection {
+        let conn = test_connection();
+        conn.execute_batch("CREATE TABLE active_provider_selections (codex_dir TEXT PRIMARY KEY, provider_id TEXT NOT NULL, updated_at TEXT NOT NULL);").unwrap();
+        conn
+    }
+
+    #[test]
+    fn immediate_copy_preserves_original_selection_and_complete_template() {
+        let mut conn = copy_test_connection();
+        let dir = std::path::Path::new("/fixture/copy-selection");
+        let mut original = provider("original", "Original", Some("fixture-key"));
+        original.toml_config = Some("model = \"gpt-5.5\"\nmodel_provider = \"custom\"\nmodel_context_window = 1000000\n[model_providers.custom]\nname = \"Original\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n[mcp_servers.keep]\ncommand = \"fixture\"\n".to_string());
+        let original = save_manual_provider_on_connection(&conn, original).unwrap();
+        let first = duplicate_provider_on_connection(
+            &mut conn,
+            dir,
+            Some(original.clone()),
+            Some(&original.id),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            first.active_provider_id.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_ne!(first.provider.id, original.id);
+        assert_eq!(first.provider.api_key, original.api_key);
+        assert_eq!(first.provider.provider_name, "Original 副本");
+        let config = first
+            .provider
+            .toml_config
+            .as_ref()
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(config["model_context_window"].as_integer(), Some(1_000_000));
+        assert_eq!(
+            config["mcp_servers"]["keep"]["command"].as_str(),
+            Some("fixture")
+        );
+        assert_eq!(
+            provider_by_id_on_connection(&conn, &original.id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let second = duplicate_provider_on_connection(
+            &mut conn,
+            dir,
+            Some(original.clone()),
+            Some(&original.id),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.provider.provider_name, "Original 副本 2");
+        assert_eq!(
+            second.active_provider_id.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_ne!(second.provider.id, first.provider.id);
+    }
+
+    #[test]
+    fn immediate_copy_adopts_detected_original_without_enabling_the_copy() {
+        let mut conn = copy_test_connection();
+        let dir = std::path::Path::new("/fixture/copy-detected");
+        let live = provider("custom", "Detected", Some("fixture-key"));
+        let result =
+            duplicate_provider_on_connection(&mut conn, dir, Some(live.clone()), None, None)
+                .unwrap();
+        assert_eq!(result.providers.len(), 2);
+        let original = result
+            .providers
+            .iter()
+            .find(|provider| provider.id != result.provider.id)
+            .unwrap();
+        assert_eq!(original.provider_name, live.provider_name);
+        assert_eq!(
+            result.active_provider_id.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_ne!(
+            result.active_provider_id.as_deref(),
+            Some(result.provider.id.as_str())
+        );
+    }
+
+    #[test]
+    fn failed_immediate_copy_rolls_back_detected_adoption_and_selection() {
+        let mut conn = copy_test_connection();
+        conn.execute_batch("CREATE TRIGGER fail_copy BEFORE INSERT ON providers WHEN NEW.provider_name LIKE '%副本%' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        let result = duplicate_provider_on_connection(
+            &mut conn,
+            std::path::Path::new("/fixture/copy-failure"),
+            Some(provider("custom", "Detected", Some("fixture-key"))),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(provider_count(&conn), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM active_provider_selections",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]

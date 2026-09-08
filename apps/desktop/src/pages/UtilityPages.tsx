@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { createContext, useContext, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   CheckCircle2,
+  BarChart3,
   Download,
   ExternalLink,
   Globe2,
@@ -9,9 +10,12 @@ import {
   Power,
   RefreshCw,
   Sparkles,
+  SlidersHorizontal,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { PageTransition } from "../components/PageTransition";
 import { Button, ModalShell } from "../components/ui";
+import { UsageStatisticsPage } from "./UsageStatisticsPage";
 import "../styles/utility-pages.css";
 
 export type UtilityLanguage = "zh" | "en";
@@ -100,6 +104,8 @@ export type SettingsCopy = {
 
 export type SettingsPageProps = {
   lang: UtilityLanguage;
+  configDir: string;
+  active?: boolean;
   copy: SettingsCopy;
   onLanguageChange: (lang: UtilityLanguage) => void;
   onRecheck: () => void;
@@ -107,6 +113,16 @@ export type SettingsPageProps = {
   recheckBusy?: boolean;
   restartBusy?: boolean;
 };
+
+// PageTransition keeps the previous content during its exit animation. Context
+// still propagates the current activity state so requests stop immediately,
+// while the retained usage component keeps its filters between tabs.
+const SettingsUsageActiveContext = createContext(false);
+
+function SettingsUsagePanel({ lang, configDir }: Pick<SettingsPageProps, "lang" | "configDir">) {
+  const active = useContext(SettingsUsageActiveContext);
+  return <UsageStatisticsPage lang={lang} configDir={configDir} active={active} />;
+}
 
 type SettingRowProps = {
   icon: LucideIcon;
@@ -132,6 +148,8 @@ function SettingRow({ icon: Icon, title, description, action }: SettingRowProps)
 
 export function SettingsPage({
   lang,
+  configDir,
+  active = true,
   copy,
   onLanguageChange,
   onRecheck,
@@ -139,6 +157,10 @@ export function SettingsPage({
   recheckBusy = false,
   restartBusy = false,
 }: SettingsPageProps) {
+  const [tab, setTab] = useState<"general" | "usage">("general");
+  const [usageOpened, setUsageOpened] = useState(false);
+  const tabId = useId();
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
   const closeRestartConfirm = () => {
     if (!restartBusy) setRestartConfirmOpen(false);
@@ -151,74 +173,95 @@ export function SettingsPage({
   return (
     <section className="cx-utility cx-page cx-page--settings">
       <PageHeader eyebrow={copy.eyebrow} title={copy.title} />
-      <div className="cx-page-settings-list">
-        <SettingRow
-          icon={Globe2}
-          title={copy.languageTitle}
-          description={copy.languageDescription}
-          action={(
-            <div className="cx-page-segmented" role="group" aria-label={String(copy.languageTitle)}>
-              <button
-                type="button"
-                className={lang === "zh" ? "cx-page-segmented-button cx-page-segmented-button--active" : "cx-page-segmented-button"}
-                onClick={() => onLanguageChange("zh")}
-                aria-pressed={lang === "zh"}
-              >
-                {copy.chineseLabel}
-              </button>
-              <button
-                type="button"
-                className={lang === "en" ? "cx-page-segmented-button cx-page-segmented-button--active" : "cx-page-segmented-button"}
-                onClick={() => onLanguageChange("en")}
-                aria-pressed={lang === "en"}
-              >
-                {copy.englishLabel}
-              </button>
-            </div>
-          )}
-        />
-
-        <SettingRow
-          icon={Sparkles}
-          title={copy.productTitle}
-          description={copy.productDescription}
-          action={<span className="cx-page-value-pill">{copy.productValue}</span>}
-        />
-
-        <SettingRow
-          icon={CheckCircle2}
-          title={copy.recheckTitle}
-          description={copy.recheckDescription}
-          action={(
-            <button
-              type="button"
-              className="cx-page-button cx-page-button--secondary"
-              onClick={onRecheck}
-              disabled={recheckBusy}
-            >
-              {recheckBusy && <Loader2 size={15} className="cx-page-spin" aria-hidden="true" />}
-              {copy.recheckLabel}
-            </button>
-          )}
-        />
-
-        <SettingRow
-          icon={Power}
-          title={copy.restartTitle}
-          description={copy.restartDescription}
-          action={(
-            <button
-              type="button"
-              className="cx-page-button cx-page-button--secondary"
-              onClick={() => setRestartConfirmOpen(true)}
-              disabled={restartBusy}
-            >
-              {restartBusy ? <Loader2 size={15} className="cx-page-spin" aria-hidden="true" /> : <Power size={15} aria-hidden="true" />}
-              {restartBusy ? copy.restartingLabel : copy.restartLabel}
-            </button>
-          )}
-        />
+      <div className="cx-settings-tabs" role="tablist" aria-label={lang === "zh" ? "设置页面" : "Settings pages"}>
+        {(["general", "usage"] as const).map((value, index) => {
+          const Icon = value === "general" ? SlidersHorizontal : BarChart3;
+          const select = () => { setTab(value); if (value === "usage") setUsageOpened(true); };
+          return <button key={value} ref={(element) => { tabRefs.current[index] = element; }} type="button" role="tab" id={`${tabId}-${value}-tab`} aria-controls={`${tabId}-${value}-panel`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className="cx-settings-tab" onClick={select} onKeyDown={(event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === "Home" ? 0 : event.key === "End" ? 1 : 1 - index;
+            tabRefs.current[next]?.click();
+            tabRefs.current[next]?.focus();
+          }}><Icon size={14} aria-hidden="true" />{value === "general" ? (lang === "zh" ? "通用设置" : "General") : (lang === "zh" ? "用量统计" : "Usage statistics")}</button>;
+        })}
       </div>
+      <SettingsUsageActiveContext.Provider value={active && tab === "usage"}>
+        <PageTransition pageKey={`settings:${tab}`}>
+          <div className="cx-settings-panel cx-page-settings-list" role="tabpanel" id={`${tabId}-general-panel`} aria-labelledby={`${tabId}-general-tab`} hidden={tab !== "general"}>
+            <SettingRow
+              icon={Globe2}
+              title={copy.languageTitle}
+              description={copy.languageDescription}
+              action={(
+                <div className="cx-page-segmented" role="group" aria-label={String(copy.languageTitle)}>
+                  <button
+                    type="button"
+                    className={lang === "zh" ? "cx-page-segmented-button cx-page-segmented-button--active" : "cx-page-segmented-button"}
+                    onClick={() => onLanguageChange("zh")}
+                    aria-pressed={lang === "zh"}
+                  >
+                    {copy.chineseLabel}
+                  </button>
+                  <button
+                    type="button"
+                    className={lang === "en" ? "cx-page-segmented-button cx-page-segmented-button--active" : "cx-page-segmented-button"}
+                    onClick={() => onLanguageChange("en")}
+                    aria-pressed={lang === "en"}
+                  >
+                    {copy.englishLabel}
+                  </button>
+                </div>
+              )}
+            />
+
+            <SettingRow
+              icon={Sparkles}
+              title={copy.productTitle}
+              description={copy.productDescription}
+              action={<span className="cx-page-value-pill">{copy.productValue}</span>}
+            />
+
+            <SettingRow
+              icon={CheckCircle2}
+              title={copy.recheckTitle}
+              description={copy.recheckDescription}
+              action={(
+                <button
+                  type="button"
+                  className="cx-page-button cx-page-button--secondary"
+                  onClick={onRecheck}
+                  disabled={recheckBusy}
+                >
+                  {recheckBusy && <Loader2 size={15} className="cx-page-spin" aria-hidden="true" />}
+                  {copy.recheckLabel}
+                </button>
+              )}
+            />
+
+            <SettingRow
+              icon={Power}
+              title={copy.restartTitle}
+              description={copy.restartDescription}
+              action={(
+                <button
+                  type="button"
+                  className="cx-page-button cx-page-button--secondary"
+                  onClick={() => setRestartConfirmOpen(true)}
+                  disabled={restartBusy}
+                >
+                  {restartBusy ? <Loader2 size={15} className="cx-page-spin" aria-hidden="true" /> : <Power size={15} aria-hidden="true" />}
+                  {restartBusy ? copy.restartingLabel : copy.restartLabel}
+                </button>
+              )}
+            />
+          </div>
+
+          <div className="cx-settings-panel" role="tabpanel" id={`${tabId}-usage-panel`} aria-labelledby={`${tabId}-usage-tab`} hidden={tab !== "usage"}>
+            {usageOpened && <SettingsUsagePanel lang={lang} configDir={configDir} />}
+          </div>
+        </PageTransition>
+      </SettingsUsageActiveContext.Provider>
 
       <ModalShell
         open={restartConfirmOpen}

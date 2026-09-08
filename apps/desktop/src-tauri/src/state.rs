@@ -47,6 +47,7 @@ pub(crate) struct CodexState {
     pub(crate) instruction_template_key: Option<String>,
     agents_path: String,
     pub(crate) active_saved_provider_id: Option<String>,
+    pub(crate) active_official_profile_id: Option<String>,
     providers: Vec<ProviderSummary>,
     pub(crate) config_text: String,
     auth_preview: Option<Value>,
@@ -249,6 +250,10 @@ pub(crate) fn build_state_after_migration(codex_dir: PathBuf) -> Result<CodexSta
         instruction_template_key,
         agents_path: agents_path(&codex_dir).display().to_string(),
         active_saved_provider_id,
+        active_official_profile_id: crate::providers::official_profiles::active_profile_id(
+            &codex_dir,
+            is_official_provider,
+        )?,
         providers,
         config_text: text,
         auth_preview: redacted_auth_preview(&auth)?,

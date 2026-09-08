@@ -2,6 +2,7 @@ mod ccswitch;
 mod connection;
 mod live;
 mod official_auth;
+pub(crate) mod official_profiles;
 mod selection;
 mod store;
 
@@ -25,21 +26,22 @@ pub(crate) use connection::{
 };
 pub(crate) use live::detected_live_custom_provider;
 pub(crate) use live::{
-    build_provider_toml_draft_inner, delete_saved_provider_inner, reset_official_provider_inner,
-    restore_official_provider_inner, save_active_provider_inner, save_official_config_inner,
-    save_provider_toml_config_inner, switch_official_provider_inner, switch_provider_inner,
+    build_provider_toml_draft_inner, delete_saved_provider_inner, save_active_provider_inner,
+    save_official_config_inner, save_provider_toml_config_inner, switch_provider_inner,
     OfficialConfigInput, ProviderInput, ProviderTomlInput,
 };
 #[cfg(test)]
 pub(crate) use live::{
-    save_provider_toml_config_with_pre_persist, switch_official_provider_with_pre_persist,
-    switch_provider_with_pre_persist,
+    reset_official_provider_inner, restore_official_provider_inner,
+    save_provider_toml_config_with_pre_persist, switch_official_provider_inner,
+    switch_official_provider_with_pre_persist, switch_provider_with_pre_persist,
 };
 #[cfg(test)]
-pub(crate) use official_auth::{capture_live_chatgpt_config, official_snapshot_path_for_test};
 pub(crate) use official_auth::{
-    document_is_official, get_official_config_draft_inner, official_auth_available,
-    OfficialConfigDraft,
+    capture_live_chatgpt_config, get_official_config_draft_inner, official_snapshot_path_for_test,
+};
+pub(crate) use official_auth::{
+    document_is_official, official_auth_available, OfficialConfigDraft,
 };
 pub(crate) use selection::{
     clear_active_provider_on_connection, clear_provider_selections_on_connection,
@@ -52,14 +54,14 @@ pub(crate) use store::{
 };
 pub(crate) use store::{
     consolidate_legacy_provider_duplicates_on_connection, custom_provider_id,
-    delete_provider_inner, experimental_bearer_token_from_doc, is_placeholder_provider,
-    list_saved_providers_inner, list_saved_providers_on_connection,
+    delete_provider_inner, duplicate_provider_inner, experimental_bearer_token_from_doc,
+    is_placeholder_provider, list_saved_providers_inner, list_saved_providers_on_connection,
     matching_saved_provider_ids_for_live, normalize_saved_provider,
     normalize_saved_provider_for_save, provider_template_from_document, reserved_codex_provider_id,
-    rollback_provider_store_inner, save_provider_inner, save_provider_with_rollback_inner,
-    strip_provider_bearer_tokens, unique_saved_provider_id_for_live,
-    upsert_ccswitch_provider_on_connection, ProviderStoreRollback, ProviderUpsertKind,
-    SavedProvider,
+    rollback_provider_store_inner, save_detected_provider_with_rollback_inner, save_provider_inner,
+    save_provider_with_rollback_inner, strip_provider_bearer_tokens,
+    upsert_ccswitch_provider_on_connection, DuplicateProviderResult, ProviderStoreRollback,
+    ProviderUpsertKind, SavedProvider,
 };
 
 pub(crate) fn open_store() -> Result<Connection> {

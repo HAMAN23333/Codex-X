@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use toml_edit::DocumentMut;
 
 pub(super) fn current_model_provider(codex_dir: &Path, explicit: Option<String>) -> Result<String> {
@@ -700,12 +700,15 @@ fn sqlite_state_version(path: &Path) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-fn sqlite_table_names(path: &Path) -> Option<HashSet<String>> {
+fn sqlite_table_names(path: &Path, busy_timeout: Option<Duration>) -> Option<HashSet<String>> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
+    if let Some(timeout) = busy_timeout {
+        conn.busy_timeout(timeout).ok()?;
+    }
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
         .ok()?;
@@ -778,6 +781,13 @@ fn ordered_database_paths(
 }
 
 pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
+    discover_sqlite_databases_with_busy_timeout(codex_dir, None)
+}
+
+fn discover_sqlite_databases_with_busy_timeout(
+    codex_dir: &Path,
+    busy_timeout: Option<Duration>,
+) -> SqliteDiscovery {
     let mut databases = Vec::new();
     let mut seen_paths = HashSet::new();
     let mut unreadable_paths = Vec::new();
@@ -838,7 +848,7 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
                 continue;
             }
             let codex_named = is_root_codex_sqlite_file(&path);
-            let Some(tables) = sqlite_table_names(&path) else {
+            let Some(tables) = sqlite_table_names(&path, busy_timeout) else {
                 let header_is_sqlite = has_sqlite_header(&path);
                 let read_error = fs::File::open(&path).err();
                 if header_is_sqlite || read_error.is_some() {
@@ -910,6 +920,116 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
 
 pub(crate) fn sqlite_candidate_paths(codex_dir: &Path) -> Vec<PathBuf> {
     discover_sqlite_databases(codex_dir).active_paths
+}
+
+fn clean_session_title(values: [Option<String>; 3]) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+pub(crate) fn session_project_title(cwd: &str) -> Option<String> {
+    let path = normalize_workspace_path(cwd)?.replace('\\', "/");
+    if path.chars().any(char::is_control) || path.contains("://") {
+        return None;
+    }
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    // A UNC share root is a storage location, rather than a project directory.
+    if path.starts_with("//") && parts.len() <= 2 {
+        return None;
+    }
+    let name = parts.last()?.trim();
+    if name.is_empty()
+        || matches!(name, "." | ".." | "~")
+        || (name.len() == 2 && name.as_bytes()[0].is_ascii_alphabetic() && name.ends_with(':'))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Best-effort titles for the small recent-usage list. Read only the requested
+/// IDs and re-read metadata on each refresh so renamed chats appear immediately.
+pub(crate) fn session_titles_by_id(codex_dir: &Path, ids: &[String]) -> HashMap<String, String> {
+    let ids = ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>();
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let timeout = Duration::from_millis(50);
+    let discovery = discover_sqlite_databases_with_busy_timeout(codex_dir, Some(timeout));
+    let mut titles = HashMap::new();
+    let mut projects = HashMap::new();
+    for path in discovery.active_first_session_paths() {
+        let Ok(conn) = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            continue;
+        };
+        if conn.busy_timeout(timeout).is_err()
+            || !sqlite_has_table(&conn, "threads").unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(cols) = table_column_set(&conn, "threads") else {
+            continue;
+        };
+        if !cols.contains("id") {
+            continue;
+        }
+        let unresolved = ids
+            .iter()
+            .copied()
+            .filter(|id| !titles.contains_key(*id))
+            .collect::<Vec<_>>();
+        if unresolved.is_empty() {
+            break;
+        }
+        let title = sql_select_column(&cols, "title", "NULL");
+        let first = sql_select_column(&cols, "first_user_message", "NULL");
+        let preview = sql_select_column(&cols, "preview", "NULL");
+        let cwd = sql_select_column(&cols, "cwd", "NULL");
+        // Keep below SQLite's variable limit even if another caller requests more IDs.
+        for chunk in unresolved.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let query = format!("SELECT \"id\", {title}, {first}, {preview}, {cwd} FROM threads WHERE \"id\" IN ({placeholders})");
+            let Ok(mut statement) = conn.prepare(&query) else {
+                continue;
+            };
+            let Ok(rows) = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                let id = row.get::<_, String>(0)?;
+                let text = |index| row.get::<_, Option<String>>(index).ok().flatten();
+                Ok((
+                    id,
+                    clean_session_title([text(1), text(2), text(3)]),
+                    text(4),
+                ))
+            }) else {
+                continue;
+            };
+            for (id, title, cwd) in rows.flatten() {
+                if let Some(title) = title {
+                    titles.entry(id).or_insert(title);
+                } else if let Some(project) = cwd.as_deref().and_then(session_project_title) {
+                    projects.entry(id).or_insert(project);
+                }
+            }
+        }
+    }
+    // Prefer a real chat title from an older database over a project-only fallback.
+    for (id, project) in projects {
+        titles.entry(id).or_insert(project);
+    }
+    titles
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -991,7 +1111,7 @@ pub(super) fn sqlite_subagent_thread_ids(
     Ok(ids)
 }
 
-fn source_value_is_subagent(source: &Value) -> bool {
+pub(crate) fn source_value_is_subagent(source: &Value) -> bool {
     match source {
         Value::String(source) => source.trim().eq_ignore_ascii_case("subagent"),
         Value::Object(source) => source.contains_key("subagent"),
@@ -1006,6 +1126,160 @@ fn source_text_is_subagent(source: &str) -> bool {
             .ok()
             .as_ref()
             .is_some_and(source_value_is_subagent)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsageThreadIdentity {
+    pub(crate) is_subagent: bool,
+    pub(crate) classification_known: bool,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) parent_conflict: bool,
+}
+
+fn usage_identities_on_connection(
+    conn: &Connection,
+) -> Result<HashMap<String, (bool, bool, HashSet<String>)>> {
+    if !sqlite_has_table(conn, "threads")? {
+        return Ok(HashMap::new());
+    }
+    let cols = table_column_set(conn, "threads")?;
+    if !cols.contains("id") {
+        return Ok(HashMap::new());
+    }
+    let subagents = sqlite_subagent_thread_ids(conn, &cols)?;
+    let source = sql_select_column(&cols, "source", "NULL");
+    let thread_source = sql_select_column(&cols, "thread_source", "NULL");
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT id, {source}, {thread_source} FROM threads"
+        ))
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1).ok().flatten(),
+                row.get::<_, Option<String>>(2).ok().flatten(),
+            ))
+        })
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    let mut identities = HashMap::new();
+    for row in rows {
+        let (id, source, thread_source) =
+            row.map_err(|error| CodexxError::Database(error.to_string()))?;
+        if id.trim().is_empty() {
+            continue;
+        }
+        let is_subagent = subagents.contains(&id);
+        let classification_known = is_subagent
+            || thread_source
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || source
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+        let mut parents = HashSet::new();
+        if is_subagent {
+            if let Some(parent) = source
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .pointer("/subagent/thread_spawn/parent_thread_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                parents.insert(parent);
+            }
+        }
+        identities.insert(id, (is_subagent, classification_known, parents));
+    }
+    if sqlite_has_table(conn, "thread_spawn_edges")? {
+        let cols = table_column_set(conn, "thread_spawn_edges")?;
+        if cols.contains("child_thread_id") && cols.contains("parent_thread_id") {
+            let mut statement = conn
+                .prepare("SELECT child_thread_id, parent_thread_id FROM thread_spawn_edges")
+                .map_err(|error| CodexxError::Database(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1).ok().flatten(),
+                    ))
+                })
+                .map_err(|error| CodexxError::Database(error.to_string()))?;
+            for row in rows {
+                let (child, parent) =
+                    row.map_err(|error| CodexxError::Database(error.to_string()))?;
+                if let Some((true, _, parents)) = identities.get_mut(&child) {
+                    if let Some(parent) = parent
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                    {
+                        parents.insert(parent);
+                    }
+                }
+            }
+        }
+    }
+    Ok(identities)
+}
+
+/// Reuse session-management classification without reading any rollout content.
+/// Current database records override stale legacy classification and parentage.
+pub(crate) fn usage_thread_identities(codex_dir: &Path) -> HashMap<String, UsageThreadIdentity> {
+    let timeout = Duration::from_millis(50);
+    let discovery = discover_sqlite_databases_with_busy_timeout(codex_dir, Some(timeout));
+    let mut active_ids = HashSet::new();
+    let mut combined = HashMap::<String, (bool, bool, HashSet<String>)>::new();
+    for path in discovery.active_first_session_paths() {
+        let Ok(conn) = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            continue;
+        };
+        if conn.busy_timeout(timeout).is_err() {
+            continue;
+        }
+        let Ok(identities) = usage_identities_on_connection(&conn) else {
+            continue;
+        };
+        let is_active = discovery.active_paths.contains(&path);
+        for (id, (is_subagent, classification_known, parents)) in identities {
+            if is_active {
+                active_ids.insert(id.clone());
+                combined.insert(id, (is_subagent, classification_known, parents));
+            } else if !active_ids.contains(&id) {
+                let existing = combined
+                    .entry(id)
+                    .or_insert_with(|| (false, false, HashSet::new()));
+                existing.0 |= is_subagent;
+                existing.1 |= classification_known;
+                existing.2.extend(parents);
+            }
+        }
+    }
+    combined
+        .into_iter()
+        .map(|(id, (is_subagent, classification_known, parents))| {
+            let parent_conflict = is_subagent && parents.len() > 1;
+            let parent_id =
+                (is_subagent && parents.len() == 1).then(|| parents.into_iter().next().unwrap());
+            (
+                id,
+                UsageThreadIdentity {
+                    is_subagent,
+                    classification_known,
+                    parent_id,
+                    parent_conflict,
+                },
+            )
+        })
+        .collect()
 }
 
 pub(super) struct SqliteThreadIndexState<'a> {
@@ -1240,11 +1514,7 @@ pub(super) fn list_session_previews_with_paths(
                 let updated_at: Option<i64> = row.get(9)?;
                 let archived: i64 = row.get(10)?;
                 let has_user_event: i64 = row.get(11)?;
-                let clean_title = [title, first_message, preview]
-                    .into_iter()
-                    .flatten()
-                    .map(|v| v.trim().to_string())
-                    .find(|v| !v.is_empty())
+                let clean_title = clean_session_title([title, first_message, preview])
                     .unwrap_or_else(|| format!("会话 {}", id.chars().take(8).collect::<String>()));
                 let normalized_provider = model_provider
                     .as_ref()
@@ -1349,6 +1619,335 @@ mod tests {
             (id, provider),
         )
         .expect("insert thread");
+    }
+
+    fn create_title_database(path: &Path) -> Connection {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title, first_user_message, preview, cwd TEXT);").unwrap();
+        conn
+    }
+
+    fn create_identity_database(path: &Path) -> Connection {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, thread_source TEXT, source TEXT);
+            CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn usage_thread_identity_reuses_edges_source_and_authoritative_thread_source() {
+        let dir = temp_codex_dir("usage-identities-source");
+        let path = dir.join("state_10.sqlite");
+        let conn = create_identity_database(&path);
+        conn.execute_batch(r#"INSERT INTO threads VALUES
+            ('parent', 'user', NULL),
+            ('edge', NULL, NULL),
+            ('source', NULL, '{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}'),
+            ('thread-source', 'subagent', NULL),
+            ('source-only', NULL, 'subagent'),
+            ('user-override', 'user', '{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}');
+            INSERT INTO thread_spawn_edges VALUES ('parent', 'edge'), ('parent', 'user-override');"#).unwrap();
+        drop(conn);
+        let before = fs::read(&path).unwrap();
+        let identities = usage_thread_identities(&dir);
+        assert_eq!(
+            identities["edge"],
+            UsageThreadIdentity {
+                classification_known: true,
+                is_subagent: true,
+                parent_id: Some("parent".into()),
+                parent_conflict: false,
+            }
+        );
+        assert_eq!(identities["source"], identities["edge"]);
+        assert_eq!(
+            identities["thread-source"],
+            UsageThreadIdentity {
+                classification_known: true,
+                is_subagent: true,
+                parent_id: None,
+                parent_conflict: false,
+            }
+        );
+        assert_eq!(identities["source-only"], identities["thread-source"]);
+        assert_eq!(
+            identities["user-override"],
+            UsageThreadIdentity {
+                classification_known: true,
+                is_subagent: false,
+                parent_id: None,
+                parent_conflict: false,
+            }
+        );
+        assert_eq!(identities["parent"], identities["user-override"]);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_thread_identity_missing_or_blank_source_is_unknown_not_explicit_user() {
+        let dir = temp_codex_dir("usage-identities-unknown");
+        let active = create_identity_database(&dir.join("state_10.sqlite"));
+        active
+            .execute_batch(
+                "INSERT INTO threads VALUES
+            ('null-source', NULL, NULL), ('blank-source', '  ', '  '),
+            ('known-user', 'user', NULL), ('source-user', NULL, 'cli');",
+            )
+            .unwrap();
+        let legacy_path = dir.join("sqlite/state_5.sqlite");
+        create_thread_database(&legacy_path, "no-source-columns", "openai");
+        let identities = usage_thread_identities(&dir);
+        for id in ["null-source", "blank-source", "no-source-columns"] {
+            assert_eq!(
+                identities[id],
+                UsageThreadIdentity {
+                    is_subagent: false,
+                    classification_known: false,
+                    parent_id: None,
+                    parent_conflict: false,
+                }
+            );
+        }
+        for id in ["known-user", "source-user"] {
+            assert!(!identities[id].is_subagent);
+            assert!(identities[id].classification_known);
+        }
+        drop(active);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_thread_identity_active_records_override_stale_legacy_subagents_and_parents() {
+        let dir = temp_codex_dir("usage-identities-active");
+        let active = create_identity_database(&dir.join("state_10.sqlite"));
+        let legacy = create_identity_database(&dir.join("sqlite/state_5.sqlite"));
+        active
+            .execute_batch(
+                "INSERT INTO threads VALUES ('user', 'user', NULL), ('child', 'subagent', NULL);
+            INSERT INTO thread_spawn_edges VALUES ('current-parent', 'child');",
+            )
+            .unwrap();
+        legacy.execute_batch("INSERT INTO threads VALUES ('user', 'subagent', NULL), ('child', 'subagent', NULL), ('legacy-child', 'subagent', NULL);
+            INSERT INTO thread_spawn_edges VALUES ('old-parent', 'user'), ('old-parent', 'child'), ('legacy-parent', 'legacy-child');").unwrap();
+        let identities = usage_thread_identities(&dir);
+        assert_eq!(
+            identities["user"],
+            UsageThreadIdentity {
+                classification_known: true,
+                is_subagent: false,
+                parent_id: None,
+                parent_conflict: false,
+            }
+        );
+        assert_eq!(
+            identities["child"].parent_id.as_deref(),
+            Some("current-parent")
+        );
+        assert_eq!(
+            identities["legacy-child"].parent_id.as_deref(),
+            Some("legacy-parent")
+        );
+        drop(active);
+        drop(legacy);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_thread_identity_conflicting_parent_edges_or_sources_remain_unassigned() {
+        let dir = temp_codex_dir("usage-identities-conflicts");
+        let active = create_identity_database(&dir.join("state_10.sqlite"));
+        let first = create_identity_database(&dir.join("sqlite/state_5.sqlite"));
+        let second = create_identity_database(&dir.join("sqlite/state_6.sqlite"));
+        active.execute_batch(r#"INSERT INTO threads VALUES ('conflict', 'subagent', '{"subagent":{"thread_spawn":{"parent_thread_id":"source-parent"}}}');
+            INSERT INTO thread_spawn_edges VALUES ('edge-parent', 'conflict');"#).unwrap();
+        first.execute_batch("INSERT INTO threads VALUES ('legacy', 'subagent', NULL); INSERT INTO thread_spawn_edges VALUES ('first-parent', 'legacy');").unwrap();
+        second.execute_batch("INSERT INTO threads VALUES ('legacy', 'subagent', NULL); INSERT INTO thread_spawn_edges VALUES ('second-parent', 'legacy');").unwrap();
+        let identities = usage_thread_identities(&dir);
+        assert_eq!(
+            identities["conflict"],
+            UsageThreadIdentity {
+                classification_known: true,
+                is_subagent: true,
+                parent_id: None,
+                parent_conflict: true,
+            }
+        );
+        assert_eq!(identities["legacy"], identities["conflict"]);
+        drop(active);
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_thread_identity_missing_corrupt_and_locked_databases_are_best_effort() {
+        let dir = temp_codex_dir("usage-identities-unavailable");
+        assert!(usage_thread_identities(&dir.join("missing")).is_empty());
+        assert!(!dir.join("missing").exists());
+        fs::write(
+            dir.join("state_12.sqlite"),
+            b"SQLite format 3\0broken fixture",
+        )
+        .unwrap();
+        assert!(usage_thread_identities(&dir).is_empty());
+        let locked = create_identity_database(&dir.join("state_10.sqlite"));
+        locked
+            .execute_batch("INSERT INTO threads VALUES ('user', 'user', NULL); BEGIN EXCLUSIVE;")
+            .unwrap();
+        let start = std::time::Instant::now();
+        assert!(usage_thread_identities(&dir).is_empty());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        locked.execute_batch("ROLLBACK;").unwrap();
+        assert!(!usage_thread_identities(&dir)["user"].is_subagent);
+        drop(locked);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_session_titles_follow_chat_title_fallbacks_and_only_requested_ids() {
+        let codex_dir = temp_codex_dir("usage-title-fields");
+        let conn = create_title_database(&codex_dir.join("state_10.sqlite"));
+        conn.execute_batch(
+            "INSERT INTO threads VALUES
+             ('named', '  真实聊天标题  ', 'First message', 'Preview', '/projects/unused'),
+             ('first', '   ', ' 首条用户消息 ', 'Preview', NULL),
+             ('preview', NULL, ' ', '  会话摘要  ', NULL),
+             ('project', NULL, NULL, NULL, 'C:\\work\\Codex-X\\'),
+             ('invalid-title', X'FF', ' 可读取的首条消息 ', NULL, NULL),
+             ('invalid-values', 42, 3.14, X'FF', NULL),
+             ('root', NULL, NULL, NULL, '/'),
+             ('excluded', 'This row was not requested', NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let ids = [
+            "named",
+            "first",
+            "preview",
+            "project",
+            "invalid-title",
+            "invalid-values",
+            "root",
+            "x' OR 1=1 --",
+        ]
+        .map(ToString::to_string);
+        let titles = session_titles_by_id(&codex_dir, &ids);
+        assert_eq!(titles.len(), 5);
+        assert_eq!(titles["named"], "真实聊天标题");
+        assert_eq!(titles["first"], "首条用户消息");
+        assert_eq!(titles["preview"], "会话摘要");
+        assert_eq!(titles["project"], "Codex-X");
+        assert_eq!(titles["invalid-title"], "可读取的首条消息");
+        assert!(!titles.contains_key("excluded"));
+        assert!(!titles.contains_key("invalid-values"));
+        assert!(!titles.contains_key("root"));
+        drop(conn);
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn usage_session_titles_prefer_active_database_and_reread_renames() {
+        let codex_dir = temp_codex_dir("usage-title-priority");
+        let active = create_title_database(&codex_dir.join("state_10.sqlite"));
+        let legacy = create_title_database(&codex_dir.join("sqlite/state_5.sqlite"));
+        active
+            .execute_batch(
+                "INSERT INTO threads VALUES
+            ('shared', 'Current title', NULL, NULL, NULL),
+            ('fallback', ' ', NULL, NULL, '/projects/active-project'),
+            ('project', NULL, NULL, NULL, '/projects/active-project');",
+            )
+            .unwrap();
+        legacy
+            .execute_batch(
+                "INSERT INTO threads VALUES
+            ('shared', 'Old title', NULL, NULL, NULL),
+            ('fallback', 'Recovered chat title', NULL, NULL, '/projects/old-project'),
+            ('project', NULL, NULL, NULL, '/projects/old-project');",
+            )
+            .unwrap();
+        let ids = ["shared", "fallback", "project"].map(ToString::to_string);
+        let titles = session_titles_by_id(&codex_dir, &ids);
+        assert_eq!(titles["shared"], "Current title");
+        assert_eq!(titles["fallback"], "Recovered chat title");
+        assert_eq!(titles["project"], "active-project");
+        active
+            .execute(
+                "UPDATE threads SET title = 'Renamed chat title' WHERE id = 'shared'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            session_titles_by_id(&codex_dir, &ids)["shared"],
+            "Renamed chat title"
+        );
+        drop(active);
+        drop(legacy);
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn usage_session_titles_are_read_only_and_tolerate_missing_corrupt_or_locked_databases() {
+        let codex_dir = temp_codex_dir("usage-title-read-only");
+        let missing = codex_dir.join("missing");
+        let ids = ["session".to_string()];
+        assert!(session_titles_by_id(&missing, &ids).is_empty());
+        assert!(!missing.exists());
+        let path = codex_dir.join("state_10.sqlite");
+        create_thread_database(&path, "session", "openai");
+        fs::write(
+            codex_dir.join("state_12.sqlite"),
+            b"SQLite format 3\0broken fixture",
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions.clone()).unwrap();
+        assert_eq!(
+            session_titles_by_id(&codex_dir, &ids)["session"],
+            "test session"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert!(!codex_dir.join("state_10.sqlite-journal").exists());
+        fs::set_permissions(&path, original_permissions).unwrap();
+        let locked = Connection::open(&path).unwrap();
+        locked.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let start = std::time::Instant::now();
+        assert!(session_titles_by_id(&codex_dir, &ids).is_empty());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        locked.execute_batch("ROLLBACK;").unwrap();
+        drop(locked);
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn session_project_titles_support_platform_paths_and_reject_roots() {
+        for (path, expected) in [
+            ("/Users/test/projects/Codex-X/", Some("Codex-X")),
+            (r"C:\work\Codex-X\", Some("Codex-X")),
+            (r"\\?\C:\work\Codex-X", Some("Codex-X")),
+            (r"\\server\share\project", Some("project")),
+            ("relative/project", Some("project")),
+            ("", None),
+            ("  ", None),
+            ("/", None),
+            (r"C:\", None),
+            ("C:", None),
+            (r"\\server\share\", None),
+            (".", None),
+            ("..", None),
+        ] {
+            assert_eq!(session_project_title(path).as_deref(), expected, "{path}");
+        }
     }
 
     #[test]
