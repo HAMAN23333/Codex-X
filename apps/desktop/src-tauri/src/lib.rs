@@ -98,9 +98,8 @@ use providers::{
     read_ccswitch_official_auth_inner, remember_active_provider_on_connection,
     save_active_provider_inner, save_official_config_inner, save_provider_inner,
     save_provider_toml_config_inner, switch_provider_inner, test_provider_connection_inner,
-    ImportResult, OfficialAuthCandidate, OfficialConfigDraft, OfficialConfigInput,
-    ProviderConnectionResult, ProviderInput, ProviderModelsResult, ProviderTomlInput,
-    SavedProvider,
+    ImportResult, OfficialAuthCandidate, OfficialConfigInput, ProviderConnectionResult,
+    ProviderInput, ProviderModelsResult, ProviderTomlInput, SavedProvider,
 };
 #[cfg(test)]
 use sessions::{
@@ -1005,6 +1004,22 @@ async fn get_usage_statistics(
 }
 
 #[tauri::command]
+async fn activate_saved_provider(
+    config_dir: Option<String>,
+    provider_id: String,
+) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = providers::activate_saved_provider_inner(config_dir, provider_id.clone())?;
+        Ok(finish_provider_selection(
+            result,
+            ActiveProviderSelectionUpdate::Set(provider_id),
+        ))
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("启用供应商失败: {error}")))?
+}
+
+#[tauri::command]
 async fn save_active_provider(
     provider: SavedProvider,
     config_dir: Option<String>,
@@ -1057,30 +1072,34 @@ async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionRe
 }
 
 #[tauri::command]
-async fn get_official_config_draft(
-    config_dir: Option<String>,
-) -> Result<Option<OfficialConfigDraft>> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let detail = get_official_profile_inner(
-            config_dir,
-            providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
-        )?;
-        Ok(Some(OfficialConfigDraft {
-            auth_json: detail.auth_json,
-            config_text: detail.config_text,
-            model: detail.profile.model,
-            source: detail.source,
-        }))
-    })
-    .await
-    .map_err(|e| CodexxError::Config(format!("读取官方配置快照失败: {e}")))?
-}
-
-#[tauri::command]
 async fn list_official_profiles(config_dir: Option<String>) -> Result<Vec<OfficialProfileSummary>> {
     tauri::async_runtime::spawn_blocking(move || list_official_profiles_inner(config_dir))
         .await
         .map_err(|error| CodexxError::Config(format!("读取官方配置列表失败: {error}")))?
+}
+
+#[tauri::command]
+async fn get_official_profile_quota(
+    config_dir: Option<String>,
+    profile_id: String,
+) -> Result<providers::quota::OfficialQuotaSnapshot> {
+    tauri::async_runtime::spawn_blocking(move || {
+        providers::quota::get_official_profile_quota_inner(config_dir, profile_id)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("读取官方账号额度失败，请重试".to_string()))?
+}
+
+#[tauri::command]
+async fn get_official_profile_reset_credits(
+    config_dir: Option<String>,
+    profile_id: String,
+) -> Result<providers::quota::OfficialResetCreditsSnapshot> {
+    tauri::async_runtime::spawn_blocking(move || {
+        providers::quota::get_official_profile_reset_credits_inner(config_dir, profile_id)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("读取官方账号重置次数失败，请重试".to_string()))?
 }
 
 #[tauri::command]
@@ -1132,20 +1151,6 @@ async fn delete_official_profile(config_dir: Option<String>, profile_id: String)
     })
     .await
     .map_err(|error| CodexxError::Config(format!("删除官方配置失败: {error}")))?
-}
-
-#[tauri::command]
-async fn restore_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let result =
-            providers::official_profiles::restore_default_official_profile_inner(config_dir)?;
-        Ok(finish_provider_selection(
-            result,
-            ActiveProviderSelectionUpdate::ClearIfOfficial,
-        ))
-    })
-    .await
-    .map_err(|e| CodexxError::Config(format!("还原官方配置失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1622,17 +1627,18 @@ pub fn run() {
             update_codex_context_window,
             get_usage_statistics,
             save_active_provider,
+            activate_saved_provider,
             delete_saved_provider,
             get_codex_state,
             switch_official_provider,
-            get_official_config_draft,
             list_official_profiles,
             get_official_profile,
+            get_official_profile_quota,
+            get_official_profile_reset_credits,
             save_official_profile,
             duplicate_official_profile,
             switch_official_profile,
             delete_official_profile,
-            restore_official_provider,
             reset_official_provider,
             save_official_config,
             enable_instruction,

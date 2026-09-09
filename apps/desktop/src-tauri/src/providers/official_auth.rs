@@ -27,6 +27,7 @@ pub(crate) struct OfficialConfigCandidate {
     pub(crate) source: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OfficialConfigDraft {
@@ -247,6 +248,14 @@ pub(crate) fn build_official_config_text(
         doc.as_table_mut().remove("model");
     }
 
+    super::model_catalog::prepare_model_catalog(
+        codex_dir,
+        "official",
+        &[],
+        model.unwrap_or_default(),
+        &mut doc,
+    )?;
+
     Ok(doc.to_string())
 }
 
@@ -274,6 +283,13 @@ pub(crate) fn validate_official_config_text(
             doc["model"] = value(model);
         }
     }
+    super::model_catalog::prepare_model_catalog(
+        codex_dir,
+        "official",
+        &[],
+        model.unwrap_or_default(),
+        &mut doc,
+    )?;
     let text = doc.to_string();
     let model = string_value(&doc, "model");
     Ok((text, model))

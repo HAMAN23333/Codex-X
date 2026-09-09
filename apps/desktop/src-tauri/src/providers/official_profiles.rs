@@ -19,6 +19,7 @@ use crate::live_config::{
 use crate::paths::normalized_path_scope;
 use crate::state::{build_state_after_migration, ActionResult};
 use crate::{now_rfc3339, resolve_codex_dir};
+use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +35,10 @@ pub(crate) struct OfficialProfileSummary {
     pub(crate) provider_name: String,
     pub(crate) model: Option<String>,
     pub(crate) has_auth: bool,
+    pub(crate) has_owned_auth: bool,
+    pub(crate) email: Option<String>,
+    pub(crate) plan_type: Option<String>,
+    pub(crate) can_query_quota: bool,
     pub(crate) is_default: bool,
     pub(crate) is_current: bool,
 }
@@ -65,6 +70,158 @@ pub(crate) struct OfficialProfileActionResult {
     #[serde(flatten)]
     pub(crate) action: ActionResult,
     pub(crate) profile: OfficialProfileSummary,
+}
+
+// Native-only credentials: intentionally neither Debug nor Serialize. The
+// network caller reads these while holding the short live-config lock, then
+// drops that lock before making a request.
+pub(crate) struct OfficialProfileQuotaCredentials {
+    pub(crate) access_token: String,
+    pub(crate) account_id: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+fn nonempty_auth_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn display_email(value: Option<&Value>) -> Option<String> {
+    nonempty_auth_string(value).filter(|email| {
+        email.len() <= 320
+            && email.contains('@')
+            && !email
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+    })
+}
+
+fn jwt_display_claims(token: Option<&Value>) -> Option<Value> {
+    let token = token?.as_str()?;
+    // Decode only a bounded payload. JWT claims are unverified display metadata,
+    // never the source of account IDs, credentials, or authorization decisions.
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if header.is_empty()
+        || payload.is_empty()
+        || signature.is_empty()
+        || parts.next().is_some()
+        || payload.len() > 32 * 1024
+    {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+fn display_plan_type(value: Option<&Value>) -> Option<String> {
+    let raw = value?.as_str()?;
+    if raw.len() > 64 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let plan = raw.trim();
+    (!plan.is_empty()
+        && plan
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then(|| plan.to_string())
+}
+
+#[derive(Default)]
+struct OfficialAuthDisplayMetadata {
+    email: Option<String>,
+    plan_type: Option<String>,
+}
+
+fn auth_display_metadata(auth: &Value) -> OfficialAuthDisplayMetadata {
+    let chatgpt_auth = is_chatgpt_auth(auth);
+    let mut metadata = OfficialAuthDisplayMetadata {
+        email: display_email(auth.get("email")),
+        plan_type: chatgpt_auth
+            .then(|| {
+                display_plan_type(auth.get("plan_type"))
+                    .or_else(|| display_plan_type(auth.get("chatgpt_plan_type")))
+            })
+            .flatten(),
+    };
+    for token in [
+        auth.pointer("/tokens/id_token"),
+        auth.pointer("/tokens/access_token"),
+    ] {
+        if metadata.email.is_some() && (metadata.plan_type.is_some() || !chatgpt_auth) {
+            break;
+        }
+        let Some(claims) = jwt_display_claims(token) else {
+            continue;
+        };
+        metadata.email = metadata.email.or_else(|| {
+            display_email(claims.get("email")).or_else(|| {
+                display_email(claims.pointer("/https:~1~1api.openai.com~1profile/email"))
+            })
+        });
+        if chatgpt_auth && metadata.plan_type.is_none() {
+            // Codex's login/token_data.rs reads this namespaced ID-token claim.
+            // Keep its raw identifier for display; it never grants access.
+            metadata.plan_type = display_plan_type(
+                claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"),
+            );
+        }
+    }
+    metadata
+}
+
+fn auth_display_email(auth: &Value) -> Option<String> {
+    auth_display_metadata(auth).email
+}
+
+fn quota_access_token(auth: &Value) -> Option<String> {
+    is_chatgpt_auth(auth)
+        .then(|| nonempty_auth_string(auth.pointer("/tokens/access_token")))
+        .flatten()
+}
+
+fn profile_owned_auth(codex_dir: &Path, profile_id: &str) -> Result<Option<Value>> {
+    profile_name(codex_dir, profile_id)?;
+    let is_current = selected_profile_id(codex_dir)? == profile_id
+        && live_config_is_official(codex_dir)
+            .map_err(|_| CodexxError::Config("无法确认当前官方登录状态，请刷新配置".to_string()))?;
+    if is_current {
+        let text = read_to_string_if_exists(&crate::auth_path(codex_dir))
+            .map_err(|_| CodexxError::Config("无法读取当前官方认证，请重新登录".to_string()))?;
+        // Live logout/refresh owns the current profile. Do not resurrect a stale
+        // snapshot or consult another account's historical recovery credentials.
+        return parse_auth(&text)
+            .map_err(|_| CodexxError::Config("当前官方认证无效，请重新登录".to_string()));
+    }
+    saved_official_profile_candidate(codex_dir, profile_id)
+        .map(|candidate| candidate.and_then(|candidate| candidate.auth))
+        .map_err(|_| {
+            CodexxError::Config("无法读取此官方配置的认证，请重新保存登录信息".to_string())
+        })
+}
+
+pub(crate) fn official_profile_quota_credentials(
+    codex_dir: &Path,
+    profile_id: &str,
+) -> Result<OfficialProfileQuotaCredentials> {
+    let auth = profile_owned_auth(codex_dir, profile_id)?.ok_or_else(|| {
+        CodexxError::Config("此官方配置尚未登录，请先在 Codex 中登录".to_string())
+    })?;
+    let access_token = quota_access_token(&auth).ok_or_else(|| {
+        CodexxError::Config("此配置没有可用的 ChatGPT 登录凭据，无法查询订阅额度".to_string())
+    })?;
+    Ok(OfficialProfileQuotaCredentials {
+        access_token,
+        account_id: nonempty_auth_string(auth.pointer("/tokens/account_id")),
+        email: auth_display_email(&auth),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,12 +380,21 @@ fn detail(codex_dir: &Path, id: &str) -> Result<OfficialProfileDetail> {
         .transpose()
         .map_err(|error| CodexxError::Config(format!("读取官方认证失败: {error}")))?
         .unwrap_or_default();
+    let owned_auth = profile_owned_auth(codex_dir, id).ok().flatten();
+    let metadata = owned_auth
+        .as_ref()
+        .map(auth_display_metadata)
+        .unwrap_or_default();
     Ok(OfficialProfileDetail {
         profile: OfficialProfileSummary {
             id: id.to_string(),
             provider_name,
             model,
             has_auth: !auth_json.is_empty(),
+            has_owned_auth: owned_auth.is_some(),
+            email: metadata.email,
+            plan_type: metadata.plan_type,
+            can_query_quota: owned_auth.as_ref().and_then(quota_access_token).is_some(),
             is_default: id == DEFAULT_OFFICIAL_PROFILE_ID,
             is_current: live_config_is_official(codex_dir)?
                 && selected_profile_id(codex_dir)? == id,
@@ -272,11 +438,13 @@ pub(crate) fn list_official_profiles_inner(
     let config = parse_toml_document(&config_path, &read_to_string_if_exists(&config_path)?)?;
     let is_official = document_is_official(&config);
     let live_model = crate::string_value(&config, "model");
-    let live_has_auth = is_official
-        && read_to_string_if_exists(&crate::auth_path(&codex_dir))
-            .ok()
-            .and_then(|text| parse_auth(&text).ok().flatten())
-            .is_some();
+    let live_auth = is_official
+        .then(|| {
+            read_to_string_if_exists(&crate::auth_path(&codex_dir))
+                .ok()
+                .and_then(|text| parse_auth(&text).ok().flatten())
+        })
+        .flatten();
     // Startup only needs metadata and the explicit profile snapshot. Do not
     // call the editor/recovery candidate path: its legacy fallback scans the
     // complete backup history and synthesizes full config/auth documents.
@@ -287,14 +455,24 @@ pub(crate) fn list_official_profiles_inner(
                 .ok()
                 .flatten();
             let is_current = is_official && selected == id;
+            let owned_auth = if is_current {
+                live_auth.as_ref()
+            } else {
+                saved.as_ref().and_then(|saved| saved.auth.as_ref())
+            };
+            let metadata = owned_auth.map(auth_display_metadata).unwrap_or_default();
             OfficialProfileSummary {
                 model: if is_current {
                     live_model.clone()
                 } else {
                     saved.as_ref().and_then(|saved| saved.model.clone())
                 },
-                has_auth: (is_current && live_has_auth)
+                has_auth: (is_current && live_auth.is_some())
                     || saved.as_ref().is_some_and(|saved| saved.auth.is_some()),
+                has_owned_auth: owned_auth.is_some(),
+                email: metadata.email,
+                plan_type: metadata.plan_type,
+                can_query_quota: owned_auth.and_then(quota_access_token).is_some(),
                 is_default: id == DEFAULT_OFFICIAL_PROFILE_ID,
                 id,
                 provider_name,
@@ -666,34 +844,6 @@ pub(crate) fn reset_default_official_profile_inner(
     Ok(result)
 }
 
-pub(crate) fn restore_default_official_profile_inner(
-    config_dir: Option<String>,
-) -> Result<ActionResult> {
-    let codex_dir = resolve_codex_dir(config_dir)?;
-    ensure_directory(&codex_dir)?;
-    let _lock = acquire_live_config_lock(&codex_dir)?;
-    let candidate = if selected_profile_id(&codex_dir)? == DEFAULT_OFFICIAL_PROFILE_ID {
-        official_config_candidate(&codex_dir, true)?
-    } else {
-        saved_official_profile_candidate(&codex_dir, DEFAULT_OFFICIAL_PROFILE_ID)?
-    }
-    .ok_or_else(|| {
-        CodexxError::Config("未找到默认官方配置的可信快照，请新建配置后重新登录".to_string())
-    })?;
-    with_mutation(&codex_dir, |mutation| {
-        mutation.snapshot(DEFAULT_OFFICIAL_PROFILE_ID, || {
-            write_official_profile_snapshot(
-                &codex_dir,
-                DEFAULT_OFFICIAL_PROFILE_ID,
-                candidate.config_text,
-                candidate.model,
-                candidate.auth,
-            )
-        })?;
-        action(&codex_dir, "已还原默认官方配置".to_string(), None)
-    })
-}
-
 pub(crate) fn switch_official_profile_inner(
     config_dir: Option<String>,
     profile_id: String,
@@ -816,6 +966,374 @@ mod tests {
 
     fn auth(label: &str) -> Value {
         json!({"auth_mode":"chatgpt","tokens":{"account_id":format!("account-{label}"),"access_token":format!("access-{label}"),"refresh_token":format!("refresh-{label}")}})
+    }
+
+    fn display_jwt(claims: Value) -> String {
+        format!(
+            "e30.{}.fixture-signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    }
+
+    #[test]
+    fn official_profile_email_decodes_only_bounded_display_claims() {
+        let mut authentication = auth("email");
+        authentication["tokens"]["id_token"] =
+            json!(display_jwt(json!({"email":"id@example.test"})));
+        authentication["tokens"]["access_token"] = json!(display_jwt(
+            json!({"https://api.openai.com/profile":{"email":"access@example.test"}})
+        ));
+        assert_eq!(
+            auth_display_email(&authentication).as_deref(),
+            Some("id@example.test")
+        );
+        authentication["email"] = json!(" direct@example.test ");
+        assert_eq!(
+            auth_display_email(&authentication).as_deref(),
+            Some("direct@example.test")
+        );
+        authentication["email"] = json!("\n");
+        authentication["tokens"]["id_token"] = json!("invalid-token");
+        assert_eq!(
+            auth_display_email(&authentication).as_deref(),
+            Some("access@example.test")
+        );
+        authentication["tokens"]["access_token"] = json!(format!("e30.{}.sig", "A".repeat(32769)));
+        assert!(auth_display_email(&authentication).is_none());
+        authentication["email"] = json!("unsafe\nemail@example.test");
+        assert!(auth_display_email(&authentication).is_none());
+    }
+
+    #[test]
+    fn official_profile_plan_type_uses_chatgpt_metadata_with_validated_fallbacks() {
+        let mut authentication = auth("plan");
+        authentication["tokens"]["id_token"] = json!(display_jwt(json!({
+            "email": "id@example.test",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}
+        })));
+        authentication["tokens"]["access_token"] = json!(display_jwt(json!({
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "team"}
+        })));
+        let metadata = auth_display_metadata(&authentication);
+        assert_eq!(metadata.email.as_deref(), Some("id@example.test"));
+        assert_eq!(metadata.plan_type.as_deref(), Some("pro"));
+
+        authentication["plan_type"] = json!(" pro_lite ");
+        authentication["chatgpt_plan_type"] = json!("business");
+        assert_eq!(
+            auth_display_metadata(&authentication).plan_type.as_deref(),
+            Some("pro_lite")
+        );
+        authentication["plan_type"] = Value::Null;
+        assert_eq!(
+            auth_display_metadata(&authentication).plan_type.as_deref(),
+            Some("business")
+        );
+        authentication["chatgpt_plan_type"] = Value::Null;
+        authentication["tokens"]["id_token"] = json!("malformed-token");
+        assert_eq!(
+            auth_display_metadata(&authentication).plan_type.as_deref(),
+            Some("team")
+        );
+
+        authentication["plan_type"] = json!("Future_Plan-2");
+        assert_eq!(
+            auth_display_metadata(&authentication).plan_type.as_deref(),
+            Some("Future_Plan-2")
+        );
+        authentication["auth_mode"] = json!("apikey");
+        authentication["OPENAI_API_KEY"] = json!("synthetic-api-key");
+        assert!(auth_display_metadata(&authentication).plan_type.is_none());
+        assert!(auth_display_metadata(&auth("missing-plan"))
+            .plan_type
+            .is_none());
+    }
+
+    #[test]
+    fn official_profile_plan_type_rejects_unsafe_and_oversized_metadata() {
+        for value in [
+            json!(""),
+            json!(" \t"),
+            json!("\npro"),
+            json!("pro\n"),
+            json!("pro lite"),
+            json!("pro\u{202e}lite"),
+            json!("<script>"),
+            json!("p".repeat(65)),
+            json!(false),
+            json!(["pro"]),
+            json!({"plan":"pro"}),
+        ] {
+            let mut authentication = auth("invalid-plan");
+            authentication["plan_type"] = value.clone();
+            authentication["tokens"]["id_token"] = json!(display_jwt(json!({
+                "https://api.openai.com/auth": {"chatgpt_plan_type": value}
+            })));
+            assert!(auth_display_metadata(&authentication).plan_type.is_none());
+        }
+        let valid_token =
+            display_jwt(json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}));
+        for token in [
+            format!("e30.{}.sig", "A".repeat(32769)),
+            format!("{valid_token}.extra"),
+            valid_token.replacen("e30.", ".", 1),
+            valid_token.replace("fixture-signature", ""),
+            display_jwt(json!(["pro"])),
+            display_jwt(
+                json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"},"oversized":"x".repeat(32768)}),
+            ),
+        ] {
+            let mut authentication = auth("invalid-jwt");
+            authentication["tokens"]["id_token"] = json!(token);
+            assert!(auth_display_metadata(&authentication).plan_type.is_none());
+        }
+    }
+
+    #[test]
+    fn official_quota_credentials_follow_owned_profiles_live_refresh_and_account_switches() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = prepare_home("quota-profile-isolation");
+        let mut first_auth = auth("a");
+        first_auth["tokens"]["id_token"] = json!(display_jwt(
+            json!({"email":"first@example.test", "account_id":"untrusted-claim", "https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}})
+        ));
+        write_json(&auth_path(&dir), &first_auth).unwrap();
+        let first = official_profile_quota_credentials(&dir, DEFAULT_OFFICIAL_PROFILE_ID).unwrap();
+        assert_eq!(first.access_token, "access-a");
+        assert_eq!(first.account_id.as_deref(), Some("account-a"));
+        assert_eq!(first.email.as_deref(), Some("first@example.test"));
+        let mut second_auth = auth("b");
+        second_auth["email"] = json!("second@example.test");
+        second_auth["tokens"]["id_token"] = json!(display_jwt(
+            json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"team"}})
+        ));
+        let second = save(
+            &dir,
+            None,
+            "Second account",
+            Some(config("b")),
+            Some(second_auth.to_string()),
+        );
+        assert_eq!(second.profile.email.as_deref(), Some("second@example.test"));
+        assert_eq!(second.profile.plan_type.as_deref(), Some("team"));
+        assert!(second.profile.can_query_quota);
+        let inactive = official_profile_quota_credentials(&dir, &second.profile.id).unwrap();
+        assert_eq!(inactive.access_token, "access-b");
+        assert_eq!(inactive.account_id.as_deref(), Some("account-b"));
+        switch(&dir, &second.profile.id);
+        let mut refreshed = auth("b-refreshed");
+        refreshed["email"] = json!("refreshed@example.test");
+        refreshed["chatgpt_plan_type"] = json!("prolite");
+        write_json(&auth_path(&dir), &refreshed).unwrap();
+        assert_eq!(
+            official_profile_quota_credentials(&dir, &second.profile.id)
+                .unwrap()
+                .access_token,
+            "access-b-refreshed"
+        );
+        assert_eq!(
+            official_profile_quota_credentials(&dir, DEFAULT_OFFICIAL_PROFILE_ID)
+                .unwrap()
+                .access_token,
+            "access-a"
+        );
+        let summaries = list_official_profiles_inner(scope(&dir)).unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|profile| profile.is_default)
+                .unwrap()
+                .plan_type
+                .as_deref(),
+            Some("pro")
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|profile| profile.is_current)
+                .unwrap()
+                .plan_type
+                .as_deref(),
+            Some("prolite")
+        );
+        assert_eq!(
+            detail(&dir, &second.profile.id)
+                .unwrap()
+                .profile
+                .plan_type
+                .as_deref(),
+            Some("prolite")
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|profile| profile.is_current)
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("refreshed@example.test")
+        );
+        let serialized = serde_json::to_string(&summaries).unwrap();
+        assert!(serialized.contains("\"planType\":\"prolite\""));
+        assert!(!serialized.contains("access-b-refreshed"));
+        assert!(!serialized.contains("refresh-b-refreshed"));
+        switch(&dir, DEFAULT_OFFICIAL_PROFILE_ID);
+        assert_eq!(
+            detail(&dir, DEFAULT_OFFICIAL_PROFILE_ID)
+                .unwrap()
+                .profile
+                .plan_type
+                .as_deref(),
+            Some("pro")
+        );
+        assert_eq!(
+            detail(&dir, &second.profile.id)
+                .unwrap()
+                .profile
+                .plan_type
+                .as_deref(),
+            Some("prolite")
+        );
+        assert_eq!(
+            official_profile_quota_credentials(&dir, &second.profile.id)
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("refreshed@example.test")
+        );
+        assert_eq!(
+            official_profile_quota_credentials(&dir, DEFAULT_OFFICIAL_PROFILE_ID)
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("first@example.test")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn official_quota_credentials_never_recover_history_or_a_proxy_login() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = prepare_home("quota-no-history");
+        let mut historical = auth("historical");
+        historical["plan_type"] = json!("pro");
+        write_json(&auth_path(&dir), &historical).unwrap();
+        crate::backups::create_backup(&dir, "quota-ignored-history").unwrap();
+        write_text(&config_path(&dir), "model_provider='custom'\nmodel='proxy-model'\n[model_providers.custom]\nname='Proxy'\nbase_url='https://proxy.example.test/v1'\nrequires_openai_auth=true\n").unwrap();
+        let mut foreign = auth("foreign-live");
+        foreign["email"] = json!("foreign@example.test");
+        foreign["plan_type"] = json!("team");
+        write_json(&auth_path(&dir), &foreign).unwrap();
+        assert!(official_profile_quota_credentials(&dir, DEFAULT_OFFICIAL_PROFILE_ID).is_err());
+        let summaries = list_official_profiles_inner(scope(&dir)).unwrap();
+        assert!(summaries[0].email.is_none());
+        assert!(summaries[0].plan_type.is_none());
+        assert!(!summaries[0].can_query_quota);
+        assert!(
+            !official_snapshot_path_for_profile(&dir, DEFAULT_OFFICIAL_PROFILE_ID)
+                .unwrap()
+                .exists()
+        );
+        let named = save(
+            &dir,
+            None,
+            "Missing snapshot",
+            Some(config("b")),
+            Some(auth("b").to_string()),
+        );
+        fs::remove_file(official_snapshot_path_for_profile(&dir, &named.profile.id).unwrap())
+            .unwrap();
+        assert!(official_profile_quota_credentials(&dir, &named.profile.id).is_err());
+        assert!(list_official_profiles_inner(scope(&dir))
+            .unwrap()
+            .iter()
+            .find(|profile| profile.id == named.profile.id)
+            .unwrap()
+            .plan_type
+            .is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn official_quota_credentials_reject_logout_api_keys_and_missing_access_tokens() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = prepare_home("quota-auth-states");
+        let mut authentication = auth("signed-in");
+        authentication["plan_type"] = json!("pro");
+        write_json(&auth_path(&dir), &authentication).unwrap();
+        save(
+            &dir,
+            Some(DEFAULT_OFFICIAL_PROFILE_ID),
+            "Default",
+            None,
+            None,
+        );
+        fs::remove_file(auth_path(&dir)).unwrap();
+        let summary = list_official_profiles_inner(scope(&dir)).unwrap().remove(0);
+        assert!(
+            summary.has_auth,
+            "legacy saved-auth availability is retained"
+        );
+        assert!(
+            !summary.has_owned_auth,
+            "a logged-out current profile must show the signed-out badge"
+        );
+        assert!(!summary.can_query_quota);
+        assert!(summary.email.is_none());
+        assert!(summary.plan_type.is_none());
+        assert!(detail(&dir, DEFAULT_OFFICIAL_PROFILE_ID)
+            .unwrap()
+            .profile
+            .plan_type
+            .is_none());
+        assert!(official_profile_quota_credentials(&dir, DEFAULT_OFFICIAL_PROFILE_ID).is_err());
+        write_text(
+            &auth_path(&dir),
+            "{\"tokens\":\"sensitive-test-marker\",invalid-json}",
+        )
+        .unwrap();
+        let error = official_profile_quota_credentials(&dir, DEFAULT_OFFICIAL_PROFILE_ID)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("sensitive-test-marker"));
+        write_json(&auth_path(&dir), &auth("a")).unwrap();
+        for (name, authentication) in [
+            (
+                "API key",
+                json!({"auth_mode":"apikey", "OPENAI_API_KEY":"sk-test-only"}),
+            ),
+            (
+                "Refresh only",
+                json!({"auth_mode":"chatgpt", "tokens":{"refresh_token":"refresh-only"}}),
+            ),
+        ] {
+            let profile = save(
+                &dir,
+                None,
+                name,
+                Some(config("b")),
+                Some(authentication.to_string()),
+            );
+            assert!(profile.profile.has_auth);
+            assert!(profile.profile.has_owned_auth);
+            assert!(!profile.profile.can_query_quota);
+            assert!(official_profile_quota_credentials(&dir, &profile.profile.id).is_err());
+        }
+        let empty = save(
+            &dir,
+            None,
+            "Not signed in",
+            Some(config("empty")),
+            Some(String::new()),
+        );
+        assert!(!empty.profile.has_auth);
+        assert!(!empty.profile.has_owned_auth);
+        assert!(!empty.profile.can_query_quota);
+        assert!(empty.profile.email.is_none());
+        assert!(empty.profile.plan_type.is_none());
+        assert!(official_profile_quota_credentials(&dir, &empty.profile.id).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn prepare_home(label: &str) -> PathBuf {
@@ -1176,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn official_profiles_default_reset_and_restore_do_not_overwrite_a_named_account() {
+    fn official_profiles_default_reset_does_not_overwrite_a_named_account() {
         let _guard = crate::app_db::test_db_guard();
         let dir = prepare_home("default-reset");
         save(
@@ -1195,12 +1713,6 @@ mod tests {
         );
         switch(&dir, &b.profile.id);
         write_json(&auth_path(&dir), &auth("b-latest")).unwrap();
-        let restored = restore_default_official_profile_inner(scope(&dir)).unwrap();
-        assert_eq!(
-            restored.state.active_official_profile_id.as_deref(),
-            Some(b.profile.id.as_str())
-        );
-        assert_eq!(live_auth(&dir), auth("b-latest"));
         let reset = reset_default_official_profile_inner(super::super::live::OfficialConfigInput {
             config_dir: scope(&dir),
             model: None,

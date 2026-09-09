@@ -17,6 +17,8 @@ pub(crate) struct SavedProvider {
     pub(crate) toml_config: Option<String>,
     pub(crate) wire_api: String,
     pub(crate) requires_openai_auth: bool,
+    #[serde(default)]
+    pub(crate) model_mappings: Vec<super::model_catalog::ProviderModelMapping>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +284,62 @@ pub(crate) fn matching_saved_provider_ids_for_live(
         .collect()
 }
 
+fn same_live_provider_route(live: &SavedProvider, saved: &SavedProvider) -> bool {
+    if !same_provider_endpoint(live, saved) {
+        return false;
+    }
+    match (
+        effective_provider_api_key(live),
+        effective_provider_api_key(saved),
+    ) {
+        (Some(live_key), Some(saved_key)) => live_key == saved_key,
+        // Missing live authentication is tolerated for legacy providers, but
+        // without credentials a changed name is not enough evidence to adopt it.
+        _ => {
+            normalized_provider_name(&live.provider_name)
+                == normalized_provider_name(&saved.provider_name)
+        }
+    }
+}
+
+/// A saved record keeps its identity when Codex changes the runtime model or
+/// display name. Prefer the remembered record only while its route/credential
+/// still matches; otherwise fall back to the existing profile matching rules.
+/// This lookup never changes a selection or writes a provider.
+pub(crate) fn matching_saved_provider_ids_for_live_on_connection(
+    conn: &Connection,
+    codex_dir: &std::path::Path,
+    live: &SavedProvider,
+    providers: &[SavedProvider],
+) -> Result<Vec<String>> {
+    if let Some(selected) = super::selection::selected_provider_id_on_connection(conn, codex_dir)? {
+        if providers
+            .iter()
+            .any(|provider| provider.id == selected && same_live_provider_route(live, provider))
+        {
+            return Ok(vec![selected]);
+        }
+    }
+    let matches = matching_saved_provider_ids_for_live(live, providers)
+        .into_iter()
+        .filter(|id| {
+            providers
+                .iter()
+                .any(|provider| &provider.id == id && same_live_provider_route(live, provider))
+        })
+        .collect::<Vec<_>>();
+    if !matches.is_empty() {
+        return Ok(matches);
+    }
+    // Several same-API records remain ambiguous without a remembered ID. Return
+    // all candidates so callers can leave them alone rather than create a copy.
+    Ok(providers
+        .iter()
+        .filter(|provider| same_live_provider_route(live, provider))
+        .map(|provider| provider.id.clone())
+        .collect())
+}
+
 #[cfg(test)]
 fn unique_saved_provider_id_for_live(
     live: &SavedProvider,
@@ -301,6 +359,13 @@ fn saved_provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedPro
         toml_config: row.get(5)?,
         wire_api: row.get(6)?,
         requires_openai_auth: row.get::<_, i64>(7)? != 0,
+        model_mappings: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
     })
 }
 
@@ -308,7 +373,7 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
     let mut stmt = conn
         .prepare(
             "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api,
-                    requires_openai_auth, created_at, updated_at, source, source_id
+                    requires_openai_auth, model_mappings_json, created_at, updated_at, source, source_id
              FROM providers
              ORDER BY created_at ASC, rowid ASC",
         )
@@ -317,10 +382,10 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
         .query_map([], |row| {
             Ok(StoredProvider {
                 provider: saved_provider_from_row(row)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-                source: row.get(10)?,
-                source_id: row.get(11)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                source: row.get(11)?,
+                source_id: row.get(12)?,
             })
         })
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -353,7 +418,7 @@ pub(crate) fn provider_by_id_on_connection(
     let mut stmt = conn
         .prepare(
             "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api,
-                    requires_openai_auth
+                    requires_openai_auth, model_mappings_json
              FROM providers WHERE id = ?1 LIMIT 1",
         )
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -380,14 +445,16 @@ fn write_provider_with_origin(
     origin: Option<(&str, &str)>,
 ) -> Result<()> {
     let now = now_rfc3339();
+    let model_mappings_json = serde_json::to_string(&provider.model_mappings)
+        .map_err(|error| CodexxError::Config(format!("序列化模型映射失败: {error}")))?;
     let (source, source_id) = origin
         .map(|(source, source_id)| (source, Some(source_id)))
         .unwrap_or((MANUAL_PROVIDER_SOURCE, None));
     conn.execute(
         "INSERT INTO providers
             (id, provider_name, base_url, model, api_key, toml_config, wire_api,
-             requires_openai_auth, source, source_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+             requires_openai_auth, model_mappings_json, source, source_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
          ON CONFLICT(id) DO UPDATE SET
             provider_name = excluded.provider_name,
             base_url = excluded.base_url,
@@ -396,6 +463,7 @@ fn write_provider_with_origin(
             toml_config = excluded.toml_config,
             wire_api = excluded.wire_api,
             requires_openai_auth = excluded.requires_openai_auth,
+            model_mappings_json = excluded.model_mappings_json,
             source = CASE
                 WHEN excluded.source_id IS NULL THEN providers.source
                 ELSE excluded.source
@@ -414,6 +482,7 @@ fn write_provider_with_origin(
             provider.toml_config,
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
+            model_mappings_json,
             source,
             source_id,
             now,
@@ -472,6 +541,9 @@ fn merge_authoritative_import(
     }
     if incoming.wire_api.trim().is_empty() {
         incoming.wire_api = existing.wire_api.clone();
+    }
+    if incoming.model_mappings.is_empty() {
+        incoming.model_mappings = existing.model_mappings.clone();
     }
     incoming
 }
@@ -725,6 +797,8 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
     if raw_id.is_empty() {
         return Err(CodexxError::Config("provider id 不能为空".to_string()));
     }
+    let model_mappings =
+        super::model_catalog::normalize_mappings(&provider.model_mappings, &provider.model)?;
     let mut normalized = SavedProvider {
         id: custom_provider_id(raw_id),
         provider_name: provider.provider_name.trim().to_string(),
@@ -744,6 +818,7 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
             provider.wire_api.trim().to_string()
         },
         requires_openai_auth: provider.requires_openai_auth,
+        model_mappings,
     };
     if normalized.provider_name.is_empty() {
         return Err(CodexxError::Config("供应商名称不能为空".to_string()));
@@ -846,7 +921,21 @@ fn duplicate_provider_on_connection(
         })?;
         // Adopt an unsaved detected original before adding its copy. Otherwise
         // the copy would become the only matching row and appear to be enabled.
-        if matching_saved_provider_ids_for_live(&detected, &saved).is_empty() {
+        let detected_matches = matching_saved_provider_ids_for_live_on_connection(
+            &transaction,
+            codex_dir,
+            &detected,
+            &saved,
+        )?;
+        if let [saved_id] = detected_matches.as_slice() {
+            if let Some(original) = saved.iter().find(|provider| &provider.id == saved_id) {
+                detected.id = original.id.clone();
+                detected.model_mappings = original.model_mappings.clone();
+                if detected.api_key.is_none() {
+                    detected.api_key = original.api_key.clone();
+                }
+            }
+        } else if detected_matches.is_empty() {
             detected.id = unique_provider_id_on_connection(
                 &transaction,
                 &custom_provider_id(&detected.provider_name),
@@ -860,7 +949,12 @@ fn duplicate_provider_on_connection(
         super::reconcile_active_provider_on_connection(
             &transaction,
             codex_dir,
-            &matching_saved_provider_ids_for_live(live, &saved),
+            &matching_saved_provider_ids_for_live_on_connection(
+                &transaction,
+                codex_dir,
+                live,
+                &saved,
+            )?,
         )?
     } else {
         None
@@ -910,6 +1004,7 @@ pub(crate) fn save_provider_with_rollback_inner(
 }
 
 pub(crate) fn save_detected_provider_with_rollback_inner(
+    codex_dir: &std::path::Path,
     mut live: SavedProvider,
 ) -> Result<Option<ProviderStoreRollback>> {
     let mut conn = open_db()?;
@@ -921,9 +1016,13 @@ pub(crate) fn save_detected_provider_with_rollback_inner(
         .iter()
         .map(|stored| stored.provider.clone())
         .collect::<Vec<_>>();
-    let matches = matching_saved_provider_ids_for_live(&live, &saved);
+    let matches =
+        matching_saved_provider_ids_for_live_on_connection(&transaction, codex_dir, &live, &saved)?;
     match matches.as_slice() {
         [saved_id] => {
+            if let Some(saved) = saved.iter().find(|provider| &provider.id == saved_id) {
+                live.model_mappings = saved.model_mappings.clone();
+            }
             if live.api_key.is_none() {
                 live.api_key = saved
                     .iter()
@@ -954,11 +1053,13 @@ pub(crate) fn save_detected_provider_with_rollback_inner(
 
 fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<()> {
     let provider = &stored.provider;
+    let model_mappings_json = serde_json::to_string(&provider.model_mappings)
+        .map_err(|error| CodexxError::Config(format!("序列化模型映射失败: {error}")))?;
     conn.execute(
         "INSERT INTO providers
             (id, provider_name, base_url, model, api_key, toml_config, wire_api,
-             requires_openai_auth, source, source_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             requires_openai_auth, model_mappings_json, source, source_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             provider.id,
             provider.provider_name,
@@ -968,6 +1069,7 @@ fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<
             provider.toml_config,
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
+            model_mappings_json,
             stored.source,
             stored.source_id,
             stored.created_at,
@@ -1099,6 +1201,7 @@ mod tests {
                 model TEXT NOT NULL, api_key TEXT, toml_config TEXT,
                 wire_api TEXT NOT NULL DEFAULT 'responses',
                 requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+                model_mappings_json TEXT NOT NULL DEFAULT '[]',
                 source TEXT NOT NULL DEFAULT 'manual',
                 source_id TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
@@ -1117,6 +1220,7 @@ mod tests {
             toml_config: None,
             wire_api: "responses".to_string(),
             requires_openai_auth: true,
+            model_mappings: Vec::new(),
         }
     }
 
@@ -1128,6 +1232,131 @@ mod tests {
         let conn = test_connection();
         conn.execute_batch("CREATE TABLE active_provider_selections (codex_dir TEXT PRIMARY KEY, provider_id TEXT NOT NULL, updated_at TEXT NOT NULL);").unwrap();
         conn
+    }
+
+    #[test]
+    fn model_mappings_roundtrip_and_copy_preserve_independent_records() {
+        let mut conn = copy_test_connection();
+        let mut original = provider("mapping-original", "Original", Some("fixture-key"));
+        original.model_mappings = vec![
+            super::super::model_catalog::ProviderModelMapping {
+                model: " gpt-5.5 ".into(),
+                display_name: "GPT".into(),
+                context_window: None,
+            },
+            super::super::model_catalog::ProviderModelMapping {
+                model: "deepseek-chat".into(),
+                display_name: "DeepSeek".into(),
+                context_window: Some(128000),
+            },
+        ];
+        let original = save_manual_provider_on_connection(&conn, original).unwrap();
+        assert_eq!(original.model_mappings[0].model, "gpt-5.5");
+        assert_eq!(
+            provider_by_id_on_connection(&conn, &original.id)
+                .unwrap()
+                .unwrap()
+                .model_mappings,
+            original.model_mappings
+        );
+        let copied = duplicate_provider_on_connection(
+            &mut conn,
+            std::path::Path::new("/fixture/model-copy"),
+            Some(original.clone()),
+            Some(&original.id),
+            None,
+        )
+        .unwrap();
+        assert_ne!(copied.provider.id, original.id);
+        assert_eq!(copied.provider.model_mappings, original.model_mappings);
+        let mut detected = original.clone();
+        detected.id = "custom".into();
+        detected.model = "deepseek-chat".into();
+        detected.model_mappings.clear();
+        let detected_copy = duplicate_provider_on_connection(
+            &mut conn,
+            std::path::Path::new("/fixture/model-copy"),
+            Some(detected),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            detected_copy.provider.model_mappings,
+            original.model_mappings
+        );
+        let mut edited = copied.provider;
+        edited.model_mappings[1].display_name = "Independent copy".into();
+        save_manual_provider_on_connection(&conn, edited).unwrap();
+        assert_eq!(
+            provider_by_id_on_connection(&conn, &original.id)
+                .unwrap()
+                .unwrap()
+                .model_mappings,
+            original.model_mappings
+        );
+        let serialized = serde_json::to_value(&original).unwrap();
+        assert_eq!(serialized["modelMappings"][1]["contextWindow"], 128000);
+        let mut old_payload = serialized;
+        old_payload.as_object_mut().unwrap().remove("modelMappings");
+        assert!(serde_json::from_value::<SavedProvider>(old_payload)
+            .unwrap()
+            .model_mappings
+            .is_empty());
+    }
+
+    #[test]
+    fn cc_switch_refresh_preserves_locally_saved_model_mappings() {
+        let conn = copy_test_connection();
+        let mut original = provider("mapping-import", "Imported", Some("fixture-key"));
+        original.model_mappings = vec![super::super::model_catalog::ProviderModelMapping {
+            model: "gpt-5.5".into(),
+            display_name: "Local label".into(),
+            context_window: Some(256000),
+        }];
+        upsert_ccswitch_provider_on_connection(&conn, original.clone(), "mapping-source").unwrap();
+        let incoming = provider("external-id", "Fresh import", Some("fixture-key"));
+        let refreshed =
+            upsert_ccswitch_provider_on_connection(&conn, incoming, "mapping-source").unwrap();
+        assert_eq!(refreshed.provider.id, original.id);
+        assert_eq!(refreshed.provider.provider_name, "Fresh import");
+        assert_eq!(refreshed.provider.model_mappings, original.model_mappings);
+    }
+
+    #[test]
+    fn model_mapping_rollback_restores_mappings_and_origin_metadata() {
+        let _guard = crate::app_db::test_db_guard();
+        let mut original = provider("mapping-rollback-record", "Original", Some("fixture-key"));
+        original.model_mappings = vec![super::super::model_catalog::ProviderModelMapping {
+            model: "gpt-5.5".into(),
+            display_name: "Original model".into(),
+            context_window: Some(128000),
+        }];
+        let conn = open_db().unwrap();
+        upsert_ccswitch_provider_on_connection(&conn, original.clone(), "mapping-rollback-source")
+            .unwrap();
+        let metadata = |conn: &Connection| {
+            conn.query_row(
+            "SELECT source, source_id, created_at, updated_at FROM providers WHERE id = 'mapping-rollback-record'", [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+        ).unwrap()
+        };
+        let before = metadata(&conn);
+        let mut changed = original.clone();
+        changed.model_mappings[0].display_name = "Changed".into();
+        changed.model_mappings[0].context_window = Some(1000000);
+        let (_, rollback) = save_provider_with_rollback_inner(changed).unwrap();
+        rollback_provider_store_inner(rollback).unwrap();
+        assert_eq!(
+            provider_by_id_on_connection(&conn, &original.id)
+                .unwrap()
+                .unwrap()
+                .model_mappings,
+            original.model_mappings
+        );
+        assert_eq!(metadata(&conn), before);
+        drop(conn);
+        delete_provider_inner(&original.id).unwrap();
     }
 
     #[test]
@@ -1642,6 +1871,7 @@ enabled = true
             toml_config: Some("\n".to_string()),
             wire_api: String::new(),
             requires_openai_auth: false,
+            model_mappings: Vec::new(),
         };
         let result = upsert_ccswitch_provider_on_connection(&conn, missing, "cc-row")
             .expect("fill missing import fields from the existing source row");

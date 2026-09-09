@@ -10,7 +10,7 @@ use super::official_auth::{
 use super::{
     custom_provider_id, delete_provider_inner, experimental_bearer_token_from_doc,
     is_placeholder_provider, list_saved_providers_on_connection,
-    matching_saved_provider_ids_for_live, normalize_saved_provider,
+    matching_saved_provider_ids_for_live_on_connection, normalize_saved_provider,
     normalize_saved_provider_for_save, open_store, provider_template_from_document,
     reconcile_active_provider_on_connection, reserved_codex_provider_id,
     rollback_provider_store_inner, save_detected_provider_with_rollback_inner,
@@ -129,6 +129,37 @@ fn provider_auth_action(api_key: Option<&str>) -> LiveAuthAction {
         Value::String(api_key.to_string()),
     );
     LiveAuthAction::Replace(Value::Object(auth))
+}
+
+fn configure_live_provider_auth(
+    table: &mut toml_edit::Table,
+    api_key: Option<&str>,
+    requires_openai_auth: bool,
+) {
+    table.remove("experimental_bearer_token");
+    // Codex ignores auth.json for providers that do not use OpenAI auth.
+    // Supply the selected provider's key directly, not a stale environment or
+    // command-backed credential inherited from a previous configuration.
+    if !requires_openai_auth {
+        if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+            table.remove("env_key");
+            table.remove("env_key_instructions");
+            table.remove("auth");
+            for headers in ["http_headers", "env_http_headers"] {
+                if let Some(headers) = table.get_mut(headers).and_then(Item::as_table_like_mut) {
+                    let authorization = headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                        .map(|(name, _)| name.to_string())
+                        .collect::<Vec<_>>();
+                    for name in authorization {
+                        headers.remove(&name);
+                    }
+                }
+            }
+            table["experimental_bearer_token"] = value(key);
+        }
+    }
 }
 
 fn live_auth_api_key(codex_dir: &Path) -> Result<Option<String>> {
@@ -551,6 +582,7 @@ pub(crate) fn detected_live_custom_provider(codex_dir: &Path) -> Result<Option<S
         toml_config: (!toml_config.is_empty()).then_some(toml_config),
         wire_api: section.wire_api,
         requires_openai_auth: section.requires_openai_auth,
+        model_mappings: Vec::new(),
     }))
 }
 
@@ -560,7 +592,7 @@ pub(super) fn persist_detected_live_custom_provider(
     let Some(live) = detected_live_custom_provider(codex_dir)? else {
         return Ok(None);
     };
-    save_detected_provider_with_rollback_inner(live)
+    save_detected_provider_with_rollback_inner(codex_dir, live)
 }
 
 pub(crate) fn build_provider_toml_draft_inner(
@@ -1032,7 +1064,11 @@ fn merge_provider_toml_into_live(
             "该供应商需要 API Key，未切换且未修改 auth.json".to_string(),
         ));
     }
-    source_provider.remove("experimental_bearer_token");
+    configure_live_provider_auth(
+        &mut source_provider,
+        api_key.as_deref(),
+        requires_openai_auth,
+    );
 
     // New and cc-switch imports carry a complete provider config. Treat it as
     // authoritative so provider-specific desktop/features/plugin settings make
@@ -1074,6 +1110,19 @@ fn save_provider_toml_config_locked<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    save_provider_toml_config_with_catalog_locked(codex_dir, input, old_config, pre_persist, None)
+}
+
+fn save_provider_toml_config_with_catalog_locked<F>(
+    codex_dir: &Path,
+    input: ProviderTomlInput,
+    old_config: Option<Vec<u8>>,
+    pre_persist: F,
+    saved: Option<&SavedProvider>,
+) -> Result<ActionResult>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     let cfg = config_path(codex_dir);
     let old_auth = read_file_snapshot(&auth_path(codex_dir))?;
     let snapshot = capture_live_official_snapshot(codex_dir)?;
@@ -1081,12 +1130,23 @@ where
         pre_persist(codex_dir)?;
         let backup_id = create_backup(codex_dir, "save-provider-toml")?;
         let current_text = text_from_snapshot(&cfg, old_config.as_deref())?;
-        let (doc, api_key) = merge_provider_toml_into_live(
+        let (mut doc, api_key) = merge_provider_toml_into_live(
             &cfg,
             &current_text,
             input.config_text.trim_end(),
             input.api_key,
         )?;
+        if let Some(saved) = saved {
+            // Resolve the menu after sparse legacy templates inherit common
+            // settings, so a previous provider's managed menu cannot leak back.
+            super::model_catalog::prepare_model_catalog(
+                codex_dir,
+                &saved.id,
+                &saved.model_mappings,
+                &saved.model,
+                &mut doc,
+            )?;
+        }
         let provider_name = doc
             .get("model_providers")
             .and_then(|item| item.as_table())
@@ -1205,6 +1265,7 @@ where
                 "该供应商需要 API Key，未切换且未修改 auth.json".to_string(),
             ));
         }
+        configure_live_provider_auth(provider_table, api_key.as_deref(), requires_openai_auth);
         let auth_action = provider_auth_action(api_key.as_deref());
         Ok((backup_id, doc.to_string(), auth_action))
     })();
@@ -1268,7 +1329,12 @@ where
     let live = detected_live_custom_provider(&codex_dir)?.ok_or_else(|| {
         CodexxError::Config("当前不是可编辑的第三方供应商，未修改保存记录".to_string())
     })?;
-    let matches = matching_saved_provider_ids_for_live(&live, &saved_before);
+    let matches = matching_saved_provider_ids_for_live_on_connection(
+        &conn,
+        &codex_dir,
+        &live,
+        &saved_before,
+    )?;
     if matches.is_empty() {
         if saved_before
             .iter()
@@ -1305,36 +1371,48 @@ pub(crate) fn save_active_provider_inner(
     provider: SavedProvider,
     config_dir: Option<String>,
 ) -> Result<ActionResult> {
-    save_active_provider_with_apply(provider, config_dir, |saved, codex_dir, active_config| {
-        if let Some(config_text) = saved.toml_config.clone() {
-            save_provider_toml_config_locked(
-                codex_dir,
-                ProviderTomlInput {
-                    config_dir: None,
-                    config_text,
-                    api_key: saved.api_key.clone(),
-                },
-                active_config,
-                |_| Ok(()),
-            )
-        } else {
-            switch_provider_locked(
-                codex_dir,
-                ProviderInput {
-                    config_dir: None,
-                    provider_id: Some(saved.id.clone()),
-                    provider_name: saved.provider_name.clone(),
-                    base_url: saved.base_url.clone(),
-                    model: saved.model.clone(),
-                    api_key: saved.api_key.clone(),
-                    wire_api: Some(saved.wire_api.clone()),
-                    requires_openai_auth: Some(saved.requires_openai_auth),
-                },
-                active_config,
-                |_| Ok(()),
-            )
-        }
-    })
+    save_active_provider_with_apply(provider, config_dir, apply_saved_provider_locked)
+}
+
+fn apply_saved_provider_locked(
+    saved: &SavedProvider,
+    codex_dir: &Path,
+    active_config: Option<Vec<u8>>,
+) -> Result<ActionResult> {
+    if !saved.model_mappings.is_empty() && saved.wire_api != "responses" {
+        return Err(CodexxError::Config(
+            "模型映射需要供应商提供 Responses 兼容接口，请检查 Wire API 设置".into(),
+        ));
+    }
+    let config_text =
+        build_provider_toml_draft_inner(saved.clone(), Some(codex_dir.display().to_string()))?;
+    save_provider_toml_config_with_catalog_locked(
+        codex_dir,
+        ProviderTomlInput {
+            config_dir: None,
+            config_text,
+            api_key: saved.api_key.clone(),
+        },
+        active_config,
+        |_| Ok(()),
+        Some(saved),
+    )
+}
+
+pub(crate) fn activate_saved_provider_inner(
+    config_dir: Option<String>,
+    provider_id: String,
+) -> Result<ActionResult> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    ensure_directory(&codex_dir)?;
+    let _lock = acquire_live_config_lock(&codex_dir)?;
+    migrate_legacy_prompt_config_locked(&codex_dir)?;
+    let saved = super::store::provider_by_id_on_connection(&open_store()?, provider_id.trim())?
+        .ok_or_else(|| CodexxError::Config("供应商已不存在，请刷新列表后重试".into()))?;
+    let active_config = read_file_snapshot(&config_path(&codex_dir))?;
+    let rollback = persist_detected_live_custom_provider(&codex_dir)?;
+    let result = apply_saved_provider_locked(&saved, &codex_dir, active_config);
+    rollback_persisted_provider(result, rollback)
 }
 
 pub(crate) fn delete_saved_provider_inner(id: &str, config_dir: Option<String>) -> Result<()> {
@@ -1346,7 +1424,9 @@ pub(crate) fn delete_saved_provider_inner(id: &str, config_dir: Option<String>) 
     let conn = open_store()?;
     let providers = list_saved_providers_on_connection(&conn)?;
     if let Some(live) = detected_live_custom_provider(&codex_dir)? {
-        let active_ids = matching_saved_provider_ids_for_live(&live, &providers);
+        let active_ids = matching_saved_provider_ids_for_live_on_connection(
+            &conn, &codex_dir, &live, &providers,
+        )?;
         let active_id = reconcile_active_provider_on_connection(&conn, &codex_dir, &active_ids)?;
         if live.id == id || active_id.as_deref() == Some(id) {
             return Err(CodexxError::Config(
@@ -1395,6 +1475,7 @@ requires_openai_auth = false
             )),
             wire_api: "responses".to_string(),
             requires_openai_auth: false,
+            model_mappings: Vec::new(),
         }
     }
 
@@ -1820,9 +1901,10 @@ trust_level = "untrusted"
             merged["model_providers"]["custom"]["request_max_retries"].as_integer(),
             Some(9)
         );
-        assert!(merged["model_providers"]["custom"]
-            .get("experimental_bearer_token")
-            .is_none());
+        assert_eq!(
+            merged["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("sk-b")
+        );
         assert_eq!(api_key.as_deref(), Some("sk-b"));
         assert!(!text.contains("sk-a"));
         assert!(!text.contains("sk-stale-template"));
@@ -1878,6 +1960,7 @@ command = "docs-server"
                 toml_config: None,
                 wire_api: "responses".to_string(),
                 requires_openai_auth: false,
+                model_mappings: Vec::new(),
             },
             Some(codex_dir.display().to_string()),
         )
@@ -1963,6 +2046,559 @@ command = "docs-server"
     }
 
     #[test]
+    fn active_provider_identity_survives_external_model_and_name_changes() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_001;
+        let id = format!("runtime-edit-{tag}");
+        let dir = active_provider_test_dir("runtime-identity", tag);
+        let original = active_provider_fixture(tag, &id, "Original", "saved-model", "fixture-key");
+        save_provider_inner(original.clone()).unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &id).unwrap();
+        let external = active_provider_fixture(
+            tag,
+            "custom",
+            "Codex renamed",
+            "runtime-model",
+            "fixture-key",
+        );
+        write_active_provider_files(&dir, &external);
+        assert_eq!(
+            build_state_after_migration(dir.clone())
+                .unwrap()
+                .active_saved_provider_id
+                .as_deref(),
+            Some(id.as_str())
+        );
+        let updated = active_provider_fixture(tag, &id, "User renamed", "new-model", "fixture-key");
+        let result = save_active_provider_inner(updated, Some(dir.display().to_string())).unwrap();
+        assert_eq!(
+            result.state.active_saved_provider_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(saved_provider(&id).provider_name, "User renamed");
+        assert_eq!(saved_provider(&id).model, "new-model");
+        assert_eq!(
+            list_saved_providers_inner()
+                .unwrap()
+                .iter()
+                .filter(|provider| provider.base_url == original.base_url)
+                .count(),
+            1
+        );
+        delete_provider_inner(&id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selected_record_wins_when_runtime_model_matches_a_same_api_sibling() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_002;
+        let first_id = format!("runtime-first-{tag}");
+        let second_id = format!("runtime-second-{tag}");
+        let dir = active_provider_test_dir("runtime-sibling", tag);
+        let first = save_provider_inner(active_provider_fixture(
+            tag,
+            &first_id,
+            "First",
+            "first-model",
+            "shared-fixture-key",
+        ))
+        .unwrap();
+        let second = save_provider_inner(active_provider_fixture(
+            tag,
+            &second_id,
+            "Second",
+            "second-model",
+            "shared-fixture-key",
+        ))
+        .unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &first_id).unwrap();
+        let external = active_provider_fixture(
+            tag,
+            "custom",
+            "Second",
+            "second-model",
+            "shared-fixture-key",
+        );
+        write_active_provider_files(&dir, &external);
+        assert_eq!(
+            build_state_after_migration(dir.clone())
+                .unwrap()
+                .active_saved_provider_id
+                .as_deref(),
+            Some(first_id.as_str())
+        );
+        let before_config = fs::read(config_path(&dir)).unwrap();
+        let before_auth = fs::read(auth_path(&dir)).unwrap();
+        assert!(
+            save_active_provider_inner(second.clone(), Some(dir.display().to_string())).is_err()
+        );
+        assert_eq!(saved_provider(&first_id), first);
+        assert_eq!(saved_provider(&second_id), second);
+        assert_eq!(fs::read(config_path(&dir)).unwrap(), before_config);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), before_auth);
+        let updated = active_provider_fixture(
+            tag,
+            &first_id,
+            "Edited first",
+            "edited-model",
+            "shared-fixture-key",
+        );
+        save_active_provider_inner(updated, Some(dir.display().to_string())).unwrap();
+        assert_eq!(saved_provider(&second_id), second);
+        assert_eq!(saved_provider(&first_id).provider_name, "Edited first");
+        delete_provider_inner(&first_id).unwrap();
+        delete_provider_inner(&second_id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unique_route_recovers_an_older_missing_selection_after_model_change() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_003;
+        let id = format!("runtime-recover-{tag}");
+        let dir = active_provider_test_dir("runtime-recover", tag);
+        save_provider_inner(active_provider_fixture(
+            tag,
+            &id,
+            "Saved",
+            "before",
+            "fixture-key",
+        ))
+        .unwrap();
+        write_active_provider_files(
+            &dir,
+            &active_provider_fixture(tag, "custom", "External", "after", "fixture-key"),
+        );
+        let updated = active_provider_fixture(tag, &id, "Renamed", "saved-again", "fixture-key");
+        let result = save_active_provider_inner(updated, Some(dir.display().to_string())).unwrap();
+        assert_eq!(
+            result.state.active_saved_provider_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(saved_provider(&id).provider_name, "Renamed");
+        delete_provider_inner(&id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switching_after_cancelled_runtime_edit_updates_original_without_a_duplicate() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_004;
+        let id = format!("runtime-cancel-{tag}");
+        let dir = active_provider_test_dir("runtime-cancel", tag);
+        let mut mapped = active_provider_fixture(tag, &id, "Original", "before", "fixture-key");
+        mapped.model_mappings = vec![
+            super::super::model_catalog::ProviderModelMapping {
+                model: "before".into(),
+                display_name: "Saved model".into(),
+                context_window: Some(128000),
+            },
+            super::super::model_catalog::ProviderModelMapping {
+                model: "external-model".into(),
+                display_name: "Other supported model".into(),
+                context_window: Some(256000),
+            },
+        ];
+        let original = save_provider_inner(mapped).unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &id).unwrap();
+        let external = active_provider_fixture(tag, "custom", "D", "external-model", "fixture-key");
+        write_active_provider_files(&dir, &external);
+        // Opening/cancelling an editor only reads state; it must not persist a second row.
+        let current = build_state_after_migration(dir.clone()).unwrap();
+        assert_eq!(
+            current.active_saved_provider_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(saved_provider(&id), original);
+        switch_official_provider_inner(Some(dir.display().to_string())).unwrap();
+        let after = list_saved_providers_inner()
+            .unwrap()
+            .into_iter()
+            .filter(|provider| provider.base_url == original.base_url)
+            .collect::<Vec<_>>();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, id);
+        assert_eq!(after[0].provider_name, "D");
+        assert_eq!(after[0].model, "external-model");
+        assert_eq!(after[0].model_mappings, original.model_mappings);
+        delete_provider_inner(&id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_runtime_edit_restores_original_record_and_selection() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_005;
+        let id = format!("runtime-failure-{tag}");
+        let dir = active_provider_test_dir("runtime-failure", tag);
+        let original = save_provider_inner(active_provider_fixture(
+            tag,
+            &id,
+            "Original",
+            "before",
+            "fixture-key",
+        ))
+        .unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &id).unwrap();
+        write_active_provider_files(
+            &dir,
+            &active_provider_fixture(tag, "custom", "D", "external-model", "fixture-key"),
+        );
+        let before_config = fs::read(config_path(&dir)).unwrap();
+        let before_auth = fs::read(auth_path(&dir)).unwrap();
+        let error = save_active_provider_with_apply(
+            active_provider_fixture(tag, &id, "Must roll back", "requested", "new-fixture-key"),
+            Some(dir.display().to_string()),
+            |_, _, _| Err(CodexxError::Config("fixture apply failure".to_string())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fixture apply failure"));
+        assert_eq!(saved_provider(&id), original);
+        assert_eq!(fs::read(config_path(&dir)).unwrap(), before_config);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), before_auth);
+        assert_eq!(
+            build_state_after_migration(dir.clone())
+                .unwrap()
+                .active_saved_provider_id
+                .as_deref(),
+            Some(id.as_str())
+        );
+        switch_official_provider_inner(Some(dir.display().to_string())).unwrap();
+        assert_eq!(
+            list_saved_providers_inner()
+                .unwrap()
+                .iter()
+                .filter(|provider| provider.base_url == original.base_url)
+                .count(),
+            1
+        );
+        delete_provider_inner(&id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_runtime_route_does_not_create_or_overwrite_a_saved_profile_on_switch() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_006;
+        let dir = active_provider_test_dir("runtime-ambiguous", tag);
+        let first = save_provider_inner(active_provider_fixture(
+            tag,
+            &format!("runtime-a-{tag}"),
+            "A",
+            "model-a",
+            "fixture-key",
+        ))
+        .unwrap();
+        let second = save_provider_inner(active_provider_fixture(
+            tag,
+            &format!("runtime-b-{tag}"),
+            "B",
+            "model-b",
+            "fixture-key",
+        ))
+        .unwrap();
+        write_active_provider_files(
+            &dir,
+            &active_provider_fixture(tag, "custom", "D", "external-model", "fixture-key"),
+        );
+        assert!(build_state_after_migration(dir.clone())
+            .unwrap()
+            .active_saved_provider_id
+            .is_none());
+        switch_official_provider_inner(Some(dir.display().to_string())).unwrap();
+        assert_eq!(saved_provider(&first.id), first);
+        assert_eq!(saved_provider(&second.id), second);
+        assert_eq!(
+            list_saved_providers_inner()
+                .unwrap()
+                .iter()
+                .filter(|provider| provider.base_url == first.base_url)
+                .count(),
+            2
+        );
+        delete_provider_inner(&first.id).unwrap();
+        delete_provider_inner(&second.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_provider_edit_rejects_a_different_live_credential_without_side_effects() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 50_007;
+        let id = format!("runtime-foreign-{tag}");
+        let dir = active_provider_test_dir("runtime-foreign", tag);
+        let original = save_provider_inner(active_provider_fixture(
+            tag,
+            &id,
+            "Original",
+            "model",
+            "stored-fixture-key",
+        ))
+        .unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &id).unwrap();
+        write_active_provider_files(
+            &dir,
+            &active_provider_fixture(tag, "custom", "Original", "model", "foreign-fixture-key"),
+        );
+        let before_config = fs::read(config_path(&dir)).unwrap();
+        let before_auth = fs::read(auth_path(&dir)).unwrap();
+        assert!(
+            save_active_provider_inner(original.clone(), Some(dir.display().to_string())).is_err()
+        );
+        assert_eq!(saved_provider(&id), original);
+        assert_eq!(fs::read(config_path(&dir)).unwrap(), before_config);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), before_auth);
+        assert_eq!(
+            super::super::selection::selected_provider_id_on_connection(
+                &open_store().unwrap(),
+                &dir
+            )
+            .unwrap()
+            .as_deref(),
+            Some(id.as_str())
+        );
+        delete_provider_inner(&id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_provider_activation_supplies_its_key_and_real_model_catalog() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 60_001;
+        let dir = active_provider_test_dir("catalog-auth", tag);
+        let id = format!("catalog-auth-{tag}");
+        let mut provider =
+            active_provider_fixture(tag, &id, "DeepSeek", "deepseek-chat", "fixture-current-key");
+        provider.toml_config.as_mut().unwrap().push_str(
+            r#"env_key = "STALE_ENV_KEY"
+env_key_instructions = "Stale environment instructions"
+auth = { command = "fixture-never-executed" }
+http_headers = { Authorization = "Bearer stale", "X-Trace" = "keep-static" }
+env_http_headers = { aUtHoRiZaTiOn = "STALE_AUTH", "X-Project" = "PROJECT_ENV" }
+"#,
+        );
+        provider.model_mappings = vec![
+            super::super::model_catalog::ProviderModelMapping {
+                model: "deepseek-chat".into(),
+                display_name: "DeepSeek V3".into(),
+                context_window: Some(128000),
+            },
+            super::super::model_catalog::ProviderModelMapping {
+                model: "deepseek-reasoner".into(),
+                display_name: "DeepSeek R1".into(),
+                context_window: Some(256000),
+            },
+        ];
+        save_provider_inner(provider.clone()).unwrap();
+        let result =
+            activate_saved_provider_inner(Some(dir.display().to_string()), id.clone()).unwrap();
+        assert_eq!(result.state.model.as_deref(), Some("deepseek-chat"));
+        let doc = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let route = doc["model_providers"]["custom"].as_table().unwrap();
+        assert_eq!(
+            route["experimental_bearer_token"].as_str(),
+            Some("fixture-current-key")
+        );
+        for key in ["env_key", "env_key_instructions", "auth"] {
+            assert!(route.get(key).is_none());
+        }
+        assert!(route["http_headers"]
+            .as_table_like()
+            .unwrap()
+            .get("Authorization")
+            .is_none());
+        assert!(route["env_http_headers"]
+            .as_table_like()
+            .unwrap()
+            .get("aUtHoRiZaTiOn")
+            .is_none());
+        assert_eq!(
+            route["http_headers"]["X-Trace"].as_str(),
+            Some("keep-static")
+        );
+        assert_eq!(
+            route["env_http_headers"]["X-Project"].as_str(),
+            Some("PROJECT_ENV")
+        );
+        let pointer = PathBuf::from(doc["model_catalog_json"].as_str().unwrap());
+        assert!(pointer.is_file());
+        let catalog: Value = serde_json::from_slice(&fs::read(&pointer).unwrap()).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "deepseek-chat");
+        assert_eq!(models[0]["display_name"], "DeepSeek V3");
+        assert_eq!(models[1]["slug"], "deepseek-reasoner");
+        assert_eq!(models[1]["context_window"], 256000);
+        assert!(!fs::read_to_string(&pointer)
+            .unwrap()
+            .contains("fixture-current-key"));
+        assert!(!saved_provider(&id)
+            .toml_config
+            .unwrap()
+            .contains("fixture-current-key"));
+        delete_provider_inner(&id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switching_to_unmapped_or_official_provider_removes_only_owned_catalog_pointer() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 60_002;
+        let dir = active_provider_test_dir("catalog-switch", tag);
+        let mut mapped = active_provider_fixture(
+            tag,
+            &format!("catalog-mapped-{tag}"),
+            "Mapped",
+            "deepseek-chat",
+            "fixture-mapped-key",
+        );
+        mapped.model_mappings = vec![super::super::model_catalog::ProviderModelMapping {
+            model: "deepseek-chat".into(),
+            display_name: "DeepSeek".into(),
+            context_window: None,
+        }];
+        let mapped = save_provider_inner(mapped).unwrap();
+        let plain = save_provider_inner(active_provider_fixture(
+            tag + 1,
+            &format!("catalog-plain-{tag}"),
+            "Plain",
+            "plain-model",
+            "fixture-plain-key",
+        ))
+        .unwrap();
+        activate_saved_provider_inner(Some(dir.display().to_string()), mapped.id.clone()).unwrap();
+        let doc = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let generated = PathBuf::from(doc["model_catalog_json"].as_str().unwrap());
+        activate_saved_provider_inner(Some(dir.display().to_string()), plain.id.clone()).unwrap();
+        let plain_live = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(
+            plain_live.get("model_catalog_json").is_none(),
+            "a sparse unmapped provider must not inherit the previous generated model catalog"
+        );
+        assert!(
+            generated.is_file(),
+            "catalog snapshots may remain for saved configurations and rollback"
+        );
+        activate_saved_provider_inner(Some(dir.display().to_string()), mapped.id.clone()).unwrap();
+        switch_official_provider_inner(Some(dir.display().to_string())).unwrap();
+        let official = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(official.get("model_catalog_json").is_none());
+        // Use a fresh CODEX_HOME so an unrelated older official snapshot cannot
+        // replace the user-supplied catalog before the cleanup logic sees it.
+        let custom_dir = active_provider_test_dir("catalog-user-pointer", 60_004);
+        let custom_catalog = custom_dir.join("my-custom-models.json");
+        fs::write(&custom_catalog, "{\"models\":[]}").unwrap();
+        let mut custom = plain.clone();
+        let mut template = custom
+            .toml_config
+            .as_ref()
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        template["model_catalog_json"] = value(custom_catalog.display().to_string());
+        custom.toml_config = Some(template.to_string());
+        save_provider_inner(custom).unwrap();
+        activate_saved_provider_inner(Some(custom_dir.display().to_string()), plain.id.clone())
+            .unwrap();
+        switch_official_provider_inner(Some(custom_dir.display().to_string())).unwrap();
+        let official_custom = fs::read_to_string(config_path(&custom_dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            official_custom["model_catalog_json"].as_str(),
+            Some(custom_catalog.to_str().unwrap())
+        );
+        assert!(custom_catalog.is_file());
+        delete_provider_inner(&mapped.id).unwrap();
+        delete_provider_inner(&plain.id).unwrap();
+        fs::remove_dir_all(custom_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_catalog_failure_rolls_back_activation_adoption_and_active_edits() {
+        let _guard = crate::app_db::test_db_guard();
+        let tag = 60_003;
+        let dir = active_provider_test_dir("catalog-failure", tag);
+        let original = save_provider_inner(active_provider_fixture(
+            tag,
+            &format!("catalog-original-{tag}"),
+            "Original",
+            "before",
+            "fixture-original-key",
+        ))
+        .unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &original.id).unwrap();
+        let external = active_provider_fixture(
+            tag,
+            "custom",
+            "Codex rename",
+            "external-model",
+            "fixture-original-key",
+        );
+        write_active_provider_files(&dir, &external);
+        let before_config = fs::read(config_path(&dir)).unwrap();
+        let before_auth = fs::read(auth_path(&dir)).unwrap();
+        let mut target = active_provider_fixture(
+            tag + 1,
+            &format!("catalog-target-{tag}"),
+            "Target",
+            "deepseek-chat",
+            "fixture-target-key",
+        );
+        target.model_mappings = vec![super::super::model_catalog::ProviderModelMapping {
+            model: "deepseek-chat".into(),
+            display_name: "DeepSeek".into(),
+            context_window: None,
+        }];
+        let target = save_provider_inner(target).unwrap();
+        fs::write(dir.join(".codex-x"), "fixture blocks generated directory").unwrap();
+        assert!(
+            activate_saved_provider_inner(Some(dir.display().to_string()), target.id.clone())
+                .is_err()
+        );
+        assert_eq!(saved_provider(&original.id), original);
+        assert_eq!(saved_provider(&target.id), target);
+        let mut updated = original.clone();
+        updated.provider_name = "Must roll back".into();
+        updated.model_mappings = vec![super::super::model_catalog::ProviderModelMapping {
+            model: "before".into(),
+            display_name: "Mapped before".into(),
+            context_window: None,
+        }];
+        assert!(save_active_provider_inner(updated, Some(dir.display().to_string())).is_err());
+        assert_eq!(saved_provider(&original.id), original);
+        assert_eq!(fs::read(config_path(&dir)).unwrap(), before_config);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), before_auth);
+        assert_eq!(
+            super::super::selection::selected_provider_id_on_connection(
+                &open_store().unwrap(),
+                &dir
+            )
+            .unwrap()
+            .as_deref(),
+            Some(original.id.as_str())
+        );
+        delete_provider_inner(&original.id).unwrap();
+        delete_provider_inner(&target.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn active_provider_save_updates_one_record_and_hot_applies() {
         let _db_guard = crate::app_db::test_db_guard();
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1990,9 +2626,10 @@ command = "docs-server"
             doc["mcp_servers"]["docs"]["command"].as_str(),
             Some("docs-server")
         );
-        assert!(doc["model_providers"]["custom"]
-            .get("experimental_bearer_token")
-            .is_none());
+        assert_eq!(
+            doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("sk-after")
+        );
         assert_eq!(saved_provider(&id).provider_name, "After");
         let auth_after: Value = serde_json::from_str(
             &fs::read_to_string(auth_path(&codex_dir)).expect("read official auth"),
@@ -2555,7 +3192,7 @@ experimental_bearer_token = "sk-external"
     }
 
     #[test]
-    fn detected_live_provider_does_not_overwrite_ambiguous_saved_copies() {
+    fn detected_live_provider_only_captures_runtime_config_after_explicit_copy_selection() {
         let _db_guard = crate::app_db::test_db_guard();
         let tag = 40_006;
         let codex_dir = active_provider_test_dir("detected-ambiguous", tag);
@@ -2574,6 +3211,9 @@ experimental_bearer_token = "sk-external"
             api_key: live.api_key.clone(),
         })
         .unwrap();
+        assert!(activated.state.active_saved_provider_id.is_none());
+        assert_eq!(saved_provider(&first.id), first);
+        assert_eq!(saved_provider(&second.id), second);
         let selected = crate::finish_provider_selection(
             activated,
             crate::ActiveProviderSelectionUpdate::Set(second.id.clone()),
@@ -2586,7 +3226,27 @@ experimental_bearer_token = "sk-external"
         switch_official_provider_inner(Some(codex_dir.display().to_string())).unwrap();
 
         assert_eq!(saved_provider(&first.id), first);
-        assert_eq!(saved_provider(&second.id), second);
+        let retained = saved_provider(&second.id);
+        assert_eq!(retained.id, second.id);
+        assert_eq!(retained.provider_name, second.provider_name);
+        assert_eq!(retained.base_url, second.base_url);
+        assert_eq!(retained.model, second.model);
+        assert_eq!(retained.api_key, second.api_key);
+        assert_eq!(retained.model_mappings, second.model_mappings);
+        let config = retained
+            .toml_config
+            .as_ref()
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(config["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            config["mcp_servers"]["docs"]["command"].as_str(),
+            Some("docs-server")
+        );
+        assert!(config["model_providers"]["custom"]
+            .get("experimental_bearer_token")
+            .is_none());
         assert_eq!(
             list_saved_providers_inner()
                 .unwrap()

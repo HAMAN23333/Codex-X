@@ -22,6 +22,12 @@ export type ProviderSummary = {
   isCurrent: boolean;
 };
 
+export type ProviderModelMapping = {
+  model: string;
+  displayName: string;
+  contextWindow: number | null;
+};
+
 export type SavedProvider = {
   id: string;
   providerName: string;
@@ -31,6 +37,7 @@ export type SavedProvider = {
   tomlConfig?: string;
   wireApi: string;
   requiresOpenaiAuth: boolean;
+  modelMappings?: ProviderModelMapping[];
 };
 
 export type OfficialProfileSummary = {
@@ -38,6 +45,10 @@ export type OfficialProfileSummary = {
   providerName: string;
   model: string | null;
   hasAuth: boolean;
+  hasOwnedAuth: boolean;
+  email: string | null;
+  planType?: string | null;
+  canQueryQuota: boolean;
   isDefault: boolean;
   isCurrent: boolean;
 };
@@ -127,13 +138,6 @@ export type ActionResult = {
   message: string;
   backupId?: string;
   state: CodexState;
-};
-
-export type OfficialConfigDraft = {
-  authJson: string;
-  configText: string;
-  model?: string;
-  source: string;
 };
 
 export type OfficialAuthCandidate = {

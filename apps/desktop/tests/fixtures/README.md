@@ -160,6 +160,76 @@ with the production response shape from `src/usageTypes.ts`. Both refresh
 paths return newly aggregated sample data; there is no filesystem scan or
 real usage cache in this fixture.
 
+## Official account badges and quota
+
+Reset the fixture when migrating older session data so synthetic authentication
+includes `one@example.test`. **Fixture：登录第二个官方账号** writes
+`two@example.test`. Official summaries expose `email`, `hasOwnedAuth`, and
+`canQueryQuota` from the selected profile's live authentication or its own saved
+snapshot. An empty official profile shows the unsigned-in badge. No additional
+profiles are added by default; use **新增供应商 → 官方 Codex 登录** to create one.
+
+Use the compact **Fixture：额度模式** selector before clicking a profile's quota
+button or the quota dialog's refresh action:
+
+- **双窗口 Team**: 5-hour and weekly windows with 93% and 52% remaining.
+- **单周 Pro**: one weekly window with 91% remaining.
+- **Spark 双窗 + reserve 周**: the main windows plus Spark 5-hour/week and a
+  separate reserve weekly allowance.
+- **无主额度窗口**: no limits and an unknown plan.
+- **未知窗口周期**: a 2-hour window plus an unknown duration/percentage/reset.
+- **认证过期 401**: a sanitized sign-in-expired error.
+- **延迟：完成后成功／失败**: keeps the request pending until
+  **Fixture：完成额度请求** is clicked. The scenario is captured when the request
+  starts, so changing the selector does not alter an already pending response.
+
+Changing fixture mode does not trigger a request. Diagnostics expose `quotaMode`
+and `pendingQuota`. Node assertions may use `setQuotaMode`, `completeQuota`, and
+`failQuota` on `window.__CODEX_X_FIXTURE__`. Responses follow
+`src/officialQuotaTypes.ts`; all accounts, limits and timestamps are synthetic,
+and the fixture never contacts the ChatGPT endpoint.
+
+## Provider model mappings
+
+The fixture preserves `modelMappings` when saving and copying a supplier, and
+implements `activate_saved_provider` with the production `providerId` argument.
+Fetch models, expand **模型映射**, import the list, and edit the display name,
+actual model ID or optional context window. Invalid IDs, duplicate rows and
+invalid context sizes disable Save. Reopening a saved item retains its mappings;
+enabling it shows the restart notice. Actual catalog files, outbound model IDs,
+authentication and rollback are covered by the Rust and native Codex checks.
+
+## Provider presets and retained usage results
+
+The add-provider form exposes eight preset cards. Cards show only brand marks and names; switching among all presets, including official sign-in, keeps the same add-page transition key. The initial custom TOML includes a reasoning setting, a fixture MCP server and a project entry for inheritance checks. Selecting a vendor fills its
+native Responses endpoint and model mappings. MiniMax region and MiMo plan
+buttons change the endpoint and clear the synthetic key. Reopening a saved
+preset retains its selected model and mappings.
+
+For the usage-switching regression, load the initial seven-day result, then turn
+on **Fixture：暂停用量响应**. Select Today, 30 days and All time in succession.
+The existing summary and charts should remain visible with their original range
+label and a small loading status. **Fixture：完成最新用量请求** resolves the last
+selection first; **Fixture：完成旧用量请求** resolves one older request at a time.
+Those older results must not replace the latest displayed range. Diagnostics
+include `pendingUsage`; all data remains synthetic and in memory.
+
+## Reset credits and plan badges
+
+Official fixture logins expose a `planType` (the default login is Pro, and the
+external second login is Pro Lite). Additional fake official logins can specify
+`plan_type` in their synthetic auth JSON to inspect Plus, Team or other badges.
+No account key or network request is involved in these metadata displays.
+
+**Fixture：重置次数模式** controls the independent reset-count response: 3, 0,
+failure, delayed success or delayed failure. To verify concurrency, select a
+delayed quota and delayed reset-count response, open the quota dialog, and check
+`pendingQuota` and `pendingResetCredits` are both 1 in the visible diagnostics.
+**Fixture：完成重置次数请求** resolves only the count; it must render while quota
+is still loading. **Fixture：完成额度请求** resolves the other request. Closing
+and changing profiles invalidate both pending results. There is no redemption
+operation in the fixture or this feature.
+
 ## Diagnostics and scope
 
 The accessible **Fixture 命令记录** output (`#fixture-command-log`) displays JSON

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 4;
+const APP_DB_SCHEMA_VERSION: i64 = 5;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -148,6 +148,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             toml_config TEXT,
             wire_api TEXT NOT NULL DEFAULT 'responses',
             requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+            model_mappings_json TEXT NOT NULL DEFAULT '[]',
             source TEXT NOT NULL DEFAULT 'manual',
             source_id TEXT,
             created_at TEXT NOT NULL,
@@ -239,6 +240,12 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         "providers",
         "source_id",
         "ALTER TABLE providers ADD COLUMN source_id TEXT",
+    )?;
+    ensure_sqlite_column(
+        conn,
+        "providers",
+        "model_mappings_json",
+        "ALTER TABLE providers ADD COLUMN model_mappings_json TEXT NOT NULL DEFAULT '[]'",
     )?;
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_source_identity
@@ -364,6 +371,48 @@ mod tests {
             APP_DB_SCHEMA_VERSION
         );
         drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn version_four_provider_rows_migrate_with_empty_model_mappings() {
+        let path = test_db_path("provider-model-mappings-v5");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch("CREATE TABLE providers (
+            id TEXT PRIMARY KEY, provider_name TEXT NOT NULL, base_url TEXT NOT NULL,
+            model TEXT NOT NULL, api_key TEXT, toml_config TEXT,
+            wire_api TEXT NOT NULL DEFAULT 'responses', requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'manual', source_id TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            INSERT INTO providers (id, provider_name, base_url, model, api_key, source, source_id, created_at, updated_at)
+            VALUES ('legacy-models', 'Existing provider', 'https://migration.example.test/v1', 'existing-model', 'fixture-key', 'cc-switch', 'source-row', 'original-created', 'original-updated');
+            PRAGMA user_version = 4;").unwrap();
+        drop(legacy);
+        let migrated = DatabaseInitializer::new().open_at(&path).unwrap();
+        assert_eq!(schema_version(&migrated).unwrap(), 5);
+        let stored = crate::providers::list_saved_providers_on_connection(&migrated).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].model_mappings.is_empty());
+        assert_eq!(stored[0].model, "existing-model");
+        assert_eq!(stored[0].api_key.as_deref(), Some("fixture-key"));
+        let metadata: (String, String, String, String, String) = migrated.query_row(
+            "SELECT source, source_id, created_at, updated_at, model_mappings_json FROM providers WHERE id = 'legacy-models'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            metadata,
+            (
+                "cc-switch".into(),
+                "source-row".into(),
+                "original-created".into(),
+                "original-updated".into(),
+                "[]".into()
+            )
+        );
+        drop(migrated);
         remove_test_db(&path);
     }
 

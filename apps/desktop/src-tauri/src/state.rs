@@ -8,7 +8,7 @@ use crate::prompts::{
 };
 use crate::providers::{
     clear_active_provider_on_connection, detected_live_custom_provider, document_is_official,
-    list_saved_providers_on_connection, matching_saved_provider_ids_for_live,
+    list_saved_providers_on_connection, matching_saved_provider_ids_for_live_on_connection,
     official_auth_available, open_store, reconcile_active_provider_on_connection, SavedProvider,
 };
 use crate::{auth_path, config_path, string_value};
@@ -227,7 +227,12 @@ pub(crate) fn build_state_after_migration(codex_dir: PathBuf) -> Result<CodexSta
         clear_active_provider_on_connection(&conn, &codex_dir)?;
         None
     } else if let Some(live) = detected_live_custom_provider(&codex_dir)? {
-        let candidates = matching_saved_provider_ids_for_live(&live, &saved_providers);
+        let candidates = matching_saved_provider_ids_for_live_on_connection(
+            &conn,
+            &codex_dir,
+            &live,
+            &saved_providers,
+        )?;
         reconcile_active_provider_on_connection(&conn, &codex_dir, &candidates)?
     } else {
         let candidates = matching_saved_provider_ids_from_config(&text, &saved_providers);

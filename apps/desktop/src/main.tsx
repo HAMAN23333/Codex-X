@@ -24,6 +24,9 @@ import { cx } from "./components/ui";
 import { appUpdater, useAppUpdater } from "./appUpdater";
 import { providerProfilesMatch, type ProviderProfile } from "./providerProfiles";
 import { orderProviderRows } from "./providerRowOrder";
+import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
+import { validateProviderModelMappings } from "./components/ProviderModelMappings";
+import { createOfficialProfileMonitor } from "./officialProfileMonitor";
 import type {
   AboutInfo,
   ActionResult,
@@ -37,7 +40,6 @@ import type {
   InstructionTemplate,
   Lang,
   OfficialAuthCandidate,
-  OfficialConfigDraft,
   OfficialProfileActionResult,
   OfficialProfileDetail,
   OfficialProfileSummary,
@@ -207,7 +209,7 @@ const dict = {
       model: "模型",
       wireApi: "Wire API",
       apiKey: "API Key",
-      apiKeyPlaceholder: "用于写入 auth.json",
+      apiKeyPlaceholder: "填写 API Key",
       requiresAuth: "requires_openai_auth",
       save: "保存到列表",
       saveAndSwitch: "保存",
@@ -308,7 +310,7 @@ const dict = {
       model: "Model",
       wireApi: "Wire API",
       apiKey: "API Key",
-      apiKeyPlaceholder: "Written to auth.json",
+      apiKeyPlaceholder: "Enter API key",
       requiresAuth: "requires_openai_auth",
       save: "Save",
       saveAndSwitch: "Save",
@@ -385,7 +387,6 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     officialTomlLabel: "config.toml (TOML)",
     officialSaveLabel: isChinese ? "保存官方配置" : "Save official config",
     loadCcSwitchOfficialLabel: isChinese ? "从 CC Switch 载入" : "Load from CC Switch",
-    restoreOfficialLabel: isChinese ? "读取已保存配置" : "Load saved config",
     resetOfficialLabel: isChinese ? "重置默认官方配置" : "Reset default official config",
     resetOfficialTitle: isChinese ? "重置默认官方配置" : "Reset default official config",
     resetOfficialDescription: isChinese
@@ -411,13 +412,13 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     modelLabel: t.provider.model,
     fetchModelsLabel: isChinese ? "获取模型列表" : "Fetch models",
     fetchingModelsLabel: isChinese ? "获取中" : "Fetching",
-    chooseModelLabel: (count) => isChinese ? `选择已获取的模型（${count}）` : `Choose a fetched model (${count})`,
+    chooseModelLabel: (count) => isChinese ? `选择模型（${count}）` : `Choose a model (${count})`,
     wireApiLabel: t.provider.wireApi,
     requiresAuthLabel: t.provider.requiresAuth,
     authPreviewTitle: "auth.json (JSON)",
     authPreviewDescription: isChinese
-      ? "启用该供应商时，auth.json 只写入 OPENAI_API_KEY；API Key 留空会移除第三方认证文件。"
-      : "When enabled, auth.json contains only OPENAI_API_KEY. Leaving the API key empty removes third-party authentication.",
+      ? "启用时会按供应商的认证方式应用 API Key；此处预览 auth.json 中保存的内容。"
+      : "Enabling applies the API key using this provider's authentication settings. This previews the contents saved in auth.json.",
     tomlTitle: "config.toml (TOML)",
     tomlDescription: isChinese
       ? "上方标准字段是启用时的权威值；已有模板中的其他扩展字段会保留。只有点击“重置生成”才会替换为标准模板。"
@@ -752,6 +753,8 @@ function App() {
   const [officialProfiles, setOfficialProfiles] = React.useState<OfficialProfileSummary[]>([]);
   const [editingOfficialProfileId, setEditingOfficialProfileId] = React.useState<string | null>(DEFAULT_OFFICIAL_PROFILE_ID);
   const [creatingProvider, setCreatingProvider] = React.useState(false);
+  const [selectedPresetId, setSelectedPresetId] = React.useState("custom");
+  const [selectedPresetVariantId, setSelectedPresetVariantId] = React.useState("");
   const [officialAuthDirty, setOfficialAuthDirty] = React.useState(false);
   const [activeProviderId, setActiveProviderId] = React.useState(() => localStorage.getItem(ACTIVE_PROVIDER_KEY) || "");
   const [savedPrompts, setSavedPrompts] = React.useState<SavedPrompt[]>([]);
@@ -814,6 +817,10 @@ function App() {
   const providerDraftRequestRef = React.useRef(0);
   const officialDraftRequestRef = React.useRef(0);
   const officialProfilesRequestRef = React.useRef(0);
+  const officialProfilesLiveRef = React.useRef(officialProfiles);
+  officialProfilesLiveRef.current = officialProfiles;
+  const officialMonitorReadyRef = React.useRef(false);
+  officialMonitorReadyRef.current = Boolean(state) && !refreshing;
   const savedProvidersRequestRef = React.useRef(0);
   const loadingGenerationRef = React.useRef(0);
   const loadingTokensRef = React.useRef(new Set<number>());
@@ -1162,6 +1169,10 @@ function App() {
       model: null,
       isDefault: true,
       hasAuth: Boolean(state?.officialAuthAvailable),
+      hasOwnedAuth: Boolean(state?.officialAuthAvailable),
+      email: null,
+      planType: null,
+      canQueryQuota: false,
     };
     const officialRow = (profile: typeof defaultProfile): ProviderRow => ({
       id: profile.id,
@@ -1174,7 +1185,10 @@ function App() {
       requiresOpenaiAuth: true,
       isCurrent: profile.id === currentOfficialProfileId,
       isDefaultOfficial: profile.isDefault,
-      meta: !profile.hasAuth ? (lang === "zh" ? "待登录" : "Sign-in required") : undefined,
+      hasAuth: profile.hasOwnedAuth,
+      email: profile.email,
+      planType: profile.planType,
+      canQueryQuota: profile.canQueryQuota,
     });
     const rows = orderProviderRows(officialRow(defaultProfile), detectedRows, localRows);
     return [rows[0], ...officialProfiles.filter((profile) => !profile.isDefault).map(officialRow), ...rows.slice(1)];
@@ -1218,6 +1232,10 @@ function App() {
       requiresOpenaiAuth: row.requiresOpenaiAuth,
       isCurrent: row.isCurrent,
       isDefaultOfficial: row.isDefaultOfficial,
+      hasAuth: row.hasAuth,
+      email: row.email,
+      planType: row.planType,
+      canQueryQuota: row.canQueryQuota,
       meta: row.meta,
       sourceLabel: row.source === "official" ? (lang === "zh" ? "Codex 登录" : "Codex login") : undefined,
       editable: row.source === "official" || Boolean(local) || row.source === "detected",
@@ -1389,6 +1407,37 @@ function App() {
     refresh(startupWizardOpen);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  React.useEffect(() => {
+    const directory = state?.codexDir;
+    if (!directory || !(tab === "dashboard" || (tab === "provider" && providerMode === "list"))) return;
+    const scope = normalizedConfigDirForComparison(directory);
+    const monitor = createOfficialProfileMonitor({
+      read: () => invoke<OfficialProfileSummary[]>("list_official_profiles", { configDir: directory }),
+      revision: () => officialProfilesRequestRef.current,
+      isVisible: () => document.visibilityState !== "hidden",
+      canRead: () => officialMonitorReadyRef.current
+        && activeConfigDirKeyRef.current === scope
+        && loadingTokensRef.current.size === 0
+        && actionBusyTokensRef.current.size === 0,
+      apply: (profiles) => {
+        if (JSON.stringify(profiles) === JSON.stringify(officialProfilesLiveRef.current)) return;
+        // This newer snapshot supersedes older foreground list reads, while a
+        // mutation that starts after the poll still invalidates it via revision.
+        officialProfilesRequestRef.current += 1;
+        officialProfilesLiveRef.current = profiles;
+        setOfficialProfiles(profiles);
+      },
+    });
+    window.addEventListener("focus", monitor.wake);
+    document.addEventListener("visibilitychange", monitor.wake);
+    monitor.wake();
+    return () => {
+      monitor.stop();
+      window.removeEventListener("focus", monitor.wake);
+      document.removeEventListener("visibilitychange", monitor.wake);
+    };
+  }, [state?.codexDir, tab, providerMode]);
 
   React.useEffect(() => {
     if (!state?.codexDir) return;
@@ -1681,6 +1730,9 @@ function App() {
   });
 
   const applyProviderConfig = (provider: SavedProvider) => {
+    if (savedProviders.some((saved) => saved.id === provider.id)) {
+      return invoke<ActionResult>("activate_saved_provider", { configDir: configDir || null, providerId: provider.id });
+    }
     const tomlConfig = provider.tomlConfig?.trim();
     if (tomlConfig) {
       return invoke<ActionResult>("save_provider_toml_config", {
@@ -1708,6 +1760,15 @@ function App() {
 
   const saveProviderOnly = () => {
     const pendingProvider = normalizedProviderForm();
+    const mappingValidation = validateProviderModelMappings(pendingProvider.modelMappings || [], pendingProvider.model, lang);
+    if (pendingProvider.modelMappings?.length && pendingProvider.wireApi !== "responses") {
+      setError(lang === "zh" ? "模型映射需要 Responses 接口，请将 Wire API 设为 responses" : "Model mappings require the Responses API. Set Wire API to responses");
+      return;
+    }
+    if (!mappingValidation.valid) {
+      setError(lang === "zh" ? "请先修正模型映射中的错误" : "Correct the model mappings before saving");
+      return;
+    }
     if (!pendingProvider.providerName || !pendingProvider.baseUrl || !pendingProvider.model) {
       setError(lang === "zh"
         ? "请填写供应商名称、API 请求地址和模型"
@@ -1743,7 +1804,9 @@ function App() {
         setEditingProviderId(null);
         setEditingDetectedProvider(false);
         setProviderTomlDirty(false);
-        setToast(applied
+        setToast(applied && pendingProvider.modelMappings?.length
+          ? (lang === "zh" ? "已保存，请重启 Codex 更新模型菜单" : "Saved. Restart Codex to update its model menu")
+          : applied
           ? (lang === "zh" ? "供应商配置已保存并热更新" : "Provider saved and hot-applied")
           : (lang === "zh" ? "供应商配置已保存" : "Provider saved"));
       },
@@ -1757,6 +1820,9 @@ function App() {
         localStorage.setItem(ACTIVE_PROVIDER_KEY, provider.id);
         setActiveProviderId(provider.id);
         handleActionResult(result);
+        if (provider.modelMappings?.length) {
+          setToast(lang === "zh" ? "已启用，请重启 Codex 更新模型菜单" : "Enabled. Restart Codex to update its model menu");
+        }
       },
     );
 
@@ -1827,30 +1893,6 @@ function App() {
         localStorage.removeItem(ACTIVE_PROVIDER_KEY);
         setActiveProviderId("");
         handleActionResult(result);
-      },
-    );
-
-  const restoreOfficialProvider = () =>
-    call(
-      async () => {
-        const result = await invoke<ActionResult>("restore_official_provider", { configDir: configDir || null });
-        const draft = await invoke<OfficialConfigDraft | null>("get_official_config_draft", {
-          configDir: configDir || null,
-        });
-        return { result, draft };
-      },
-      ({ result, draft }) => {
-        if (draft) {
-          setOfficialAuthDirty(false);
-          setOfficialForm({
-            providerName: officialForm.providerName,
-            model: draft.model || "gpt-5.5",
-            authJson: draft.authJson,
-            configText: draft.configText || buildOfficialTomlPreview(draft.model || "gpt-5.5"),
-          });
-        }
-        handleActionResult(result);
-        setToast(lang === "zh" ? "已读取保存的官方配置" : "Saved official config loaded");
       },
     );
 
@@ -2378,26 +2420,61 @@ function App() {
     }
   };
 
+  const newCustomProviderForm = (): SavedProvider => ({
+    ...blankProviderForm,
+    model: state?.model?.trim() || blankProviderForm.model,
+    wireApi: currentProvider?.wireApi?.trim() || blankProviderForm.wireApi,
+    requiresOpenaiAuth: currentProvider?.requiresOpenaiAuth ?? blankProviderForm.requiresOpenaiAuth,
+    tomlConfig: state?.configText?.trim() || "",
+  });
+
   const openAddProvider = () => {
     officialDraftRequestRef.current += 1;
     setCreatingProvider(true);
+    setSelectedPresetId("custom");
+    setSelectedPresetVariantId("");
     setEditingOfficialProfileId(null);
     setOfficialAuthDirty(false);
     setOfficialForm({ providerName: "", model: state?.model || "gpt-5.5", configText: "", authJson: "" });
-    const liveToml = state?.configText?.trim() || "";
-    const next = {
-      ...blankProviderForm,
-      model: state?.model?.trim() || blankProviderForm.model,
-      wireApi: currentProvider?.wireApi?.trim() || blankProviderForm.wireApi,
-      requiresOpenaiAuth: currentProvider?.requiresOpenaiAuth ?? blankProviderForm.requiresOpenaiAuth,
-      tomlConfig: liveToml,
-    };
+    const next = newCustomProviderForm();
     resetAvailableProviderModels();
     setEditingProviderId(null);
     setEditingDetectedProvider(false);
     setProviderForm(next);
-    setProviderTomlDraft(liveToml || buildProviderTomlPreview(next));
+    setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
     setProviderTomlDirty(false);
+    setProviderMode("form");
+  };
+
+  const applyProviderPreset = (presetId: string, variantId: string) => {
+    const preset = getProviderPreset(presetId);
+    if (!creatingProvider || !preset) return;
+    const variant = getProviderPresetVariant(presetId, variantId);
+    setSelectedPresetId(presetId);
+    setSelectedPresetVariantId(variant?.id || "");
+    resetAvailableProviderModels();
+    setError("");
+    if (presetId === "official") {
+      void changeProviderKind("official");
+      return;
+    }
+    officialDraftRequestRef.current += 1;
+    providerDraftRequestRef.current += 1;
+    clearActionBusy("loadOfficialDraft");
+    const inherited = newCustomProviderForm();
+    const draft = createPresetProvider(presetId, variantId, inherited.tomlConfig) || inherited;
+    // Presets use the same full TOML base as Custom. The existing draft builder
+    // updates provider fields while retaining common and extended settings.
+    // Switching services still starts with an empty API key field.
+    const next = {
+      ...draft,
+      id: draft.id ? uniqueId(draft.id, savedProviders.map((provider) => provider.id)) : "",
+    };
+    setProviderForm(next);
+    setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
+    setProviderTomlDirty(false);
+    setProviderApiKeyVisible(false);
+    setAvailableProviderModels(variant?.models.map((entry) => ({ id: entry.model })) || []);
     setProviderMode("form");
   };
 
@@ -2729,8 +2806,8 @@ function App() {
                 configExists={Boolean(state?.configExists)}
                 providerLabel={currentOfficialProfile?.providerName || currentProvider?.name || state?.modelProvider}
                 instructionEnabled={Boolean(state?.instructionEnabled)}
-                authExists={Boolean(state?.authExists)}
-                officialAuthAvailable={Boolean(state?.officialAuthAvailable)}
+                authExists={currentOfficialProfile?.isCurrent ? currentOfficialProfile.hasOwnedAuth : Boolean(state?.authExists)}
+                officialAuthAvailable={currentOfficialProfile?.isCurrent ? currentOfficialProfile.hasAuth : Boolean(state?.officialAuthAvailable)}
                 configPath={state?.configPath}
                 modelProvider={state?.modelProvider}
                 instructionPath={state
@@ -2753,11 +2830,14 @@ function App() {
                 copy={getProviderPageCopy(lang)}
                 mode={providerMode}
                 creatingProvider={creatingProvider}
-                providerKind={providerMode === "official" ? "official" : "api"}
-                onProviderKindChange={changeProviderKind}
+                selectedPresetId={selectedPresetId}
+                selectedPresetVariantId={selectedPresetVariantId}
+                onPresetSelect={(id) => applyProviderPreset(id, "")}
+                onPresetVariantSelect={(id) => applyProviderPreset(selectedPresetId, id)}
                 officialProfileIsDefault={editingOfficialProfileId === DEFAULT_OFFICIAL_PROFILE_ID}
                 canLoadCurrentOfficial={Boolean(state.isOfficialProvider)}
                 providerRows={providerPageRows}
+                configDir={configDir}
                 loading={loading}
                 testingId={providerTestingId}
                 actionBusy={actionBusy}
@@ -2779,6 +2859,8 @@ function App() {
                   current: state.isOfficialProvider ? currentOfficialProfile?.providerName || "OpenAI Official" : state.modelProvider,
                 }}
                 providerAuthPreview={<JsonPreview text={providerAuthPreview} />}
+                providerModelMappings={providerForm.modelMappings || []}
+                onProviderModelMappingsChange={(modelMappings) => setProviderForm((current) => ({ ...current, modelMappings }))}
                 providerTomlDraft={providerTomlDraft}
                 providerTomlRef={providerTomlEditorRef}
                 apiKeyVisible={providerApiKeyVisible}
@@ -2829,7 +2911,6 @@ function App() {
                   const local = findLocalProviderForRow(row);
                   return local ? removeProvider(local.id, row.isCurrent) : Promise.resolve(false);
                 }}
-                onRestoreOfficial={restoreOfficialProvider}
                 onResetOfficial={resetOfficialProvider}
                 onCancelMode={() => {
                   officialDraftRequestRef.current += 1;
@@ -2858,7 +2939,7 @@ function App() {
                 onProviderNameChange={(value) => setProviderForm((current) => ({
                   ...current,
                   providerName: value,
-                  id: editingProviderId || customProviderId(value),
+                  id: editingProviderId || uniqueId(customProviderId(value), savedProviders.map((provider) => provider.id)),
                 }))}
                 onProviderModelChange={(value) => setProviderForm((current) => ({ ...current, model: value }))}
                 onFetchModels={() => void fetchProviderModels()}

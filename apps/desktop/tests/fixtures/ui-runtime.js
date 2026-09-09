@@ -9,7 +9,7 @@
   const counts = {};
   const switches = [];
   const commands = [];
-  const pending = { sync: [], detail: [] };
+  const pending = { sync: [], detail: [], quota: [], resetCredits: [], usage: [] };
   const callbacks = new Map();
   let nextCallback = 1;
   let output;
@@ -18,6 +18,9 @@
   let externalOfficialLogins = 0;
   let savedPrompts = [];
   let usageMode = "sample";
+  let pauseUsage = false;
+  let quotaMode = "dual";
+  let resetCreditsMode = "available";
 
   function officialToml(model) {
     return `model_provider = "openai"\nmodel = ${JSON.stringify(model || "fixture-official-model")}\n`;
@@ -26,6 +29,8 @@
   function officialAuth(account) {
     return JSON.stringify({
       auth_mode: "chatgpt",
+      email: `${account}@example.test`,
+      plan_type: account === "one" ? "pro" : "pro-lite",
       OPENAI_API_KEY: null,
       tokens: {
         id_token: `fixture-only-id-token-${account}`,
@@ -104,7 +109,10 @@
     wireApi: "responses",
     requiresOpenaiAuth: false,
   };
-  detectedProvider.tomlConfig = toml(detectedProvider);
+  // Visible inherited settings for provider-preset regression checks.
+  detectedProvider.tomlConfig = '# fixture inherited settings\nmodel_reasoning_effort = "high"\napproval_policy = "on-request"\n'
+    + toml(detectedProvider)
+    + '\n[mcp_servers.fixture_docs]\ncommand = "fixture-docs-server"\n\n[features]\nshell_snapshot = true\n\n[projects."/fixture/project"]\ntrust_level = "trusted"\n';
   let savedProviders = [{
     id: "fixture-saved",
     providerName: "Fixture Saved Provider",
@@ -207,6 +215,10 @@
     return {
       pendingSync: pending.sync.length,
       pendingDetail: pending.detail.length,
+      pendingQuota: pending.quota.length,
+      pendingResetCredits: pending.resetCredits.length,
+      resetCreditsMode,
+      quotaMode,
       commandCounts: clone(counts),
       providerSwitches: clone(switches),
       currentProvider: state.modelProvider,
@@ -218,6 +230,7 @@
       })),
       externalOfficialLogins,
       usageMode,
+      pendingUsage: pending.usage.length,
       savedProviderIds: savedProviders.map((provider) => provider.id),
       commands: clone(commands),
     };
@@ -234,11 +247,18 @@
   }
 
   function officialSummary(profile) {
+    const authJson = state.isOfficialProvider && state.activeOfficialProfileId === profile.id ? state.authText : profile.authJson;
+    let authentication;
+    try { authentication = JSON.parse(authJson || "null"); } catch { authentication = null; }
     return {
       id: profile.id,
       providerName: profile.providerName,
       model: profile.model || null,
       hasAuth: Boolean(profile.authJson.trim()),
+      hasOwnedAuth: Boolean(authentication && typeof authentication === "object"),
+      email: typeof authentication?.email === "string" ? authentication.email.trim() || null : null,
+      planType: typeof authentication?.tokens?.access_token === "string" ? authentication.plan_type || null : null,
+      canQueryQuota: Boolean(!authentication?.OPENAI_API_KEY && typeof authentication?.tokens?.access_token === "string" && authentication.tokens.access_token.trim()),
       isDefault: profile.id === defaultOfficialId,
       isCurrent: state.isOfficialProvider && state.activeOfficialProfileId === profile.id,
     };
@@ -274,16 +294,16 @@
     return true;
   }
 
-  function defer(kind, result) {
+  function defer(kind, result, failure = null) {
     return new Promise((resolve, reject) => {
-      pending[kind].push({ resolve, reject, result });
+      pending[kind].push({ resolve, reject, result, failure });
       render();
     });
   }
 
   function settle(kind, fail) {
     for (const request of pending[kind].splice(0)) {
-      if (fail) request.reject(new Error(`Fixture ${kind} failure`));
+      if (fail || request.failure) request.reject(new Error(request.failure || `Fixture ${kind} failure`));
       else request.resolve(clone(request.result()));
     }
     render();
@@ -400,7 +420,8 @@
   function preserveDetectedProvider() {
     // This stub models the expected Rust persistence behavior. It does not test Rust.
     if (state.modelProvider === detectedProvider.id
-      && !savedProviders.some((provider) => provider.id === detectedProvider.id)) {
+      && !savedProviders.some((provider) => provider.id === detectedProvider.id
+        || provider.baseUrl === detectedProvider.baseUrl && provider.apiKey === detectedProvider.apiKey)) {
       saveProvider(detectedProvider);
     }
   }
@@ -483,6 +504,73 @@
     if (!["sample", "empty", "error", "partial"].includes(mode)) throw new Error(`Unknown fixture usage mode: ${mode}`);
     usageMode = mode;
     render();
+  }
+
+  const quotaModes = [
+    ["dual", "双窗口 Team：93% / 52%"],
+    ["weekly", "单周 Pro：91%"],
+    ["additional", "Spark 双窗 + reserve 周"],
+    ["empty", "无主额度窗口"],
+    ["unknown", "未知窗口周期"],
+    ["error", "认证过期 401"],
+    ["pending", "延迟：完成后成功"],
+    ["pending-error", "延迟：完成后失败"],
+  ];
+
+  function setQuotaMode(mode) {
+    if (!quotaModes.some(([id]) => id === mode)) throw new Error(`Unknown fixture quota mode: ${mode}`);
+    quotaMode = mode;
+    render();
+  }
+
+  function officialQuota({ profileId }) {
+    const profile = officialProfile(profileId);
+    const summary = officialSummary(profile);
+    if (!summary.canQueryQuota) throw new Error("Fixture：此官方配置没有可查询额度的登录凭据");
+    const requestedMode = quotaMode;
+    const failure = "Fixture：登录已过期或无效（HTTP 401），请在 Codex 中重新登录";
+    if (requestedMode === "error") throw new Error(failure);
+    const checkedAt = new Date();
+    const window = (id, seconds, remaining, resetSeconds) => ({
+      id, windowSeconds: seconds, usedPercent: remaining === null ? null : 100 - remaining,
+      remainingPercent: remaining,
+      resetsAt: resetSeconds === null ? null : new Date(checkedAt.getTime() + resetSeconds * 1000).toISOString(),
+    });
+    const main = { id: "main", name: null, allowed: true, limitReached: false, windows: [window("primary", 18000, 93, 7200), window("secondary", 604800, 52, 259200)] };
+    const result = { profileId, email: summary.email, planType: summary.planType || "team", limits: [main], checkedAt: checkedAt.toISOString() };
+    if (requestedMode === "weekly") {
+      result.planType = "pro";
+      main.windows = [window("primary", 604800, 91, 432000)];
+    } else if (requestedMode === "additional") {
+      result.limits.push(
+        { id: "additional-spark", name: "GPT-5.3-Codex-Spark", allowed: true, limitReached: false, windows: [window("primary", 18000, 78, 1800), window("secondary", 604800, 64, 345600)] },
+        { id: "reserve", name: "Reserve", allowed: true, limitReached: false, windows: [window("primary", 604800, 86, 172800)] },
+      );
+    } else if (requestedMode === "empty") {
+      result.planType = null;
+      result.limits = [];
+    } else if (requestedMode === "unknown") {
+      main.windows = [window("primary", 7200, 37, 1200), window("secondary", null, null, null)];
+      main.allowed = null;
+      main.limitReached = null;
+    }
+    // Capture the selected scenario now; changing the selector cannot settle an
+    // existing request differently. Only explicit quota/refresh clicks invoke it.
+    if (requestedMode === "pending" || requestedMode === "pending-error") {
+      return defer("quota", () => result, requestedMode === "pending-error" ? failure : null);
+    }
+    return clone(result);
+  }
+
+  function officialResetCredits({ profileId }) {
+    const profile = officialProfile(profileId);
+    if (!officialSummary(profile).canQueryQuota) throw new Error("Fixture：请先登录此账号");
+    const mode = resetCreditsMode;
+    const failure = "Fixture：重置次数查询失败，请稍后重试";
+    if (mode === "error") throw new Error(failure);
+    const result = { profileId, availableCount: mode === "zero" ? 0 : 3, checkedAt: new Date().toISOString() };
+    if (mode === "pending" || mode === "pending-error") return defer("resetCredits", () => result, mode === "pending-error" ? failure : null);
+    return clone(result);
   }
 
   function switchProvider(provider) {
@@ -601,6 +689,8 @@
       case "get_official_profile":
         captureCurrentOfficial();
         return officialDetail(officialProfile(args.profileId));
+      case "get_official_profile_quota": return officialQuota(args);
+      case "get_official_profile_reset_credits": return officialResetCredits(args);
       case "save_official_profile": return saveOfficial(args.input);
       case "duplicate_official_profile": return duplicateOfficial(args.profileId, args.providerName);
       case "switch_official_profile": return switchOfficial(args.profileId);
@@ -659,10 +749,18 @@
         return action("Fixture saved prompt enabled");
       case "build_provider_toml_draft": return providerTomlDraft(args.provider);
       case "update_codex_context_window": return updateContextWindow(args);
-      case "get_usage_statistics": return usageStatistics(args);
+      case "get_usage_statistics": {
+        const result = usageStatistics(args);
+        return pauseUsage ? defer("usage", () => result) : result;
+      }
       case "duplicate_provider": return duplicateProvider(args.providerId, args.providerName);
       case "save_provider": return saveProvider(args.provider);
       case "save_active_provider": return switchProvider(saveProvider(args.provider));
+      case "activate_saved_provider": {
+        const provider = savedProviders.find((item) => item.id === args.providerId);
+        if (!provider) throw new Error("Unknown fixture provider");
+        return switchProvider(provider);
+      }
       case "switch_provider": {
         const input = args.input;
         return switchProvider(savedProviders.find((provider) => provider.id === input.providerId) || {
@@ -676,19 +774,13 @@
         if (!provider) throw new Error("Unknown fixture provider");
         return switchProvider({ ...provider, tomlConfig: args.input.configText, apiKey: args.input.apiKey });
       }
-      case "switch_official_provider":
-      case "restore_official_provider": return switchOfficial();
+      case "switch_official_provider": return switchOfficial();
       case "reset_official_provider":
         saveOfficial({ id: defaultOfficialId, providerName: officialProfile(defaultOfficialId).providerName, model: "fixture-official-model", authJson: "", configText: "" });
         return switchOfficial();
       case "save_official_config": {
         const input = args.input || args;
         return saveOfficial({ ...input, id: defaultOfficialId, providerName: officialProfile(defaultOfficialId).providerName });
-      }
-      case "get_official_config_draft": {
-        captureCurrentOfficial();
-        const profile = officialProfile(defaultOfficialId);
-        return { authJson: profile.authJson, configText: profile.configText, model: profile.model, source: "fixture" };
       }
       case "read_ccswitch_official_auth": return {
         authJson: officialAuth("one"), configText: officialToml("fixture-official-model"),
@@ -735,6 +827,9 @@
     snapshot,
     loginSecondOfficialAccount,
     setUsageMode,
+    setQuotaMode,
+    completeQuota: () => settle("quota", false),
+    failQuota: () => settle("quota", true),
     completeSync: () => settle("sync", false),
     failSync: () => settle("sync", true),
     completeDetail: () => settle("detail", false),
@@ -776,6 +871,62 @@
     loginButton.style.cssText = "font:inherit;padding:5px;border:1px solid #aaa;border-radius:4px;background:#eee;color:#111;cursor:pointer";
     loginButton.addEventListener("click", loginSecondOfficialAccount);
     controls.append(loginButton);
+    const quotaModeLabel = document.createElement("label");
+    quotaModeLabel.textContent = "Fixture：额度模式 ";
+    const quotaModeSelect = document.createElement("select");
+    quotaModeSelect.setAttribute("aria-label", "Fixture：额度模式");
+    quotaModeSelect.style.cssText = "font:inherit;max-width:200px;padding:4px;color:#111;background:#fff";
+    for (const [value, text] of quotaModes) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      quotaModeSelect.append(option);
+    }
+    quotaModeSelect.value = quotaMode;
+    quotaModeSelect.addEventListener("change", () => setQuotaMode(quotaModeSelect.value));
+    quotaModeLabel.append(quotaModeSelect);
+    controls.append(quotaModeLabel);
+    const quotaCompleteButton = document.createElement("button");
+    quotaCompleteButton.type = "button";
+    quotaCompleteButton.textContent = "Fixture：完成额度请求";
+    quotaCompleteButton.style.cssText = loginButton.style.cssText;
+    quotaCompleteButton.addEventListener("click", () => settle("quota", false));
+    controls.append(quotaCompleteButton);
+    const resetModeLabel = document.createElement("label");
+    resetModeLabel.textContent = "Fixture：重置次数模式 ";
+    const resetModeSelect = document.createElement("select");
+    resetModeSelect.setAttribute("aria-label", "Fixture：重置次数模式");
+    resetModeSelect.style.cssText = quotaModeSelect.style.cssText;
+    for (const [value, text] of [["available", "可用 3 次"], ["zero", "可用 0 次"], ["error", "查询失败"], ["pending", "延迟成功"], ["pending-error", "延迟失败"]]) {
+      const option = document.createElement("option");
+      option.value = value; option.textContent = text; resetModeSelect.append(option);
+    }
+    resetModeSelect.addEventListener("change", () => { resetCreditsMode = resetModeSelect.value; render(); });
+    resetModeLabel.append(resetModeSelect); controls.append(resetModeLabel);
+    const resetCompleteButton = document.createElement("button");
+    resetCompleteButton.type = "button";
+    resetCompleteButton.textContent = "Fixture：完成重置次数请求";
+    resetCompleteButton.style.cssText = loginButton.style.cssText;
+    resetCompleteButton.addEventListener("click", () => settle("resetCredits", false));
+    controls.append(resetCompleteButton);
+    const pauseUsageLabel = document.createElement("label");
+    const pauseUsageInput = document.createElement("input");
+    pauseUsageInput.type = "checkbox";
+    pauseUsageInput.addEventListener("change", () => { pauseUsage = pauseUsageInput.checked; });
+    pauseUsageLabel.append(pauseUsageInput, "Fixture：暂停用量响应");
+    controls.append(pauseUsageLabel);
+    for (const [text, newest] of [["Fixture：完成最新用量请求", true], ["Fixture：完成旧用量请求", false]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = text;
+      button.style.cssText = loginButton.style.cssText;
+      button.addEventListener("click", () => {
+        const request = newest ? pending.usage.pop() : pending.usage.shift();
+        if (request) request.resolve(clone(request.result()));
+        render();
+      });
+      controls.append(button);
+    }
     for (const [text, mode] of [
       ["Fixture：用量示例数据", "sample"],
       ["Fixture：用量空数据", "empty"],

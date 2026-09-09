@@ -11,18 +11,23 @@ import {
   Eye,
   EyeOff,
   FilePlus2,
+  Gauge,
   Loader2,
   PencilLine,
   Plus,
   RefreshCw,
-  RotateCcw,
   Trash2,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { Ref } from "react";
 import { PageTransition } from "../components/PageTransition";
+import { OfficialQuotaDialog } from "../components/OfficialQuotaDialog";
+import { OfficialAccountBadge } from "../components/OfficialAccountBadge";
+import { ProviderModelMappings, validateProviderModelMappings } from "../components/ProviderModelMappings";
+import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
+import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
 import { Button, Checkbox, ModalShell } from "../components/ui";
-import type { ProviderMode } from "../types";
+import type { ProviderMode, ProviderModelMapping } from "../types";
 import "../styles/providers-page.css";
 
 export type ProviderRowSource = "official" | "local" | "detected";
@@ -38,6 +43,10 @@ export type ProviderRow = {
   requiresOpenaiAuth: boolean;
   isCurrent: boolean;
   isDefaultOfficial?: boolean;
+  email?: string | null;
+  planType?: string | null;
+  hasAuth?: boolean;
+  canQueryQuota?: boolean;
   sourceLabel?: string;
   editable?: boolean;
   duplicable?: boolean;
@@ -92,7 +101,6 @@ export type ProviderCopy = {
   officialTomlLabel: string;
   officialSaveLabel: string;
   loadCcSwitchOfficialLabel: string;
-  restoreOfficialLabel: string;
   resetOfficialLabel: string;
   resetOfficialTitle: string;
   resetOfficialDescription: string;
@@ -134,6 +142,7 @@ export type ProviderOfficialInfo = {
 
 export type ProvidersPageProps = {
   lang: "zh" | "en";
+  configDir: string;
   copy: ProviderCopy;
   mode: ProviderMode;
   providerRows: readonly ProviderRow[];
@@ -142,8 +151,11 @@ export type ProvidersPageProps = {
   actionBusy?: string;
   editingProviderId: string | null;
   creatingProvider: boolean;
-  providerKind: "api" | "official";
+  selectedPresetId: string;
+  selectedPresetVariantId: string;
   providerForm: ProviderFormValue;
+  providerModelMappings: readonly ProviderModelMapping[];
+  onProviderModelMappingsChange: (rows: ProviderModelMapping[]) => void;
   officialForm: OfficialFormValue;
   officialProfileIsDefault: boolean;
   canLoadCurrentOfficial: boolean;
@@ -158,10 +170,10 @@ export type ProvidersPageProps = {
   fetchingModels: boolean;
   onImportCcSwitch: () => void;
   onAddProvider: () => void;
-  onProviderKindChange: (kind: "api" | "official") => void;
+  onPresetSelect: (id: string) => void;
+  onPresetVariantSelect: (id: string) => void;
   onLoadCcSwitchOfficial: () => void;
   onLoadCurrentOfficial: () => void;
-  onRestoreOfficial: () => void;
   onResetOfficial: () => void;
   onEnableProvider: (row: ProviderRow) => void;
   onTestProvider: (row: ProviderRow) => void;
@@ -317,28 +329,19 @@ function ContextWindowControl({
   );
 }
 
-function ProviderKindSelect({
-  lang,
-  creatingProvider,
-  providerKind,
-  onProviderKindChange,
-  disabled,
-}: Pick<ProvidersPageProps, "lang" | "creatingProvider" | "providerKind" | "onProviderKindChange"> & { disabled: boolean }) {
+function ProviderPresetSection({ lang, creatingProvider, selectedPresetId, selectedPresetVariantId, onPresetSelect, onPresetVariantSelect, disabled }: Pick<ProvidersPageProps, "lang" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect"> & { disabled: boolean }) {
   if (!creatingProvider) return null;
-  return (
-    <div className="cx-providers-form-grid cx-providers-form-grid--single">
-      <Field label={lang === "zh" ? "供应商类型" : "Provider type"}>
-        <select
-          value={providerKind}
-          onChange={(event) => onProviderKindChange(event.target.value === "official" ? "official" : "api")}
-          disabled={disabled}
-        >
-          <option value="api">{lang === "zh" ? "第三方 API" : "Third-party API"}</option>
-          <option value="official">{lang === "zh" ? "官方 Codex 登录" : "Official Codex login"}</option>
-        </select>
-      </Field>
-    </div>
-  );
+  const preset = getProviderPreset(selectedPresetId);
+  const variant = getProviderPresetVariant(selectedPresetId, selectedPresetVariantId);
+  return <ProviderPresetPicker lang={lang} presets={PROVIDER_PRESETS} selectedId={selectedPresetId} onSelect={onPresetSelect} disabled={disabled}>
+    {variant && <div className="cx-preset-variant-panel">
+      {preset && preset.variants.length > 1 && <div className="cx-preset-variants" role="group" aria-label={lang === "zh" ? "接入方式" : "API service"}>
+        <span>{lang === "zh" ? "接入方式" : "API service"}</span>
+        {preset.variants.map((item) => <button key={item.id} type="button" aria-pressed={item.id === variant.id} disabled={disabled} onClick={() => onPresetVariantSelect(item.id)}>{lang === "zh" ? item.label : item.labelEn}</button>)}
+      </div>}
+      <p>{lang === "zh" ? variant.note : variant.noteEn}</p>
+    </div>}
+  </ProviderPresetPicker>;
 }
 
 function ProviderAvatar({ row }: { row: ProviderRow }) {
@@ -384,6 +387,8 @@ function ActionIconButton({
 }
 
 function ListPage({
+  lang,
+  configDir,
   copy,
   providerRows,
   loading,
@@ -391,16 +396,23 @@ function ListPage({
   actionBusy,
   onImportCcSwitch,
   onAddProvider,
-  onRestoreOfficial,
   onEnableProvider,
   onTestProvider,
   onEditProvider,
   onDuplicateProvider,
   onDeleteProvider,
-}: Pick<ProvidersPageProps, "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "onImportCcSwitch" | "onAddProvider" | "onRestoreOfficial" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
+}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
   const [providerToDelete, setProviderToDelete] = useState<ProviderRow | null>(null);
+  const [quotaSelection, setQuotaSelection] = useState<{ id: string; configDir: string; email: string | null } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const providerActionsBusy = loading || Boolean(actionBusy);
+  const quotaProfile = quotaSelection?.configDir === configDir
+    ? providerRows.find((row) => row.source === "official" && row.id === quotaSelection.id && row.canQueryQuota && (row.email ?? null) === quotaSelection.email)
+    : undefined;
+
+  useEffect(() => {
+    if (quotaSelection && !quotaProfile) setQuotaSelection(null);
+  }, [quotaSelection, quotaProfile]);
 
   const closeDeleteDialog = () => {
     if (!deleting) setProviderToDelete(null);
@@ -447,21 +459,25 @@ function ListPage({
         ) : providerRows.map((row) => {
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
+          const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
           return (
-            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}`} key={`${row.source}-${row.id}-${row.baseUrl}`} role="listitem">
+            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : ""}`} key={`${row.source}-${row.id}-${row.baseUrl}`} role="listitem">
               <ProviderAvatar row={row} />
-              <div className="cx-providers-row-main">
-                <div className="cx-providers-row-title">
-                  <strong>{row.providerName}</strong>
-                  {row.sourceLabel && (
-                    <span className={`cx-providers-source-badge${row.source === "official" ? " cx-providers-source-badge--official" : ""}`}>
-                      {row.sourceLabel}
-                    </span>
-                  )}
+              <div className="cx-providers-row-content">
+                <div className="cx-providers-row-main">
+                  <div className="cx-providers-row-title">
+                    <strong title={row.providerName}>{row.providerName}</strong>
+                    {row.sourceLabel && (
+                      <span className={`cx-providers-source-badge${row.source === "official" ? " cx-providers-source-badge--official" : ""}`}>
+                        {row.sourceLabel}
+                      </span>
+                    )}
+                  </div>
+                  <code title={row.baseUrl || copy.noBaseUrlLabel}>{row.baseUrl || copy.noBaseUrlLabel}</code>
+                  {row.source !== "official" && row.meta && <div className="cx-providers-row-meta">{row.meta}</div>}
                 </div>
-                <code title={row.baseUrl || copy.noBaseUrlLabel}>{row.baseUrl || copy.noBaseUrlLabel}</code>
-                {row.meta && <div className="cx-providers-row-meta">{row.meta}</div>}
               </div>
+              {row.source === "official" && <OfficialAccountBadge lang={lang} email={row.email} planType={row.planType} hasAuth={Boolean(row.hasAuth)} canQueryQuota={Boolean(row.canQueryQuota)} className="cx-providers-login-badge" />}
               <div className="cx-providers-row-actions">
                 {row.isCurrent && <span className="cx-providers-current-badge"><span aria-hidden="true" />{copy.currentLabel}</span>}
                 <button
@@ -472,12 +488,16 @@ function ListPage({
                 >
                   {copy.enableLabel}
                 </button>
-                {row.source === "official" && row.isDefaultOfficial && (
+                {row.source === "official" && (
                   <ActionIconButton
-                    icon={RotateCcw}
-                    label={copy.restoreOfficialLabel}
-                    onClick={onRestoreOfficial}
-                    disabled={providerActionsBusy}
+                    icon={Gauge}
+                    label={row.canQueryQuota
+                      ? (lang === "zh" ? "查看额度" : "View quota")
+                      : row.hasAuth
+                        ? (lang === "zh" ? "查看额度：此认证不支持订阅额度查询" : "View quota: these credentials do not support subscription quota queries")
+                        : (lang === "zh" ? "查看额度：请先登录官方 Codex" : "View quota: sign in to official Codex first")}
+                    onClick={() => setQuotaSelection({ id: row.id, configDir, email: row.email ?? null })}
+                    disabled={providerActionsBusy || !row.canQueryQuota}
                   />
                 )}
                 {row.testable !== false && (
@@ -494,14 +514,27 @@ function ListPage({
                 {row.duplicable && (
                   <ActionIconButton icon={Copy} label={copy.duplicateLabel} onClick={() => onDuplicateProvider(row)} disabled={providerActionsBusy} />
                 )}
-                {row.deletable && (
-                  <ActionIconButton icon={Trash2} label={copy.removeLabel} onClick={() => setProviderToDelete(row)} disabled={providerActionsBusy} danger />
+                {(row.deletable || isProtectedOfficial) && (
+                  <ActionIconButton
+                    icon={Trash2}
+                    label={isProtectedOfficial ? (lang === "zh" ? "默认官方配置不可删除" : "The default official profile cannot be deleted") : copy.removeLabel}
+                    onClick={() => { if (!isProtectedOfficial) setProviderToDelete(row); }}
+                    disabled={providerActionsBusy || isProtectedOfficial}
+                    danger={!isProtectedOfficial}
+                  />
                 )}
               </div>
             </article>
           );
         })}
       </div>
+
+      <OfficialQuotaDialog
+        lang={lang}
+        configDir={configDir}
+        profile={quotaProfile ? { id: quotaProfile.id, name: quotaProfile.providerName, email: quotaProfile.email ?? null, planType: quotaProfile.planType } : null}
+        onClose={() => setQuotaSelection(null)}
+      />
 
       <ModalShell
         open={Boolean(providerToDelete)}
@@ -559,8 +592,10 @@ function OfficialForm({
   lang,
   copy,
   creatingProvider,
-  providerKind,
-  onProviderKindChange,
+  selectedPresetId,
+  selectedPresetVariantId,
+  onPresetSelect,
+  onPresetVariantSelect,
   officialForm,
   officialProfileIsDefault,
   canLoadCurrentOfficial,
@@ -577,9 +612,8 @@ function OfficialForm({
   onSaveOfficial,
   onLoadCcSwitchOfficial,
   onLoadCurrentOfficial,
-  onRestoreOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "providerKind" | "onProviderKindChange" | "officialForm" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "officialForm" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
@@ -606,7 +640,7 @@ function OfficialForm({
         onCancel={onCancelMode}
         disabled={formBusy}
       />
-      <ProviderKindSelect lang={lang} creatingProvider={creatingProvider} providerKind={providerKind} onProviderKindChange={onProviderKindChange} disabled={formBusy} />
+      <ProviderPresetSection lang={lang} creatingProvider={creatingProvider} selectedPresetId={selectedPresetId} selectedPresetVariantId={selectedPresetVariantId} onPresetSelect={onPresetSelect} onPresetVariantSelect={onPresetVariantSelect} disabled={formBusy} />
       <div className="cx-providers-info-grid">
         <div><span>{copy.officialUrlLabel}</span><code>{officialInfo.officialUrl}</code></div>
         <div><span>{copy.authPathLabel}</span><code>{officialInfo.authPath}</code></div>
@@ -656,14 +690,9 @@ function OfficialForm({
           {copy.loadCcSwitchOfficialLabel}
         </button>
         {showDefaultActions && (
-          <>
-            <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={formBusy}>
-              <RotateCcw size={15} aria-hidden="true" />{copy.restoreOfficialLabel}
-            </button>
-            <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
-              <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
-            </button>
-          </>
+          <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
+            <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
+          </button>
         )}
         <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
       </div>
@@ -694,9 +723,13 @@ function ProviderForm({
   lang,
   copy,
   creatingProvider,
-  providerKind,
-  onProviderKindChange,
+  selectedPresetId,
+  selectedPresetVariantId,
+  onPresetSelect,
+  onPresetVariantSelect,
   providerForm,
+  providerModelMappings,
+  onProviderModelMappingsChange,
   loading,
   editingProviderId,
   providerAuthPreview,
@@ -717,11 +750,12 @@ function ProviderForm({
   onProviderTomlDraftChange,
   onResetProviderToml,
   onSaveProvider,
-}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "providerKind" | "onProviderKindChange" | "providerForm" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onResetProviderToml" | "onSaveProvider">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "providerForm" | "providerModelMappings" | "onProviderModelMappingsChange" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onResetProviderToml" | "onSaveProvider">) {
   const modelListId = useId();
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const canFetchModels = Boolean(providerForm.baseUrl.trim() && providerForm.apiKey.trim());
   const formBusy = loading || fetchingModels || contextWindowBusy;
+  const mappingsValid = validateProviderModelMappings(providerModelMappings, providerForm.model, lang).valid;
 
   return (
     <>
@@ -733,7 +767,7 @@ function ProviderForm({
         onCancel={onCancelMode}
         disabled={formBusy}
       />
-      <ProviderKindSelect lang={lang} creatingProvider={creatingProvider} providerKind={providerKind} onProviderKindChange={onProviderKindChange} disabled={formBusy} />
+      <ProviderPresetSection lang={lang} creatingProvider={creatingProvider} selectedPresetId={selectedPresetId} selectedPresetVariantId={selectedPresetVariantId} onPresetSelect={onPresetSelect} onPresetVariantSelect={onPresetVariantSelect} disabled={formBusy} />
 
       <section className="cx-providers-form-section">
         <div className="cx-providers-section-heading">
@@ -815,6 +849,16 @@ function ProviderForm({
         </div>
       </section>
 
+      <ProviderModelMappings
+        key={editingProviderId ?? "new-provider"}
+        lang={lang}
+        rows={providerModelMappings}
+        currentModel={providerForm.model}
+        availableModels={availableModels}
+        disabled={formBusy}
+        onChange={onProviderModelMappingsChange}
+      />
+
       <section className="cx-providers-form-section">
         <div className="cx-providers-section-heading"><div><h3>{copy.authPreviewTitle}</h3><p>{copy.authPreviewDescription}</p></div></div>
         <div className="cx-providers-preview">{providerAuthPreview}</div>
@@ -832,7 +876,8 @@ function ProviderForm({
       </section>
 
       <div className="cx-providers-form-actions cx-providers-form-actions--save">
-        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveProvider} disabled={formBusy}>
+        {!mappingsValid && <span className="cx-provider-mappings-save-hint">{lang === "zh" ? "请先修正模型映射中的错误。" : "Correct the model mapping errors before saving."}</span>}
+        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveProvider} disabled={formBusy || !mappingsValid}>
           {loading ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" /> : <CheckCircle2 size={15} aria-hidden="true" />}
           {loading ? copy.savingLabel : copy.saveLabel}
         </button>
@@ -842,8 +887,12 @@ function ProviderForm({
 }
 
 export function ProvidersPage(props: ProvidersPageProps) {
+  const pageKey = props.creatingProvider && props.mode !== "list"
+    ? "providers:add"
+    : `providers:${props.mode}`;
+
   return (
-    <PageTransition pageKey={`providers:${props.mode}`}>
+    <PageTransition pageKey={pageKey}>
       <section className={`cx-providers cx-page cx-providers--${props.mode}`}>
         {props.mode === "list" && <ListPage {...props} />}
         {props.mode === "official" && <OfficialForm {...props} />}

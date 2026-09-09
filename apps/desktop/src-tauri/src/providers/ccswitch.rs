@@ -315,6 +315,7 @@ pub(crate) fn build_ccswitch_codex_provider(
         toml_config: Some(toml_config),
         wire_api: section.wire_api,
         requires_openai_auth: section.requires_openai_auth,
+        model_mappings: Vec::new(),
     })
 }
 

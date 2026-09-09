@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { UsageDay, UsageModel, UsageRange, UsageStatistics } from "../usageTypes";
+import { initialUsageLoadState, sameUsageQuery, usageLoadReducer } from "../usageStatisticsState";
 import "../styles/usage-statistics.css";
 
 type Language = "zh" | "en";
@@ -77,6 +78,8 @@ function copyFor(lang: Language) {
     noDataDescription: "当前范围内还没有可统计的会话记录。使用 Codex 后点击刷新，或试试更大的日期范围。",
     showAll: "查看全部时间", loading: "正在整理本地会话用量…",
     error: "暂时无法读取用量", stale: "刷新失败，下面保留上次读取的结果。",
+    updatingResults: "正在更新用量，保留当前结果。", showingResults: "当前显示",
+    loadingResults: "正在加载", previousResults: "下方暂时显示", failedResults: "未能加载",
     partial: "部分记录未计入", partialHint: "部分本地记录不完整，当前结果仅包含可读取的用量。",
     source: "本地会话记录", updated: "更新于", notes: "缓存输入已包含在输入 Token 中，推理 Token 已包含在输出 Token 中。历史记录缺失的用量无法补算。",
     scanned: "已检查", files: "份记录", filtered: "当前模型", activity: "使用概览",
@@ -99,6 +102,8 @@ function copyFor(lang: Language) {
     noDataDescription: "No usage records in this range yet. Refresh after using Codex, or try a broader date range.",
     showAll: "View all time", loading: "Reading local session usage…",
     error: "Unable to load usage", stale: "Refresh failed. The last available results are shown below.",
+    updatingResults: "Updating usage. Current results stay visible.", showingResults: "Showing",
+    loadingResults: "Loading", previousResults: "Results below", failedResults: "Unable to load",
     partial: "Some records were excluded", partialHint: "Some local records are incomplete. These results include readable usage only.",
     source: "Local session records", updated: "Updated", notes: "Cached input is included in input tokens; reasoning is included in output tokens. Usage cannot be recovered from missing historical records.",
     scanned: "Checked", files: "records", filtered: "Selected model", activity: "Usage overview",
@@ -236,27 +241,31 @@ export function UsageStatisticsPage({ lang, configDir, active = true }: UsageSta
   const copy = copyFor(lang);
   const [range, setRange] = useState<UsageRange>("7d");
   const [model, setModel] = useState("");
-  const [record, setRecord] = useState<{ key: string; data: UsageStatistics } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [loadState, dispatch] = useReducer(usageLoadReducer, initialUsageLoadState);
   const requestRef = useRef(0);
   const previousDir = useRef(configDir);
-  const queryKey = JSON.stringify([configDir, range, model]);
-  const data = record?.key === queryKey ? record.data : null;
+  const query = useMemo(() => ({ configDir, range, model }), [configDir, range, model]);
+  const record = loadState.record?.query.configDir === configDir ? loadState.record : null;
+  const data = record?.data ?? null;
+  const currentRequest = sameUsageQuery(loadState.query, query);
+  const busy = active && (!currentRequest || loadState.busy);
+  const error = currentRequest ? loadState.error : "";
+  const displayingPrevious = record !== null && !sameUsageQuery(record.query, query);
+  const queryLabel = (value: typeof query) => `${copy.ranges[value.range]} · ${value.model ? modelLabel(value.model, lang) : copy.allModels}`;
+  const statusText = displayingPrevious
+    ? `${error ? copy.failedResults : copy.loadingResults} ${queryLabel(query)} · ${copy.previousResults} ${queryLabel(record.query)}`
+    : busy ? copy.updatingResults : `${copy.showingResults} ${queryLabel(query)}`;
   const load = useCallback(async (forceRefresh = false) => {
     if (!active) return;
     const request = ++requestRef.current;
-    setBusy(true);
-    setError("");
+    dispatch({ type: "start", requestId: request, query });
     try {
       const next = await invoke<UsageStatistics>("get_usage_statistics", { configDir, range, model: model || null, forceRefresh });
-      if (request === requestRef.current) setRecord({ key: queryKey, data: next });
+      dispatch({ type: "success", requestId: request, data: next });
     } catch (cause) {
-      if (request === requestRef.current) setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (request === requestRef.current) setBusy(false);
+      dispatch({ type: "failure", requestId: request, error: cause instanceof Error ? cause.message : String(cause) });
     }
-  }, [active, configDir, range, model, queryKey]);
+  }, [active, configDir, range, model, query]);
   useEffect(() => {
     if (previousDir.current !== configDir) {
       previousDir.current = configDir;
@@ -266,10 +275,10 @@ export function UsageStatisticsPage({ lang, configDir, active = true }: UsageSta
       }
     }
     void load();
-    return () => { requestRef.current += 1; };
+    return () => { dispatch({ type: "cancel", requestId: ++requestRef.current }); };
   }, [configDir, model, load]);
   const modelOptions = useMemo(() => {
-    const available = record?.key && JSON.parse(record.key)[0] === configDir ? record.data.availableModels : [];
+    const available = record?.data.availableModels ?? [];
     return Array.from(new Set([...available, ...(model ? [model] : [])])).sort();
   }, [record, configDir, model]);
   const partial = data && (data.coverage.skippedFiles > 0 || data.coverage.truncated || data.coverage.warnings.length > 0);
@@ -285,6 +294,10 @@ export function UsageStatisticsPage({ lang, configDir, active = true }: UsageSta
       <div className="cx-usage-toolbar-actions"><label className="cx-usage-model-select"><span className="cx-usage-sr-only">{copy.model}</span><select value={model} onChange={(event) => setModel(event.currentTarget.value)} aria-label={copy.model}><option value="">{copy.allModels}</option>{modelOptions.map((value) => <option key={value} value={value}>{modelLabel(value, lang)}</option>)}</select></label>
         <button type="button" className="cx-page-button cx-page-button--secondary cx-usage-refresh" disabled={busy} onClick={() => void load(true)}><RefreshCw size={14} className={busy ? "cx-page-spin" : ""} aria-hidden="true" />{busy ? copy.refreshing : copy.refresh}</button>
       </div>
+      <div className="cx-usage-query-status" role="status" aria-live="polite" aria-atomic="true">
+        {busy && data && <Loader2 size={12} className="cx-page-spin" aria-hidden="true" />}
+        <span>{data ? statusText : "\u00a0"}</span>
+      </div>
     </div>
     {error && <div className="cx-usage-notice cx-usage-notice--error" role="alert"><AlertCircle size={18} aria-hidden="true" /><div><strong>{copy.error}</strong>{data && <p>{copy.stale}</p>}<p>{error}</p></div><button type="button" onClick={() => void load(true)} disabled={busy}>{copy.retry}</button></div>}
     {!data && !error && <div className="cx-usage-loading" role="status"><Loader2 size={27} className="cx-page-spin" aria-hidden="true" /><p>{copy.loading}</p><div className="cx-usage-loading-cards" aria-hidden="true"><span /><span /><span /></div></div>}
@@ -293,7 +306,7 @@ export function UsageStatisticsPage({ lang, configDir, active = true }: UsageSta
     {data && hasUsage && <>
       <section className="cx-usage-summary" aria-label={copy.activity}>
         <article className="cx-usage-total">
-          <div className="cx-usage-total-heading"><span><Activity size={16} aria-hidden="true" />{copy.total}</span><span className="cx-usage-period-label">{copy.ranges[range]}</span></div>
+          <div className="cx-usage-total-heading"><span><Activity size={16} aria-hidden="true" />{copy.total}</span><span className="cx-usage-period-label">{copy.ranges[record?.query.range ?? range]}</span></div>
           <div className="cx-usage-total-value"><TokenValue value={data.totals.totalTokens} lang={lang} /><span>{copy.tokens}</span></div>
           <div className="cx-usage-total-caption"><span>{exact(data.totals.totalTokens, lang)} {copy.tokens}</span><span>{copy.totalHint}</span></div>
           <div className="cx-usage-composition" aria-hidden="true"><span className="cx-usage-swatch--input" style={{ width: `${ratio(data.totals.inputTokens - data.totals.cachedInputTokens, data.totals.totalTokens)}%` }} /><span className="cx-usage-swatch--cache" style={{ width: `${ratio(data.totals.cachedInputTokens, data.totals.totalTokens)}%` }} /><span className="cx-usage-swatch--output" style={{ width: `${ratio(data.totals.outputTokens, data.totals.totalTokens)}%` }} /></div>

@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 
-fn selected_provider_id_on_connection(
+pub(super) fn selected_provider_id_on_connection(
     conn: &Connection,
     codex_dir: &Path,
 ) -> Result<Option<String>> {

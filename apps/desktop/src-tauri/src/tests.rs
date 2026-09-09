@@ -133,6 +133,7 @@ fn provider_test_connection() -> Connection {
                 toml_config TEXT,
                 wire_api TEXT NOT NULL DEFAULT 'responses',
                 requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+                model_mappings_json TEXT NOT NULL DEFAULT '[]',
                 source TEXT NOT NULL DEFAULT 'manual',
                 source_id TEXT,
                 created_at TEXT NOT NULL,
@@ -160,6 +161,7 @@ fn provider_fixture(
         toml_config: toml_config.map(ToString::to_string),
         wire_api: "responses".to_string(),
         requires_openai_auth: true,
+        model_mappings: Vec::new(),
     }
 }
 
@@ -960,6 +962,7 @@ wire_api = "responses"
         toml_config: Some(toml.to_string()),
         wire_api: "responses".to_string(),
         requires_openai_auth: true,
+        model_mappings: Vec::new(),
     };
     let live = second_toml.replace(
         "wire_api = \"responses\"",
@@ -1807,6 +1810,7 @@ enabled = true
             toml_config: Some(provider_a_config.to_string()),
             wire_api: "responses".to_string(),
             requires_openai_auth: true,
+            model_mappings: Vec::new(),
         },
         SavedProvider {
             id: provider_b_id.clone(),
@@ -1817,6 +1821,7 @@ enabled = true
             toml_config: Some(provider_b_config.to_string()),
             wire_api: "responses".to_string(),
             requires_openai_auth: true,
+            model_mappings: Vec::new(),
         },
     ] {
         save_provider_inner(provider).expect("save provider record");
@@ -2093,9 +2098,10 @@ command = "docs-server"
         .config_text
         .parse::<DocumentMut>()
         .expect("parse provider B live config");
-    assert!(live_doc["model_providers"]["custom"]
-        .get("experimental_bearer_token")
-        .is_none());
+    assert_eq!(
+        live_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-b")
+    );
 
     let _ = fs::remove_dir_all(codex_dir);
 }
@@ -2725,6 +2731,7 @@ requires_openai_auth = true
         toml_config: Some(provider_config.to_string()),
         wire_api: "responses".to_string(),
         requires_openai_auth: true,
+        model_mappings: Vec::new(),
     })
     .expect("save provider without stored key");
     write_text(&config_path(&codex_dir), provider_config).expect("write live provider config");
@@ -3192,6 +3199,7 @@ requires_openai_auth = true
         toml_config: Some(custom_config.trim_end().to_string()),
         wire_api: "responses".to_string(),
         requires_openai_auth: true,
+        model_mappings: Vec::new(),
     };
     save_provider_inner(original.clone()).expect("save original provider");
     assert_eq!(
@@ -3755,9 +3763,10 @@ requires_openai_auth = false
     let config_doc = config_text
         .parse::<DocumentMut>()
         .expect("parse provider config");
-    assert!(config_doc["model_providers"]["custom"]
-        .get("experimental_bearer_token")
-        .is_none());
+    assert_eq!(
+        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-provider-table")
+    );
     let auth_after: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read auth after save"),
     )
@@ -3913,9 +3922,10 @@ command = "must-not-replace-live"
         doc["model_providers"]["custom"]["base_url"].as_str(),
         Some("https://new.example.com/v1")
     );
-    assert!(doc["model_providers"]["custom"]
-        .get("experimental_bearer_token")
-        .is_none());
+    assert_eq!(
+        doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-new")
+    );
     let auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read merged provider auth"),
     )
@@ -4017,9 +4027,10 @@ requires_openai_auth = false
         .config_text
         .parse::<DocumentMut>()
         .expect("parse provider B live config");
-    assert!(live_doc["model_providers"]["custom"]
-        .get("experimental_bearer_token")
-        .is_none());
+    assert_eq!(
+        live_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-b")
+    );
     assert!(!result
         .state
         .config_text
