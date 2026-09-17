@@ -66,3 +66,11 @@ pub(super) struct CcSwitchSkillMeta {
     pub(super) repo_branch: String,
     pub(super) content_hash: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillsMcpExportResult {
+    pub(crate) path: String,
+    pub(crate) exported_skills: usize,
+    pub(crate) exported_mcp: usize,
+}

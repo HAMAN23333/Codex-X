@@ -33,6 +33,14 @@ fn toml_value_to_json(value: &toml_edit::Value) -> Value {
     if let Some(b) = value.as_bool() {
         return json!(b);
     }
+    if let Some(table) = value.as_inline_table() {
+        return Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.to_owned(), toml_value_to_json(value)))
+                .collect(),
+        );
+    }
     if let Some(arr) = value.as_array() {
         return Value::Array(arr.iter().map(toml_value_to_json).collect());
     }
@@ -53,7 +61,7 @@ fn toml_item_to_json(item: &Item) -> Value {
     Value::Null
 }
 
-fn json_to_toml_item(value_json: &Value) -> Item {
+pub(super) fn json_to_toml_item(value_json: &Value) -> Item {
     match value_json {
         Value::String(s) => value(s.clone()),
         Value::Bool(b) => value(*b),
@@ -143,7 +151,7 @@ pub(super) fn mcp_summary(config: &Value) -> (String, Option<String>, Option<Str
     (transport, command, url, summary)
 }
 
-fn save_managed_mcp_on_connection(
+pub(super) fn save_managed_mcp_on_connection(
     conn: &Connection,
     id: &str,
     name: &str,
@@ -198,14 +206,17 @@ fn document_mcp_ids(doc: &toml_edit::DocumentMut) -> HashSet<String> {
         .map(|table| {
             table
                 .iter()
-                .filter(|(_, item)| item.is_table())
+                .filter(|(_, item)| item.as_table_like().is_some())
                 .map(|(id, _)| id.to_string())
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn document_bytes(snapshot: Option<&[u8]>, doc: &toml_edit::DocumentMut) -> Option<Vec<u8>> {
+pub(super) fn document_bytes(
+    snapshot: Option<&[u8]>,
+    doc: &toml_edit::DocumentMut,
+) -> Option<Vec<u8>> {
     let bytes = doc.to_string().into_bytes();
     if snapshot.is_none() && bytes.is_empty() {
         None
@@ -214,7 +225,7 @@ fn document_bytes(snapshot: Option<&[u8]>, doc: &toml_edit::DocumentMut) -> Opti
     }
 }
 
-fn commit_mcp_transaction_with_config<BeforeApply, BeforeCommit>(
+pub(super) fn commit_mcp_transaction_with_config<BeforeApply, BeforeCommit>(
     transaction: Transaction<'_>,
     codex_dir: &Path,
     before: Option<Vec<u8>>,
@@ -285,16 +296,22 @@ pub(super) fn list_mcp_from_config(codex_dir: &Path) -> Result<Vec<ManagedMcpSer
     };
     let mut out = Vec::new();
     for (id, item) in mcp_tbl.iter() {
-        if !item.is_table() {
+        if item.as_table_like().is_none() {
             continue;
         }
         let config = toml_item_to_json(item);
+        if !is_valid_mcp_config(&config) {
+            continue;
+        }
         let (transport, command, url, summary) = mcp_summary(&config);
         out.push(ManagedMcpServer {
             id: id.to_string(),
             name: id.to_string(),
             transport,
-            enabled: true,
+            enabled: config
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             source: "config.toml".to_string(),
             summary,
             note: None,
@@ -319,51 +336,7 @@ pub(super) fn import_ccswitch_mcp_servers_for_codex(
     codex_dir: &Path,
     imported_ids: &mut HashSet<String>,
 ) -> Result<usize> {
-    let db = default_ccswitch_db_path()?;
-    if !db.exists() {
-        return Ok(0);
-    }
-    let conn = Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| {
-        CodexxError::Database(format!(
-            "打开 cc-switch MCP 数据库失败 {}: {e}",
-            db.display()
-        ))
-    })?;
-    let mut stmt = match conn
-        .prepare("SELECT id, name, server_config, enabled_codex FROM mcp_servers ORDER BY name ASC, id ASC")
-        .or_else(|_| {
-            conn.prepare("SELECT id, name, server_config, 0 AS enabled_codex FROM mcp_servers ORDER BY name ASC, id ASC")
-        }) {
-        Ok(stmt) => stmt,
-        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-            if message.to_lowercase().contains("no such table") =>
-        {
-            return Ok(0);
-        }
-        Err(e) => return Err(CodexxError::Database(e.to_string())),
-    };
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
-            ))
-        })
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let mut candidates = Vec::new();
-    for row in rows {
-        let (id, name, config_text, enabled_codex) =
-            row.map_err(|e| CodexxError::Database(e.to_string()))?;
-        let config: Value =
-            serde_json::from_str(&config_text).unwrap_or(Value::Object(Default::default()));
-        candidates.push((id, name, config, enabled_codex));
-    }
+    let candidates = new_ccswitch_mcp_candidates(codex_dir, imported_ids)?;
 
     import_ccswitch_mcp_candidates_with_hooks(
         codex_dir,
@@ -388,7 +361,11 @@ where
     let mut staged_ids = HashSet::new();
     let candidates = candidates
         .into_iter()
-        .filter(|(id, _, _, _)| !imported_ids.contains(id) && staged_ids.insert(id.clone()))
+        .filter(|(id, _, config, _)| {
+            is_valid_mcp_config(config)
+                && !imported_ids.contains(id)
+                && staged_ids.insert(id.clone())
+        })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Ok(0);
@@ -429,9 +406,83 @@ where
     Ok(imported)
 }
 
-pub(super) fn preview_ccswitch_mcp_servers_for_codex(
-    codex_dir: &Path,
-) -> Result<Vec<ManagedMcpServer>> {
+// Both preview and import use the same validated records. Malformed JSON is never
+// converted to an empty stdio server.
+pub(super) fn is_valid_mcp_config(config: &Value) -> bool {
+    let Some(object) = config.as_object() else {
+        return false;
+    };
+    let nonempty = |key| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let command = nonempty("command");
+    let url = nonempty("url");
+    if command == url {
+        return false;
+    }
+    if command
+        && object.get("args").is_some_and(|args| {
+            !args
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_string))
+        })
+    {
+        return false;
+    }
+    if object.get("env").is_some_and(|env| {
+        !env.as_object()
+            .is_some_and(|values| values.values().all(Value::is_string))
+    }) {
+        return false;
+    }
+    true
+}
+
+pub(super) fn mcp_configs_equal(left: &Value, right: &Value) -> bool {
+    let normalize = |value: &Value| {
+        let mut config = value.clone();
+        if let Some(object) = config.as_object_mut() {
+            // Transport is inferred from command/url by Codex; enabled is stored
+            // separately from the connection settings in managed records.
+            object.remove("type");
+            object.remove("enabled");
+            for key in ["args", "env", "http_headers", "env_http_headers"] {
+                if object.get(key).is_some_and(|value| {
+                    value.as_array().is_some_and(Vec::is_empty)
+                        || value.as_object().is_some_and(serde_json::Map::is_empty)
+                }) {
+                    object.remove(key);
+                }
+            }
+        }
+        config
+    };
+    normalize(left) == normalize(right)
+}
+
+fn normalized_ccswitch_config(config: Value, id: &str) -> Option<Value> {
+    if is_valid_mcp_config(&config) {
+        return Some(config);
+    }
+    for key in ["mcpServers", "mcp_servers"] {
+        if let Some(servers) = config.get(key).and_then(Value::as_object) {
+            let server = servers.get(id).or_else(|| {
+                (servers.len() == 1)
+                    .then(|| servers.values().next())
+                    .flatten()
+            })?;
+            if is_valid_mcp_config(server) {
+                return Some(server.clone());
+            }
+        }
+    }
+    None
+}
+
+fn read_ccswitch_mcp_candidates() -> Result<Vec<CcSwitchMcpCandidate>> {
     let db = default_ccswitch_db_path()?;
     if !db.exists() {
         return Ok(vec![]);
@@ -440,29 +491,20 @@ pub(super) fn preview_ccswitch_mcp_servers_for_codex(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| {
-        CodexxError::Database(format!(
-            "打开 cc-switch MCP 数据库失败 {}: {e}",
-            db.display()
-        ))
-    })?;
+    .map_err(|error| CodexxError::Database(error.to_string()))?;
+    read_ccswitch_mcp_candidates_from_connection(&conn)
+}
+
+fn read_ccswitch_mcp_candidates_from_connection(
+    conn: &Connection,
+) -> Result<Vec<CcSwitchMcpCandidate>> {
     let mut stmt = match conn
         .prepare("SELECT id, name, server_config, enabled_codex FROM mcp_servers ORDER BY name ASC, id ASC")
-        .or_else(|_| {
-            conn.prepare("SELECT id, name, server_config, 0 AS enabled_codex FROM mcp_servers ORDER BY name ASC, id ASC")
-        }) {
+        .or_else(|_| conn.prepare("SELECT id, name, server_config, 0 FROM mcp_servers ORDER BY name ASC, id ASC")) {
         Ok(stmt) => stmt,
-        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-            if message.to_lowercase().contains("no such table") =>
-        {
-            return Ok(vec![]);
-        }
-        Err(e) => return Err(CodexxError::Database(e.to_string())),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message))) if message.to_lowercase().contains("no such table") => return Ok(vec![]),
+        Err(error) => return Err(CodexxError::Database(error.to_string())),
     };
-    let live_enabled = list_mcp_from_config(codex_dir)?
-        .into_iter()
-        .map(|server| server.id)
-        .collect::<HashSet<_>>();
     let rows = stmt
         .query_map([], |row| {
             Ok((
@@ -472,28 +514,88 @@ pub(super) fn preview_ccswitch_mcp_servers_for_codex(
                 row.get::<_, bool>(3)?,
             ))
         })
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, name, config_text, enabled_codex) =
-            row.map_err(|e| CodexxError::Database(e.to_string()))?;
-        let config: Value =
-            serde_json::from_str(&config_text).unwrap_or(Value::Object(Default::default()));
-        let (transport, command, url, summary) = mcp_summary(&config);
-        out.push(ManagedMcpServer {
-            id: id.clone(),
-            name,
-            transport,
-            enabled: enabled_codex || live_enabled.contains(&id),
-            source: "cc-switch".to_string(),
-            summary,
-            note: None,
-            command,
-            url,
-            config_json: config,
-        });
+        let (id, name, text, enabled) =
+            row.map_err(|error| CodexxError::Database(error.to_string()))?;
+        if id.trim().is_empty() {
+            continue;
+        }
+        let Some(config) = serde_json::from_str(&text)
+            .ok()
+            .and_then(|config| normalized_ccswitch_config(config, &id))
+        else {
+            continue;
+        };
+        let name = if name.trim().is_empty() {
+            id.clone()
+        } else {
+            name
+        };
+        out.push((id, name, config, enabled));
     }
     Ok(out)
+}
+
+fn new_ccswitch_mcp_candidates(
+    codex_dir: &Path,
+    already_seen: &HashSet<String>,
+) -> Result<Vec<CcSwitchMcpCandidate>> {
+    let current = list_mcp_from_config(codex_dir)?;
+    let managed = db_managed_mcp()?;
+    let mut ids = already_seen.clone();
+    let mut configs = Vec::new();
+    for server in current {
+        ids.insert(server.id);
+        configs.push(server.config_json);
+    }
+    for (id, _, config, _) in managed {
+        ids.insert(id);
+        if is_valid_mcp_config(&config) {
+            configs.push(config);
+        }
+    }
+    let mut output = Vec::new();
+    for candidate in read_ccswitch_mcp_candidates()? {
+        if !ids.insert(candidate.0.clone())
+            || configs
+                .iter()
+                .any(|config| mcp_configs_equal(config, &candidate.2))
+        {
+            continue;
+        }
+        configs.push(candidate.2.clone());
+        output.push(candidate);
+    }
+    Ok(output)
+}
+
+pub(super) fn preview_ccswitch_mcp_servers_for_codex(
+    codex_dir: &Path,
+) -> Result<Vec<ManagedMcpServer>> {
+    let live_enabled = list_mcp_from_config(codex_dir)?
+        .into_iter()
+        .map(|server| server.id)
+        .collect::<HashSet<_>>();
+    Ok(new_ccswitch_mcp_candidates(codex_dir, &HashSet::new())?
+        .into_iter()
+        .map(|(id, name, config, enabled)| {
+            let (transport, command, url, summary) = mcp_summary(&config);
+            ManagedMcpServer {
+                enabled: enabled || live_enabled.contains(&id),
+                id,
+                name,
+                transport,
+                source: "cc-switch".to_string(),
+                summary,
+                note: None,
+                command,
+                url,
+                config_json: config,
+            }
+        })
+        .collect())
 }
 
 pub(crate) fn toggle_codex_mcp_inner(
@@ -529,8 +631,19 @@ where
         .map_err(|error| CodexxError::Database(error.to_string()))?;
     let stored = managed_mcp_on_connection(&transaction, &id)?;
     if enabled {
-        let (name, config, _) =
-            stored.ok_or_else(|| CodexxError::Config(format!("未找到 MCP: {id}")))?;
+        let (name, mut config, _) = stored
+            .or_else(|| {
+                doc.get("mcp_servers")
+                    .and_then(Item::as_table)
+                    .and_then(|table| table.get(&id))
+                    .map(|item| (id.clone(), toml_item_to_json(item), false))
+            })
+            .ok_or_else(|| CodexxError::Config(format!("未找到 MCP: {id}")))?;
+        if let Some(object) = config.as_object_mut() {
+            if object.contains_key("enabled") {
+                object.insert("enabled".to_owned(), Value::Bool(true));
+            }
+        }
         ensure_table(doc.as_table_mut(), "mcp_servers")?.insert(&id, json_to_toml_item(&config));
         save_managed_mcp_on_connection(&transaction, &id, &name, &config, true)?;
     } else {
@@ -594,6 +707,75 @@ mod tests {
             .expect("open test database")
             .execute("DELETE FROM managed_mcp_servers WHERE id = ?1", [id])
             .expect("remove test MCP");
+    }
+
+    #[test]
+    fn enabling_existing_unmanaged_disabled_mcp_updates_enabled_flag() {
+        let _guard = crate::app_db::test_db_guard();
+        let (directory, id) = test_case("disabled-unmanaged");
+        let config = format!("[mcp_servers.\"{id}\"]\ncommand = \"fixture\"\nenabled = false\n");
+        std::fs::write(directory.join("config.toml"), config).unwrap();
+        let initial = list_mcp_from_config(&directory).unwrap();
+        assert!(!initial[0].enabled);
+        let result =
+            toggle_codex_mcp_inner(Some(directory.display().to_string()), id.clone(), true)
+                .unwrap();
+        assert!(
+            result
+                .mcp_servers
+                .iter()
+                .find(|server| server.id == id)
+                .unwrap()
+                .enabled
+        );
+        remove_test_mcp(&id);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ccswitch_candidates_skip_empty_invalid_and_transport_only_records() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers(id TEXT,name TEXT,server_config TEXT,enabled_codex BOOLEAN)",
+        )
+        .unwrap();
+        for (id, data) in [
+            ("broken", "invalid"),
+            ("empty", "{}"),
+            ("transport", r#"{"type":"stdio"}"#),
+            ("valid", r#"{"command":"npx","args":["server"]}"#),
+            (
+                "wrapped",
+                r#"{"mcpServers":{"wrapped":{"url":"https://example.test/mcp"}}}"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO mcp_servers VALUES(?1,?1,?2,0)",
+                params![id, data],
+            )
+            .unwrap();
+        }
+        let candidates = read_ccswitch_mcp_candidates_from_connection(&conn).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            ["valid", "wrapped"]
+        );
+        assert_eq!(candidates[1].2["url"], "https://example.test/mcp");
+    }
+
+    #[test]
+    fn inline_environment_round_trip_retains_mcp_credentials() {
+        let document: toml_edit::DocumentMut =
+            "[mcp_servers.example]\ncommand = \"example\"\nenv = { TOKEN = \"synthetic\" }\n"
+                .parse()
+                .unwrap();
+        let value = toml_item_to_json(&document["mcp_servers"]["example"]);
+        assert!(is_valid_mcp_config(&value));
+        assert_eq!(value["env"]["TOKEN"], "synthetic");
+        assert_eq!(toml_item_to_json(&json_to_toml_item(&value)), value);
     }
 
     #[test]

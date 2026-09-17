@@ -1,4 +1,6 @@
+mod archive;
 mod mcp;
+pub(crate) use archive::{export_skills_mcp_archive_inner, install_skill_archive_path_inner};
 mod skills;
 mod types;
 
@@ -8,7 +10,8 @@ pub(crate) use skills::{
     sort_managed_skills, toggle_codex_skill_inner,
 };
 pub(crate) use types::{
-    ManagedMcpServer, SkillsMcpActionResult, SkillsMcpImportPreview, SkillsMcpState,
+    ManagedMcpServer, SkillsMcpActionResult, SkillsMcpExportResult, SkillsMcpImportPreview,
+    SkillsMcpState,
 };
 
 #[cfg(test)]
@@ -17,7 +20,7 @@ pub(crate) use skills::read_skill_metadata;
 pub(crate) use types::ManagedSkill;
 
 use crate::error::Result;
-use crate::file_io::{ensure_directory, io_err};
+use crate::file_io::ensure_directory;
 use crate::paths::{home_dir, normalized_path_scope};
 use crate::resolve_codex_dir;
 use crate::{now_rfc3339, open_db};
@@ -26,10 +29,9 @@ use mcp::{
     preview_ccswitch_mcp_servers_for_codex, save_managed_mcp,
 };
 use rusqlite::params;
-use skills::{
-    codex_skills_dir, copy_dir_recursive, disabled_skills_dir, sanitize_dir_name, scan_skill_dir,
-};
+use skills::{codex_skills_dir, copy_dir_recursive, disabled_skills_dir, scan_skill_dir};
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 
@@ -128,7 +130,7 @@ pub(crate) fn build_skills_mcp_state_inner(config_dir: Option<String>) -> Result
     let mut mcp_servers = list_mcp_from_config(&codex_dir)?;
     let enabled_ids: HashSet<String> = mcp_servers.iter().map(|s| s.id.clone()).collect();
     for (id, name, config, enabled) in db_managed_mcp()? {
-        if enabled_ids.contains(&id) {
+        if enabled_ids.contains(&id) || !mcp::is_valid_mcp_config(&config) {
             continue;
         }
         let (transport, command, url, summary) = mcp_summary(&config);
@@ -221,31 +223,16 @@ pub(crate) fn import_existing_skills_mcp_inner(
     let codex_dir = resolve_codex_dir(config_dir.clone())?;
     let skills_dir = codex_skills_dir(&codex_dir);
     ensure_directory(&skills_dir)?;
+    let preview = preview_existing_skills_mcp_inner(config_dir.clone())?;
     let mut imported_skills = 0usize;
-    let candidates = vec![
-        home_dir()?.join(".agents").join("skills"),
-        home_dir()?.join(".cc-switch").join("skills"),
-    ];
-    for base in candidates {
-        if !base.exists() {
-            continue;
-        }
-        for entry in fs::read_dir(&base).map_err(|e| io_err(&base, e))? {
-            let entry = entry.map_err(|e| io_err(&base, e))?;
-            let src = entry.path();
-            if !src.is_dir() || !src.join("SKILL.md").is_file() {
-                continue;
-            }
-            let directory = sanitize_dir_name(&entry.file_name().to_string_lossy(), "skill");
-            let dst = skills_dir.join(&directory);
-            if !dst.exists() {
-                copy_dir_recursive(&src, &dst)?;
-                imported_skills += 1;
-            }
+    for skill in preview.skills {
+        let destination = skills_dir.join(&skill.directory);
+        if !destination.exists() {
+            copy_dir_recursive(Path::new(&skill.path), &destination)?;
+            imported_skills += 1;
         }
     }
 
-    let mut imported_mcp = 0usize;
     let mut imported_mcp_ids = db_managed_mcp()?
         .into_iter()
         .map(|(id, _, _, _)| id)
@@ -254,10 +241,11 @@ pub(crate) fn import_existing_skills_mcp_inner(
         if !imported_mcp_ids.insert(server.id.clone()) {
             continue;
         }
+        // Already visible in the list: record it for deduplication without
+        // presenting it as a newly imported server.
         save_managed_mcp(&server.id, &server.name, &server.config_json, true)?;
-        imported_mcp += 1;
     }
-    imported_mcp += import_ccswitch_mcp_servers_for_codex(&codex_dir, &mut imported_mcp_ids)?;
+    let imported_mcp = import_ccswitch_mcp_servers_for_codex(&codex_dir, &mut imported_mcp_ids)?;
     let state = build_skills_mcp_state_inner(config_dir)?;
     Ok(SkillsMcpActionResult {
         imported_skills,
@@ -272,6 +260,7 @@ pub(crate) fn preview_existing_skills_mcp_inner(
 ) -> Result<SkillsMcpImportPreview> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let skills_dir = codex_skills_dir(&codex_dir);
+    let disabled_dir = disabled_skills_dir()?;
     let mut warnings = Vec::new();
     let mut skills = Vec::new();
     let mut seen = HashSet::new();
@@ -293,14 +282,20 @@ pub(crate) fn preview_existing_skills_mcp_inner(
             warnings.push(e.to_string());
         }
         for skill in &mut skills[before..] {
-            if skills_dir.join(&skill.directory).exists() {
+            if skills_dir.join(&skill.directory).exists()
+                || disabled_dir.join(&skill.directory).exists()
+            {
                 skill.update_status = "已存在，将跳过".to_string();
             } else {
                 skill.update_status = "可导入".to_string();
             }
         }
     }
-    skills.retain(|skill| skill.update_status != "已存在，将跳过");
+    let mut candidate_ids = HashSet::new();
+    skills.retain(|skill| {
+        skill.update_status != "已存在，将跳过"
+            && candidate_ids.insert(skill.directory.to_ascii_lowercase())
+    });
 
     let mut config_mcp_servers = list_mcp_from_config(&codex_dir)?;
     for server in &mut config_mcp_servers {
@@ -311,7 +306,7 @@ pub(crate) fn preview_existing_skills_mcp_inner(
         .map(|(id, _, _, _)| id)
         .collect::<HashSet<_>>();
     let mut mcp_servers = Vec::new();
-    extend_unmanaged_mcp_candidates(&mut mcp_servers, &mut seen_mcp, config_mcp_servers);
+    seen_mcp.extend(config_mcp_servers.into_iter().map(|server| server.id));
     extend_unmanaged_mcp_candidates(
         &mut mcp_servers,
         &mut seen_mcp,

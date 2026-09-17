@@ -830,6 +830,43 @@
   border-right-color: var(--cx-dark-border);
 }
 
+:root[data-theme="dark"] .cx-skills-import-summary > div {
+  background: var(--cx-dark-surface-raised);
+  border-color: var(--cx-dark-border);
+}
+
+:root[data-theme="dark"] .cx-skills-import-summary strong {
+  color: #9fc2ff;
+}
+
+:root[data-theme="dark"] .cx-skills-import-list {
+  border-color: var(--cx-dark-border);
+  background: var(--cx-dark-surface);
+}
+
+:root[data-theme="dark"] .cx-skills-import-section-head strong,
+:root[data-theme="dark"] .cx-skills-import-row strong {
+  color: #e5e7eb;
+}
+
+:root[data-theme="dark"] .cx-skills-import-summary span,
+:root[data-theme="dark"] .cx-skills-import-section-head span,
+:root[data-theme="dark"] .cx-skills-import-list > p,
+:root[data-theme="dark"] .cx-skills-import-row span,
+:root[data-theme="dark"] .cx-skills-import-row em {
+  color: #b6bac2;
+}
+
+:root[data-theme="dark"] .cx-skills-import-warnings {
+  background: #3c352b;
+  border-color: #655238;
+}
+
+:root[data-theme="dark"] .cx-skills-import-warnings > strong,
+:root[data-theme="dark"] .cx-skills-import-warnings p {
+  color: #e8c58d;
+}
+
 :root[data-theme="dark"] .cx-prompts-mode-title strong {
   color: #d8dbe0;
 }

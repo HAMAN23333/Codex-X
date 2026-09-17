@@ -30,5 +30,3 @@ pub(crate) const GITHUB_EXAMPLES_API: &str =
     "https://api.github.com/repos/yynxxxxx/Codex-X/contents/examples?ref=main";
 pub(crate) const GITHUB_EXAMPLES_BASE: &str =
     "https://raw.githubusercontent.com/yynxxxxx/Codex-X/main/examples/";
-
-pub(crate) const MAX_SKILL_ZIP_BYTES: u64 = 20 * 1024 * 1024;

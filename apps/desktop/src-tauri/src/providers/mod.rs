@@ -7,6 +7,7 @@ pub(crate) mod official_profiles;
 pub(crate) mod quota;
 mod selection;
 mod store;
+pub(crate) mod transport;
 
 use crate::error::Result;
 use rusqlite::Connection;
@@ -28,7 +29,8 @@ pub(crate) use connection::{
 };
 pub(crate) use live::detected_live_custom_provider;
 pub(crate) use live::{
-    activate_saved_provider_inner, build_provider_toml_draft_inner, delete_saved_provider_inner,
+    activate_saved_provider_inner, build_provider_toml_draft_inner,
+    build_provider_toml_draft_with_origin_inner, delete_saved_provider_inner,
     save_active_provider_inner, save_official_config_inner, save_provider_toml_config_inner,
     switch_provider_inner, OfficialConfigInput, ProviderInput, ProviderTomlInput,
 };

@@ -250,6 +250,61 @@
   background: #f7f8fa;
 }
 
+.cx-startup-path-control--manual {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.cx-startup-config-health {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--ui-border-subtle);
+}
+
+.cx-startup-diagnostics-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--ui-border-subtle);
+  border-radius: 8px;
+  color: var(--ui-text-muted);
+  background: var(--ui-surface-elevated);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.cx-startup-diagnostics-notice > svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.cx-startup-diagnostics-notice strong {
+  color: var(--ui-text);
+  font-weight: 650;
+}
+
+.cx-startup-diagnostics-notice p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.cx-startup-diagnostics-notice strong + p {
+  margin-top: 3px;
+}
+
+.cx-startup-diagnostics-notice--error {
+  border-color: color-mix(in srgb, var(--ui-warning) 25%, transparent);
+  background: color-mix(in srgb, var(--ui-warning) 8%, transparent);
+}
+
+.cx-startup-diagnostics-notice--error > svg {
+  color: var(--ui-warning);
+}
+
+.cx-startup-diagnostics-notice + .cx-startup-checks {
+  margin-top: 10px;
+}
+
 .cx-startup-path-control label {
   padding-left: 5px;
   color: #777d86;
@@ -340,6 +395,7 @@
 
 @media (max-width: 680px) {
   .cx-startup-path-control { grid-template-columns: 1fr auto; }
+  .cx-startup-path-control--manual { grid-template-columns: minmax(0, 1fr); }
   .cx-startup-path-control label { grid-column: 1 / -1; }
   .cx-startup-checks { grid-template-columns: 1fr; }
 }

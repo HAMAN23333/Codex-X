@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   CheckCircle2,
+  Download,
   FolderTree,
   History,
   Info,
@@ -73,6 +74,7 @@ type SessionManagementPageProps = {
   actionBusy: string;
   sessionDeleteConfirmOpen: boolean;
   sessionDeleteBusy: boolean;
+  sessionExportBusy: boolean;
   sessionDeleteSafetyConfirmed: boolean;
   onCheckSessions: () => void;
   onSyncSessions: () => void;
@@ -84,6 +86,7 @@ type SessionManagementPageProps = {
   onSetSessionGroupSelected: (sessions: SessionPreview[], checked: boolean) => void;
   onCloseDeleteConfirm: () => void;
   onDeleteSelectedSessions: () => void;
+  onExportSessions: (ids: string[]) => void;
   onDeleteSafetyConfirmedChange: (checked: boolean) => void;
 };
 
@@ -138,6 +141,7 @@ export function SessionManagementPage({
   actionBusy,
   sessionDeleteConfirmOpen,
   sessionDeleteBusy,
+  sessionExportBusy,
   sessionDeleteSafetyConfirmed,
   onCheckSessions,
   onSyncSessions,
@@ -149,6 +153,7 @@ export function SessionManagementPage({
   onSetSessionGroupSelected,
   onCloseDeleteConfirm,
   onDeleteSelectedSessions,
+  onExportSessions,
   onDeleteSafetyConfirmedChange,
 }: SessionManagementPageProps) {
   const isChinese = lang === "zh";
@@ -175,6 +180,10 @@ export function SessionManagementPage({
         groupByProject: "按项目路径分组",
         showInternal: (count: number) => `显示内部会话 (${count})`,
         deleteSelected: "删除选中",
+        exportSelected: "导出选中",
+        exportOne: "导出为 Markdown",
+        exporting: "导出中…",
+        exportHint: "单个会话保存为 Markdown；多个会话打包为 ZIP",
         deleteMany: (count: number) => `永久删除 ${count} 条`,
         selectAll: "选择当前列表中的全部会话",
         selectProject: (path: string, count: number) => `选择项目 ${path} 的 ${count} 条会话`,
@@ -224,6 +233,10 @@ export function SessionManagementPage({
         groupByProject: "Group by project path",
         showInternal: (count: number) => `Show internal sessions (${count})`,
         deleteSelected: "Delete selected",
+        exportSelected: "Export selected",
+        exportOne: "Export as Markdown",
+        exporting: "Exporting…",
+        exportHint: "Save one session as Markdown, or multiple sessions in a ZIP",
         deleteMany: (count: number) => `Delete ${count} permanently`,
         selectAll: "Select all sessions in the current list",
         selectProject: (path: string, count: number) => `Select ${count} sessions in ${path}`,
@@ -392,9 +405,20 @@ export function SessionManagementPage({
             )}
             <button
               type="button"
+              className="cx-session-button cx-session-button--secondary"
+              onClick={() => onExportSessions(selectedSessionIds)}
+              disabled={loading || sessionDeleteBusy || sessionExportBusy || selectedSessionIds.length === 0}
+              title={copy.exportHint}
+              aria-busy={sessionExportBusy}
+            >
+              {sessionExportBusy ? <Loader2 size={15} className="cx-session-spin" aria-hidden="true" /> : <Download size={15} strokeWidth={1.9} aria-hidden="true" />}
+              {sessionExportBusy ? copy.exporting : copy.exportSelected}
+            </button>
+            <button
+              type="button"
               className={cx("cx-session-button cx-session-delete-trigger", selectedSessionIds.length > 0 ? "cx-session-button--danger" : "cx-session-button--secondary")}
               onClick={onOpenDeleteConfirm}
-              disabled={loading || sessionDeleteBusy || selectedSessionIds.length === 0}
+              disabled={loading || sessionDeleteBusy || sessionExportBusy || selectedSessionIds.length === 0}
               title={selectedSessionIds.length > 0 ? undefined : copy.deleteSelected}
             >
               <Trash2 size={15} strokeWidth={1.9} aria-hidden="true" />
@@ -417,7 +441,8 @@ export function SessionManagementPage({
                 <span>{isChinese ? "更新时间" : "Updated"}</span>
                 <span>{isChinese ? "供应商" : "Provider"}</span>
                 <span>{isChinese ? "模型" : "Model"}</span>
-                <span>ID</span>
+                <span className="cx-session-id-heading">ID</span>
+                <span className="cx-session-actions-heading">{isChinese ? "导出" : "Export"}</span>
               </div>
               <div className="cx-session-table-body">
                 {groupedSessions.map(([group, items]) => {
@@ -447,12 +472,20 @@ export function SessionManagementPage({
                         </label>
                       )}
                       {items.map((item) => (
-                        <label className={cx("cx-session-row", item.needsSync && "cx-session-row--needs-sync", selectedSessionSet.has(item.id) && "cx-session-row--selected")} key={item.id}>
+                        <div
+                          className={cx("cx-session-row", item.needsSync && "cx-session-row--needs-sync", selectedSessionSet.has(item.id) && "cx-session-row--selected")}
+                          key={item.id}
+                          role="row"
+                          onClick={(event) => {
+                            if (!(event.target as HTMLElement).closest("button, input") && !loading && !sessionDeleteBusy) onToggleSessionSelected(item.id);
+                          }}
+                        >
                           <span className="cx-session-select-box" title={copy.selectSession}>
                             <input
                               className="cx-session-checkbox"
                               type="checkbox"
                               checked={selectedSessionSet.has(item.id)}
+                              disabled={loading || sessionDeleteBusy}
                               onChange={() => onToggleSessionSelected(item.id)}
                               aria-label={`${copy.selectSession}: ${item.title || (isChinese ? "未命名会话" : "Untitled session")} (#${shortId(item.id)})`}
                             />
@@ -470,7 +503,17 @@ export function SessionManagementPage({
                           <code className="cx-session-meta cx-session-meta--provider" title={item.modelProvider || undefined}>{item.modelProvider || copy.unknownProvider}</code>
                           <span className="cx-session-meta cx-session-meta--model" title={item.model || undefined}>{item.model || copy.noModel}</span>
                           <small className="cx-session-meta cx-session-meta--id" title={item.id}>#{shortId(item.id)}</small>
-                        </label>
+                          <button
+                            type="button"
+                            className="cx-session-row-export"
+                            onClick={() => onExportSessions([item.id])}
+                            disabled={loading || sessionDeleteBusy || sessionExportBusy}
+                            aria-label={`${copy.exportOne}: ${item.title || (isChinese ? "未命名会话" : "Untitled session")}`}
+                            title={copy.exportOne}
+                          >
+                            <Download size={15} strokeWidth={1.9} aria-hidden="true" />
+                          </button>
+                        </div>
                       ))}
                     </div>
                   );

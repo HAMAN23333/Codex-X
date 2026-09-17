@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -313,8 +314,11 @@ export function UpdateDialog({
 export type StartupWizardDialogProps = {
   open: boolean;
   closing: boolean;
+  mode?: "startup" | "manual";
   lang: Lang;
   diagnostics: StartupDiagnostics | null;
+  diagnosticsError?: string;
+  configHealthPanel?: ReactNode;
   configDir: string;
   loading: boolean;
   onConfigDirChange: (value: string) => void;
@@ -327,8 +331,11 @@ export type StartupWizardDialogProps = {
 export function StartupWizardDialog({
   open,
   closing,
+  mode = "startup",
   lang,
   diagnostics,
+  diagnosticsError,
+  configHealthPanel,
   configDir,
   loading,
   onConfigDirChange,
@@ -338,48 +345,76 @@ export function StartupWizardDialog({
   onEnter,
 }: StartupWizardDialogProps) {
   const isChinese = lang === "zh";
-  if (!diagnostics) return null;
+  const isManual = mode === "manual";
+  const recheckButton = (
+    <Button
+      variant={isManual ? "primary" : "secondary"}
+      icon={<RefreshCw size={16} className={loading ? "spin" : undefined} />}
+      onClick={onRecheck}
+      disabled={loading}
+    >
+      {loading ? (isChinese ? "正在检查" : "Checking") : (isChinese ? "重新检查" : "Recheck")}
+    </Button>
+  );
 
   return (
     <ModalShell
       open={open}
       onClose={onSkip}
       size="lg"
-      title={isChinese ? "首次启动向导" : "First-run wizard"}
-      description={diagnostics.summary}
-      showCloseButton={false}
-      closeOnBackdrop={false}
-      closeOnEscape={false}
+      title={isChinese ? "环境与配置检查" : "Environment & configuration check"}
+      description={isManual
+        ? (isChinese ? "查看环境与配置状态，发现问题后可选择修复。" : "Review your environment and configuration, and choose whether to repair any issues.")
+        : (isChinese ? "首次使用前，检查 Codex 环境与配置是否就绪。" : "Before you get started, check whether your Codex environment and configuration are ready.")}
+      showCloseButton={isManual}
+      closeLabel={isChinese ? "关闭" : "Close"}
+      closeOnBackdrop={isManual}
+      closeOnEscape={isManual}
       className={closing ? "cx-startup-dialog cx-startup-dialog--closing" : "cx-startup-dialog"}
       footer={(
-        <>
-          <Button variant="ghost" onClick={onSkip}>{isChinese ? "跳过" : "Skip"}</Button>
-          <Button variant="secondary" icon={<Settings size={16} />} onClick={onOpenSettings}>{isChinese ? "去设置" : "Settings"}</Button>
-          <Button icon={<CheckCircle2 size={16} />} onClick={onEnter}>{isChinese ? "进入 Codex-X" : "Enter Codex-X"}</Button>
-        </>
+        isManual ? (
+          <>
+            <Button variant="secondary" onClick={onSkip}>{isChinese ? "关闭" : "Close"}</Button>
+            {recheckButton}
+          </>
+        ) : (
+          <>
+            <Button variant="ghost" onClick={onSkip}>{isChinese ? "跳过" : "Skip"}</Button>
+            <Button variant="secondary" icon={<Settings size={16} />} onClick={onOpenSettings}>{isChinese ? "去设置" : "Settings"}</Button>
+            <Button icon={<CheckCircle2 size={16} />} onClick={onEnter}>{isChinese ? "进入 Codex-X" : "Enter Codex-X"}</Button>
+          </>
+        )
       )}
     >
-      <div className="cx-startup-path-control">
+      <div className={`cx-startup-path-control${isManual ? " cx-startup-path-control--manual" : ""}`}>
         <label htmlFor="cx-startup-codex-home">CODEX_HOME</label>
         <input
           id="cx-startup-codex-home"
-          value={configDir || diagnostics.codexDir}
+          value={configDir}
           onChange={(event) => onConfigDirChange(event.target.value)}
           placeholder="~/.codex"
           disabled={loading}
           spellCheck={false}
         />
-        <Button
-          variant="secondary"
-          icon={<RefreshCw size={16} className={loading ? "spin" : undefined} />}
-          onClick={onRecheck}
-          disabled={loading}
-        >
-          {isChinese ? "重新检测" : "Recheck"}
-        </Button>
+        {!isManual && recheckButton}
       </div>
 
-      <div className="cx-startup-checks">
+      {diagnosticsError && <div className="cx-startup-diagnostics-notice cx-startup-diagnostics-notice--error" role="alert">
+        <AlertCircle size={17} aria-hidden="true" />
+        <div>
+          <strong>{isChinese ? "环境检查未完成" : "Environment check did not finish"}</strong>
+          <p>{diagnosticsError}</p>
+        </div>
+      </div>}
+
+      {!diagnostics && !diagnosticsError && <div className="cx-startup-diagnostics-notice" role="status" aria-live="polite">
+        {loading ? <Loader2 className="spin" size={17} aria-hidden="true" /> : <RefreshCw size={17} aria-hidden="true" />}
+        <p>{loading
+          ? (isChinese ? "正在检查 Codex 环境…" : "Checking your Codex environment…")
+          : (isChinese ? "点击重新检查，查看当前环境状态。" : "Choose Recheck to see the current environment status.")}</p>
+      </div>}
+
+      {diagnostics && <div className="cx-startup-checks">
         {diagnostics.items.map((item) => {
           const isOk = item.status === "ok";
           const isManual = item.status === "manual";
@@ -403,7 +438,9 @@ export function StartupWizardDialog({
             </article>
           );
         })}
-      </div>
+      </div>}
+
+      {configHealthPanel && <div className="cx-startup-config-health">{configHealthPanel}</div>}
     </ModalShell>
   );
 }

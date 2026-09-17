@@ -4,7 +4,8 @@
 
 use crate::error::{CodexxError, Result};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, Metadata};
@@ -13,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
+// Keep ordinary rollout records on the fast slice parser. Larger records use
+// the streaming parser, which skips image/tool/message bodies without retaining
+// their contents. This is a buffer threshold, never a record-size limit.
+const MAX_BUFFERED_LINE_BYTES: usize = 64 * 1024;
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_FILES: usize = 25_000;
 const MAX_DEPTH: usize = 6;
@@ -185,6 +189,94 @@ struct RateLimits {
     limit_id: Option<String>,
 }
 
+/// Keep only the source classification and parent ID used for grouping agents.
+/// In particular, newer source metadata may embed large, unrelated payloads.
+#[derive(Debug, Default)]
+struct UsageSource {
+    is_subagent: bool,
+    parent: Option<String>,
+}
+
+struct UsageSourceSeed(usize);
+
+impl<'de> DeserializeSeed<'de> for UsageSourceSeed {
+    type Value = UsageSource;
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for UsageSourceSeed {
+    type Value = UsageSource;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("session source metadata")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UsageSource {
+            is_subagent: self.0 == 0 && value.trim().eq_ignore_ascii_case("subagent"),
+            parent: (self.0 == 3).then(|| value.to_owned()),
+        })
+    }
+
+    fn visit_map<M: MapAccess<'de>>(
+        self,
+        mut map: M,
+    ) -> std::result::Result<Self::Value, M::Error> {
+        const PATH: [&str; 3] = ["subagent", "thread_spawn", "parent_thread_id"];
+        let mut source = UsageSource::default();
+        while let Some(key) = map.next_key::<String>()? {
+            if PATH.get(self.0).copied() == Some(key.as_str()) {
+                let child = map.next_value_seed(UsageSourceSeed(self.0 + 1))?;
+                source.is_subagent |= self.0 == 0;
+                source.parent = child.parent;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(source)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut sequence: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(UsageSource::default())
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UsageSource::default())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UsageSource::default())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UsageSource::default())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UsageSource::default())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(UsageSource::default())
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        UsageSourceSeed(0).deserialize(deserializer)
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct LogPayload {
     #[serde(rename = "type", default)]
@@ -193,7 +285,7 @@ struct LogPayload {
     #[serde(alias = "threadId")]
     thread_id: Option<String>,
     forked_from_id: Option<String>,
-    source: Option<serde_json::Value>,
+    source: Option<UsageSource>,
     cwd: Option<String>,
     model: Option<String>,
     info: Option<TokenInfo>,
@@ -226,7 +318,6 @@ struct TokenEvent {
 #[derive(Debug, Clone, Default)]
 struct ParseIssues {
     malformed_lines: usize,
-    oversized_lines: usize,
     invalid_usage: usize,
     incomplete_breakdown: usize,
     invalid_timestamps: usize,
@@ -235,7 +326,6 @@ struct ParseIssues {
 impl ParseIssues {
     fn add(&mut self, other: &Self) {
         self.malformed_lines += other.malformed_lines;
-        self.oversized_lines += other.oversized_lines;
         self.invalid_usage += other.invalid_usage;
         self.incomplete_breakdown += other.incomplete_breakdown;
         self.invalid_timestamps += other.invalid_timestamps;
@@ -296,13 +386,7 @@ fn timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 }
 
 impl ParsedLog {
-    fn parse_line(&mut self, bytes: &[u8]) -> std::result::Result<(), serde_json::Error> {
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(());
-        }
-        // Serde skips unknown fields. In particular, it does not materialize a
-        // response_item's message bodies or a turn_context's instructions.
-        let record: LogRecord = serde_json::from_slice(bytes)?;
+    fn parse_record(&mut self, record: LogRecord) {
         let time = timestamp(record.timestamp.as_deref());
         if let Some(time) = time {
             self.max_timestamp = Some(
@@ -323,15 +407,13 @@ impl ParsedLog {
                 let spawned = payload
                     .source
                     .as_ref()
-                    .and_then(|value| value.pointer("/subagent/thread_spawn/parent_thread_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
+                    .and_then(|value| value.parent.clone());
                 let forked = nonempty(payload.forked_from_id);
                 let spawned = nonempty(spawned);
                 self.is_subagent = payload
                     .source
                     .as_ref()
-                    .is_some_and(crate::sessions::source_value_is_subagent);
+                    .is_some_and(|source| source.is_subagent);
                 self.replays_parent = forked.is_some();
                 self.spawn_parent = spawned.clone();
                 self.invalid_spawn_parent = self.id.is_some() && self.id == self.spawn_parent;
@@ -360,7 +442,7 @@ impl ParsedLog {
             }
             "event_msg" if payload.kind == "token_count" => {
                 let Some(info) = payload.info else {
-                    return Ok(());
+                    return;
                 };
                 if let Some(model) = nonempty(info.model.or(info.model_name).or(payload.model)) {
                     self.model = model;
@@ -375,7 +457,7 @@ impl ParsedLog {
                     .and_then(RawCounters::counters);
                 if total.is_none() && last.is_none() {
                     self.issues.invalid_usage += 1;
-                    return Ok(());
+                    return;
                 }
                 let effective = if last.is_some() {
                     info.last_token_usage.as_ref()
@@ -399,7 +481,6 @@ impl ParsedLog {
             }
             _ => {}
         }
-        Ok(())
     }
 }
 
@@ -484,41 +565,123 @@ fn anchors(file: &mut File, offset: u64) -> std::io::Result<([u8; 32], [u8; 32])
     Ok((prefix, boundary))
 }
 
-struct BoundedLine {
-    bytes: Vec<u8>,
+struct ParsedLine {
+    record: std::result::Result<Option<LogRecord>, serde_json::Error>,
     consumed: u64,
     terminated: bool,
-    oversized: bool,
 }
 
-fn read_bounded_line(reader: &mut impl BufRead) -> std::io::Result<BoundedLine> {
-    let mut result = BoundedLine {
-        bytes: Vec::new(),
-        consumed: 0,
-        terminated: false,
-        oversized: false,
-    };
+/// Presents exactly one physical JSONL line to Serde. Caching the next newline
+/// boundary avoids rescanning the entire buffer for each byte Serde requests.
+/// Syntax errors can be drained to the same boundary, preserving the next event.
+struct JsonLineReader<'a, R> {
+    reader: &'a mut R,
+    available: usize,
+    ends_line: bool,
+    consumed: u64,
+    terminated: bool,
+    non_whitespace: bool,
+}
+
+impl<'a, R: BufRead> JsonLineReader<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            available: 0,
+            ends_line: false,
+            consumed: 0,
+            terminated: false,
+            non_whitespace: false,
+        }
+    }
+
+    fn drain(&mut self) -> std::io::Result<()> {
+        std::io::copy(self, &mut std::io::sink())?;
+        Ok(())
+    }
+}
+
+impl<R: BufRead> Read for JsonLineReader<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.terminated || output.is_empty() {
+            return Ok(0);
+        }
+        let buffer = self.reader.fill_buf()?;
+        if self.available == 0 {
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            self.available = newline.map_or(buffer.len(), |index| index + 1);
+            self.ends_line = newline.is_some();
+        }
+        let count = output.len().min(self.available);
+        output[..count].copy_from_slice(&buffer[..count]);
+        self.non_whitespace = self.non_whitespace
+            || output[..count]
+                .iter()
+                .any(|byte| !byte.is_ascii_whitespace());
+        self.reader.consume(count);
+        self.consumed += count as u64;
+        self.available -= count;
+        self.terminated = self.available == 0 && self.ends_line;
+        Ok(count)
+    }
+}
+
+fn parse_record_slice(bytes: &[u8]) -> std::result::Result<Option<LogRecord>, serde_json::Error> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        Ok(None)
+    } else {
+        serde_json::from_slice(bytes).map(Some)
+    }
+}
+
+fn read_log_record(reader: &mut impl BufRead) -> std::io::Result<ParsedLine> {
+    let mut bytes = Vec::new();
     loop {
         let buffer = reader.fill_buf()?;
         if buffer.is_empty() {
-            break;
+            return Ok(ParsedLine {
+                record: parse_record_slice(&bytes),
+                consumed: bytes.len() as u64,
+                terminated: false,
+            });
         }
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let count = newline.map_or(buffer.len(), |index| index + 1);
-        result.consumed += count as u64;
-        if !result.oversized && result.bytes.len() + count <= MAX_LINE_BYTES {
-            result.bytes.extend_from_slice(&buffer[..count]);
-        } else {
-            result.oversized = true;
-            result.bytes.clear();
+        if bytes.len() + count > MAX_BUFFERED_LINE_BYTES {
+            // Derived struct deserializers use IgnoredAny for unknown fields:
+            // Serde validates/skips large strings and arrays directly from the
+            // reader, rather than constructing a String, Value, or whole line.
+            let mut tail = JsonLineReader::new(reader);
+            let prefix_non_whitespace = bytes.iter().any(|byte| !byte.is_ascii_whitespace());
+            let record = serde_json::from_reader(bytes.as_slice().chain(&mut tail)).map(Some);
+            if let Err(error) = &record {
+                if let Some(kind) = error.io_error_kind() {
+                    return Err(std::io::Error::new(kind, "会话文件在读取期间发生错误"));
+                }
+            }
+            // A bad record must not consume the next JSONL line, nor prevent it
+            // from contributing usage. Also count all bytes against scan budget.
+            tail.drain()?;
+            return Ok(ParsedLine {
+                record: if prefix_non_whitespace || tail.non_whitespace {
+                    record
+                } else {
+                    Ok(None)
+                },
+                consumed: bytes.len() as u64 + tail.consumed,
+                terminated: tail.terminated,
+            });
         }
+        bytes.extend_from_slice(&buffer[..count]);
         reader.consume(count);
         if newline.is_some() {
-            result.terminated = true;
-            break;
+            return Ok(ParsedLine {
+                record: parse_record_slice(&bytes),
+                consumed: bytes.len() as u64,
+                terminated: true,
+            });
         }
     }
-    Ok(result)
 }
 
 fn parse_file(
@@ -574,23 +737,19 @@ fn parse_file(
             complete = false;
             break;
         }
-        let line = read_bounded_line(&mut reader).map_err(|error| io_error(path, error))?;
+        let line = read_log_record(&mut reader).map_err(|error| io_error(path, error))?;
         if line.consumed == 0 {
             break;
         }
         *budget = budget.saturating_sub(line.consumed);
-        if line.oversized {
-            if !line.terminated {
+        match line.record {
+            Ok(Some(record)) => parsed.parse_record(record),
+            Ok(None) => {}
+            Err(error) if !line.terminated && error.is_eof() => {
                 parsed.pending_line = true;
                 break;
             }
-            parsed.issues.oversized_lines += 1;
-        } else if let Err(error) = parsed.parse_line(&line.bytes) {
-            if !line.terminated && error.is_eof() {
-                parsed.pending_line = true;
-                break;
-            }
-            parsed.issues.malformed_lines += 1;
+            Err(_) => parsed.issues.malformed_lines += 1,
         }
         offset += line.consumed;
     }
@@ -763,7 +922,6 @@ fn combine_files(
     }
     for (count, message) in [
         (issues.malformed_lines, "行日志无法解析"),
-        (issues.oversized_lines, "行日志超过 2 MiB，已跳过"),
         (issues.invalid_usage, "条用量记录缺少有效的输入或输出计数"),
         (issues.invalid_timestamps, "条用量记录缺少有效时间"),
         (without_identity, "个会话文件缺少会话标识，已跳过"),
@@ -2235,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_reader_skips_large_lines_and_reports_bad_or_old_usage() {
+    fn streaming_reader_recovers_after_large_invalid_lines_and_reports_bad_or_old_usage() {
         let mut fixture = Fixture::new();
         let path = fixture.write(
             "sessions/one.jsonl",
@@ -2256,7 +2414,7 @@ mod tests {
         );
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"{not json}\n").unwrap();
-        file.write_all(&vec![b'x'; MAX_LINE_BYTES + 10]).unwrap();
+        file.write_all(&vec![b'x'; 2 * 1024 * 1024 + 10]).unwrap();
         file.write_all(b"\n").unwrap();
         let stats = fixture.stats("all", None);
         assert_eq!(stats.totals.total_tokens, 110);
@@ -2264,7 +2422,7 @@ mod tests {
             .coverage
             .warnings
             .iter()
-            .any(|warning| warning.contains("2 MiB")));
+            .any(|warning| warning.contains("2 行日志无法解析")));
         assert!(stats
             .coverage
             .warnings
@@ -2280,6 +2438,158 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("有效的输入或输出")));
+    }
+
+    #[test]
+    fn large_tool_image_and_token_records_keep_all_usage_without_coverage_warnings() {
+        let mut fixture = Fixture::new();
+        let huge = "x".repeat(2 * 1024 * 1024 + 100);
+        // Field ordering is deliberate: counters/metadata can follow the large
+        // value, so looking only at a record's prefix cannot recover usage.
+        let text = format!(
+            "{{\"payload\":{{\"instructions\":\"{huge}\",\"id\":\"one\"}},\"type\":\"session_meta\",\"timestamp\":\"2026-09-08T01:00:00Z\"}}\n\
+             {{\"payload\":{{\"input_image\":{{\"image_url\":\"data:image/png;base64,{huge}\"}},\"output\":\"{huge}\"}},\"type\":\"response_item\"}}\n\
+             {{\"payload\":{{\"instructions\":\"{huge}\",\"model\":\"gpt-large-fixture\"}},\"type\":\"turn_context\"}}\n\
+             {{\"payload\":{{\"info\":{{\"ignored\":\"{huge}\",\"total_token_usage\":{{\"input_tokens\":100,\"cached_input_tokens\":20,\"output_tokens\":10,\"reasoning_output_tokens\":5}}}},\"type\":\"token_count\"}},\"type\":\"event_msg\",\"timestamp\":\"2026-09-08T01:00:01Z\"}}\n"
+        );
+        let path = fixture.dir.join("sessions/one.jsonl");
+        fs::write(&path, text).unwrap();
+        let stats = fixture.stats("all", None);
+        assert_eq!(stats.totals.total_tokens, 110);
+        assert_eq!(stats.totals.cached_input_tokens, 20);
+        assert_eq!(stats.totals.reasoning_tokens, 5);
+        assert_eq!(stats.sessions[0].model, "gpt-large-fixture");
+        assert!(stats.coverage.warnings.is_empty(), "{:?}", stats.coverage);
+        // Appended events still resume at the exact boundary after large lines.
+        fixture.append(&path, &[total("2026-09-08T01:00:02Z", 150, 15)]);
+        assert_eq!(fixture.stats("all", None).totals.total_tokens, 165);
+    }
+
+    #[test]
+    fn large_source_metadata_retains_agent_parent_without_materializing_extensions() {
+        let mut fixture = Fixture::new();
+        fixture.write(
+            "sessions/root.jsonl",
+            &[
+                meta("root", "2026-09-08T01:00:00Z", None),
+                context("gpt-5.4"),
+                total("2026-09-08T01:00:01Z", 100, 10),
+            ],
+        );
+        let mut child = spawn_meta("child", "root", "2026-09-08T01:00:02Z");
+        child["payload"]["source"]["subagent"]["thread_spawn"]["instructions"] =
+            json!("private extension ".repeat(140_000));
+        fixture.write(
+            "sessions/child.jsonl",
+            &[
+                child,
+                context("gpt-5.4"),
+                total("2026-09-08T01:00:03Z", 50, 5),
+            ],
+        );
+        let stats = fixture.stats("all", None);
+        assert_eq!(stats.totals.total_tokens, 165);
+        assert_eq!(stats.sessions.len(), 1);
+        assert_eq!(stats.sessions[0].id, "root");
+        assert!(stats.coverage.warnings.is_empty());
+    }
+
+    #[test]
+    fn large_broken_record_does_not_count_partial_tokens_or_consume_next_line() {
+        let mut fixture = Fixture::new();
+        let path = fixture.write(
+            "sessions/one.jsonl",
+            &[
+                meta("one", "2026-09-08T01:00:00Z", None),
+                context("gpt-5.4"),
+            ],
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut bad = total("2026-09-08T01:00:01Z", 1000, 100);
+        bad["large_ignored"] = json!("x".repeat(2 * 1024 * 1024 + 100));
+        writeln!(file, "{bad} trailing garbage").unwrap();
+        fixture.append(&path, &[total("2026-09-08T01:00:02Z", 100, 10)]);
+        let stats = fixture.stats("all", None);
+        assert_eq!(stats.totals.total_tokens, 110);
+        assert_eq!(stats.coverage.warnings.len(), 1);
+        assert!(stats.coverage.warnings[0].contains("1 行日志无法解析"));
+    }
+
+    #[test]
+    fn partially_written_large_record_retries_then_counts_once_when_completed() {
+        let mut fixture = Fixture::new();
+        let path = fixture.write(
+            "sessions/one.jsonl",
+            &[
+                meta("one", "2026-09-08T01:00:00Z", None),
+                context("gpt-5.4"),
+                total("2026-09-08T01:00:01Z", 100, 10),
+            ],
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(
+            file,
+            "{{\"ignored\":\"{}",
+            "x".repeat(2 * 1024 * 1024 + 100)
+        )
+        .unwrap();
+        let pending = fixture.stats("all", None);
+        assert_eq!(pending.totals.total_tokens, 110);
+        assert_eq!(pending.coverage.warnings.len(), 1);
+        assert!(pending.coverage.warnings[0].contains("仍在写入"));
+        let event = total("2026-09-08T01:00:02Z", 200, 20).to_string();
+        // A complete final record is valid even before its newline is written.
+        write!(file, "\",{}", &event[1..]).unwrap();
+        let complete = fixture.stats("all", None);
+        assert_eq!(complete.totals.total_tokens, 220);
+        assert!(complete.coverage.warnings.is_empty());
+        writeln!(file).unwrap();
+        fixture.append(&path, &[total("2026-09-08T01:00:03Z", 300, 30)]);
+        assert_eq!(fixture.stats("all", None).totals.total_tokens, 330);
+    }
+
+    #[test]
+    fn streaming_line_boundaries_accept_escaped_content_and_large_blank_lines() {
+        let huge = "\\\"中文\n".repeat(300_000);
+        let mut event = total("2026-09-08T01:00:01Z", 100, 10);
+        event["unknown"] = json!(huge);
+        let text = format!("{}\n{event}\n", " ".repeat(2 * 1024 * 1024 + 10));
+        let mut reader = BufReader::with_capacity(127, text.as_bytes());
+        let blank = read_log_record(&mut reader).unwrap();
+        assert!(blank.record.unwrap().is_none());
+        assert!(blank.terminated);
+        let record = read_log_record(&mut reader).unwrap();
+        assert_eq!(record.record.unwrap().unwrap().payload.kind, "token_count");
+        assert!(record.terminated);
+        assert_eq!(blank.consumed + record.consumed, text.len() as u64);
+        assert_eq!(read_log_record(&mut reader).unwrap().consumed, 0);
+    }
+
+    #[test]
+    fn scan_budget_resumes_after_large_record_without_skipping_its_tokens() {
+        let fixture = Fixture::new();
+        let mut large = total("2026-09-08T01:00:01Z", 100, 10);
+        large["unknown"] = json!("x".repeat(2 * 1024 * 1024 + 10));
+        let path = fixture.write(
+            "sessions/one.jsonl",
+            &[
+                meta("one", "2026-09-08T01:00:00Z", None),
+                large,
+                total("2026-09-08T01:00:02Z", 150, 15),
+            ],
+        );
+        // Scan budgets stop between records, even if one large record crosses
+        // the remaining budget. Its completed token event must be retained.
+        let mut budget = MAX_BUFFERED_LINE_BYTES as u64;
+        let partial = parse_file(&path, None, false, &mut budget).unwrap();
+        assert!(!partial.complete);
+        assert_eq!(partial.parsed.events.len(), 1);
+        assert_eq!(budget, 0);
+        let mut budget = MAX_SCAN_BYTES;
+        let complete = parse_file(&path, Some(partial), false, &mut budget).unwrap();
+        assert!(complete.complete);
+        assert_eq!(complete.parsed.events.len(), 2);
+        assert!(complete.parsed.issues.malformed_lines == 0);
     }
 
     #[test]

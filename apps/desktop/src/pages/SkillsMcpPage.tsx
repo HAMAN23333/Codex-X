@@ -1,5 +1,4 @@
 import { useId, useState } from "react";
-import type { ChangeEvent, RefObject } from "react";
 import {
   AlertCircle,
   Blocks,
@@ -32,14 +31,14 @@ export type SkillsMcpPageProps = {
   noteBusyKey: string;
   importOpen: boolean;
   importPreview: SkillsMcpImportPreview | null;
-  zipInputRef: RefObject<HTMLInputElement>;
   className?: string;
   onTabChange: (tab: SkillsMcpTab) => void;
   onLoad: MaybeAsyncAction;
   onOpenImportPreview: MaybeAsyncAction;
   onCloseImportPreview: () => void;
   onConfirmImport: MaybeAsyncAction;
-  onInstallZip: (file?: File | null) => void | Promise<void>;
+  onInstallZip: MaybeAsyncAction;
+  onExport: (kind: SkillsMcpTab) => void | Promise<void>;
   onCheckUpdates: MaybeAsyncAction;
   onToggleSkill: (id: string, enabled: boolean) => void | Promise<void>;
   onToggleMcp: (id: string, enabled: boolean) => void | Promise<void>;
@@ -63,7 +62,9 @@ function getCopy(lang: Lang) {
         description: "管理 Codex 当前可用的 Skills 与 MCP，导入已有内容、安装技能包并控制启用状态。",
         refresh: "刷新",
         importExisting: "导入已有",
-        installZip: "从 ZIP 安装",
+        installZip: "从 ZIP 导入",
+        exportZip: "导出 ZIP",
+        exportHint: "导出当前标签页的全部内容，可通过 ZIP 再次导入；MCP 包可能包含连接密钥，请妥善保存。",
         checkUpdates: "检查更新",
         loading: "正在读取本地 Skills / MCP...",
         mcpHelp: (count: number) => `当前共有 ${count} 个 MCP，启用后会写入 Codex config.toml。`,
@@ -102,7 +103,9 @@ function getCopy(lang: Lang) {
         description: "Manage the Skills and MCP servers available to Codex, import existing items, install packages, and control their state.",
         refresh: "Refresh",
         importExisting: "Import existing",
-        installZip: "Install ZIP",
+        installZip: "Import ZIP",
+        exportZip: "Export ZIP",
+        exportHint: "Export all items in this tab for ZIP import. MCP archives may contain connection credentials; keep them private.",
         checkUpdates: "Check updates",
         loading: "Loading local Skills / MCP...",
         mcpHelp: (count: number) => `${count} MCP server(s). Enabling one writes it to Codex config.toml.`,
@@ -311,7 +314,6 @@ export function SkillsMcpPage({
   noteBusyKey,
   importOpen,
   importPreview,
-  zipInputRef,
   className,
   onTabChange,
   onLoad,
@@ -319,6 +321,7 @@ export function SkillsMcpPage({
   onCloseImportPreview,
   onConfirmImport,
   onInstallZip,
+  onExport,
   onCheckUpdates,
   onToggleSkill,
   onToggleMcp,
@@ -350,9 +353,6 @@ export function SkillsMcpPage({
       setNoteTarget(null);
     }
   };
-  const handleZipChange = (event: ChangeEvent<HTMLInputElement>) => {
-    void onInstallZip(event.currentTarget.files?.[0]);
-  };
 
   return (
     <section className={cx("cx-skills-page", className)} aria-label={copy.title}>
@@ -363,16 +363,6 @@ export function SkillsMcpPage({
           <span>{copy.description}</span>
         </div>
         <div className="cx-skills-actions">
-          <input
-            ref={zipInputRef}
-            className="cx-skills-file-input"
-            type="file"
-            accept=".zip,application/zip"
-            onChange={handleZipChange}
-            disabled={anyBusy}
-            tabIndex={-1}
-            aria-hidden="true"
-          />
           <Button
             variant="secondary"
             icon={actionBusy === "loadSkillsMcp" ? <Loader2 className="cx-skills-spin" /> : <RefreshCw />}
@@ -392,7 +382,7 @@ export function SkillsMcpPage({
           <Button
             variant="secondary"
             icon={actionBusy === "installSkillZip" ? <Loader2 className="cx-skills-spin" /> : <Upload />}
-            onClick={() => zipInputRef.current?.click()}
+            onClick={() => run(onInstallZip)}
             disabled={anyBusy}
           >
             {copy.installZip}
@@ -456,7 +446,12 @@ export function SkillsMcpPage({
                   {activeTab === "mcp" ? <PlugZap size={17} aria-hidden="true" /> : <PackageOpen size={17} aria-hidden="true" />}
                   <h3>{activeTab === "mcp" ? "MCP" : "Skills"}</h3>
                 </div>
-                <span>{copy.total(activeItems.length)}</span>
+                <div className="cx-skills-list-tools">
+                  <span>{copy.total(activeItems.length)}</span>
+                  <Button variant="ghost" size="sm" icon={actionBusy === "exportSkillsMcp" ? <Loader2 className="cx-skills-spin" /> : <Download />}
+                    title={copy.exportHint} disabled={anyBusy || activeItems.length === 0}
+                    onClick={() => void onExport(activeTab)}>{copy.exportZip}</Button>
+                </div>
               </div>
 
               <div className="cx-skills-list">

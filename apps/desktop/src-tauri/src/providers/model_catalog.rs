@@ -22,6 +22,9 @@ const CATALOG_DIRECTORY: &str = "model-catalogs";
 const CATALOG_FIELD: &str = "model_catalog_json";
 const OWNERSHIP_FIELD: &str = "_codex_x_model_catalog";
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
+const REASONING_EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 const BASE_INSTRUCTIONS: &str = "You are a coding assistant working with the user in a shared workspace. Use the available tools to inspect and edit project files, follow the user's requirements, and verify your changes.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,14 +111,15 @@ fn model_entry(mapping: &ProviderModelMapping, priority: usize, default_context:
     // Schema: openai/codex rust-v0.153.4, protocol/src/openai_models.rs,
     // ModelInfo + ModelsResponse. Keep legacy required fields for older Codex.
     // Unlike cloning a GPT cache entry, this does not import proprietary model
-    // instructions, hosted tools, service tiers, vision, or reasoning promises.
+    // instructions, hosted tools, service tiers or vision. Expose the same effort
+    // menu for mapped models; the upstream API determines each effort's effect.
     json!({
         "slug": mapping.model,
         "display_name": mapping.display_name,
         "description": mapping.display_name,
         "base_instructions": BASE_INSTRUCTIONS,
-        "default_reasoning_level": null,
-        "supported_reasoning_levels": [],
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": REASONING_EFFORTS.iter().map(|effort| json!({"effort": effort, "description": if *effort == "none" { "Disable thinking".to_owned() } else { format!("{effort} reasoning effort") }})).collect::<Vec<_>>(),
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
@@ -124,7 +128,8 @@ fn model_entry(mapping: &ProviderModelMapping, priority: usize, default_context:
         "service_tiers": [],
         "availability_nux": null,
         "upgrade": null,
-        "supports_reasoning_summaries": false,
+        // Older Codex gates the entire reasoning object (including effort) here.
+        "supports_reasoning_summaries": true,
         "supports_reasoning_summary_parameter": false,
         "default_reasoning_summary": "none",
         "support_verbosity": false,
@@ -139,7 +144,8 @@ fn model_entry(mapping: &ProviderModelMapping, priority: usize, default_context:
         "experimental_supported_tools": [],
         "input_modalities": ["text"],
         "supports_search_tool": false,
-        "use_responses_lite": false
+        "use_responses_lite": false,
+        "prefer_websockets": false
     })
 }
 
@@ -402,6 +408,59 @@ mod tests {
     }
     fn catalog(doc: &DocumentMut) -> Value {
         serde_json::from_slice(&fs::read(path(doc)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn every_mapped_model_has_the_complete_effort_menu_without_extra_settings() {
+        for id in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "vendor/custom-model",
+            "gpt-5.5",
+        ] {
+            let entry = model_entry(&mapping(id, id, None), 0, 128000);
+            let levels: Vec<_> = entry["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level["effort"].as_str().unwrap())
+                .collect();
+            assert_eq!(levels, REASONING_EFFORTS);
+            assert_eq!(entry["default_reasoning_level"], "high");
+            assert_eq!(entry["supports_reasoning_summaries"], true);
+            assert_eq!(entry["supports_reasoning_summary_parameter"], false);
+            assert_eq!(entry["default_reasoning_summary"], "none");
+            assert_eq!(entry["prefer_websockets"], false);
+            assert!(!entry.to_string().contains("Maps to"));
+        }
+    }
+
+    #[test]
+    fn older_saved_rows_need_no_additional_reasoning_configuration() {
+        let fixture = Fixture::new();
+        for payload in [
+            json!({"model":"custom-model"}),
+            json!({"model":"custom-model","reasoningEfforts":[]}),
+        ] {
+            let row: ProviderModelMapping = serde_json::from_value(payload).unwrap();
+            let mut doc = DocumentMut::new();
+            prepare_model_catalog(&fixture.0, "provider", &[row], "custom-model", &mut doc)
+                .unwrap();
+            let generated = catalog(&doc);
+            assert_eq!(
+                generated["models"][0]["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                8
+            );
+            assert_eq!(
+                generated["models"][0]["supported_reasoning_levels"][0]["effort"],
+                "none"
+            );
+            assert_eq!(generated["models"][0]["default_reasoning_level"], "high");
+        }
     }
 
     #[test]

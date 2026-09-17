@@ -136,6 +136,10 @@
   white-space: nowrap;
 }
 
+.cx-skills-list-tools { display: flex; align-items: center; gap: 12px; }
+.cx-skills-list-tools > span { color: var(--cx-tool-muted); font-size: 12px; }
+.cx-skills-list-tools .ui-button { min-height: 30px; padding: 4px 9px; font-size: 12px; box-shadow: none; }
+
 .cx-skills-spin,
 .cx-prompts-spin {
   animation: cx-tool-spin 0.8s linear infinite;

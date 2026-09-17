@@ -1,4 +1,4 @@
-import { createContext, useContext, useId, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   CheckCircle2,
@@ -112,6 +112,8 @@ export type SettingsPageProps = {
   onRestartCodex: () => Promise<boolean>;
   recheckBusy?: boolean;
   restartBusy?: boolean;
+  generalRequest?: number;
+  configHealthStatus?: ReactNode;
 };
 
 // PageTransition keeps the previous content during its exit animation. Context
@@ -156,8 +158,11 @@ export function SettingsPage({
   onRestartCodex,
   recheckBusy = false,
   restartBusy = false,
+  generalRequest = 0,
+  configHealthStatus,
 }: SettingsPageProps) {
   const [tab, setTab] = useState<"general" | "usage">("general");
+  useEffect(() => { setTab("general"); }, [generalRequest]);
   const [usageOpened, setUsageOpened] = useState(false);
   const tabId = useId();
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -227,6 +232,8 @@ export function SettingsPage({
               title={copy.recheckTitle}
               description={copy.recheckDescription}
               action={(
+                <div className="cx-settings-check-actions">
+                  {configHealthStatus}
                 <button
                   type="button"
                   className="cx-page-button cx-page-button--secondary"
@@ -236,6 +243,7 @@ export function SettingsPage({
                   {recheckBusy && <Loader2 size={15} className="cx-page-spin" aria-hidden="true" />}
                   {copy.recheckLabel}
                 </button>
+                </div>
               )}
             />
 

@@ -1,12 +1,10 @@
 use super::build_skills_mcp_state_inner;
 use super::types::{CcSwitchSkillMeta, ManagedSkill, SkillsMcpActionResult, SkillsMcpState};
 use crate::ccswitch::default_ccswitch_db_path;
-use crate::constants::MAX_SKILL_ZIP_BYTES;
 use crate::error::{CodexxError, Result};
 use crate::file_io::{ensure_directory, io_err, read_to_string_if_exists};
 use crate::paths::app_home;
 use crate::{now_rfc3339, open_db, resolve_codex_dir};
-use chrono::Local;
 use rusqlite::{params, Connection, OpenFlags};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -101,8 +99,15 @@ fn compute_dir_hash(dir: &Path) -> Result<String> {
             .replace('\\', "/");
         hasher.update(rel.as_bytes());
         hasher.update(b"\0");
-        let bytes = fs::read(&path).map_err(|e| io_err(&path, e))?;
-        hasher.update(&bytes);
+        let mut file = fs::File::open(&path).map_err(|e| io_err(&path, e))?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let size = file.read(&mut buffer).map_err(|e| io_err(&path, e))?;
+            if size == 0 {
+                break;
+            }
+            hasher.update(&buffer[..size]);
+        }
         hasher.update(b"\0");
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -338,83 +343,7 @@ pub(crate) fn install_skill_zip_inner(
     file_name: String,
     bytes: Vec<u8>,
 ) -> Result<SkillsMcpActionResult> {
-    let codex_dir = resolve_codex_dir(config_dir.clone())?;
-    let skills_dir = codex_skills_dir(&codex_dir);
-    ensure_directory(&skills_dir)?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| CodexxError::Config(format!("读取 ZIP 失败: {e}")))?;
-    let tmp = app_home()?
-        .join("tmp")
-        .join(format!("skill-zip-{}", Local::now().timestamp_millis()));
-    ensure_directory(&tmp)?;
-    let install_result = (|| -> Result<usize> {
-        let mut total_size = 0u64;
-        for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| CodexxError::Config(format!("读取 ZIP 条目失败: {e}")))?;
-            let Some(path) = file.enclosed_name().map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            total_size += file.size();
-            if total_size > MAX_SKILL_ZIP_BYTES {
-                return Err(CodexxError::Config("ZIP 解压后超过 20MB".to_string()));
-            }
-            let out = tmp.join(path);
-            if file.name().ends_with('/') {
-                ensure_directory(&out)?;
-            } else {
-                if let Some(parent) = out.parent() {
-                    ensure_directory(parent)?;
-                }
-                let mut outfile = fs::File::create(&out).map_err(|e| io_err(&out, e))?;
-                std::io::copy(&mut file, &mut outfile).map_err(|e| io_err(&out, e))?;
-            }
-        }
-
-        let mut skill_dirs = Vec::new();
-        fn find_skill_dirs(current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-            if current.join("SKILL.md").is_file() {
-                out.push(current.to_path_buf());
-                return Ok(());
-            }
-            for entry in fs::read_dir(current).map_err(|e| io_err(current, e))? {
-                let entry = entry.map_err(|e| io_err(current, e))?;
-                let path = entry.path();
-                if path.is_dir() {
-                    find_skill_dirs(&path, out)?;
-                }
-            }
-            Ok(())
-        }
-        find_skill_dirs(&tmp, &mut skill_dirs)?;
-        if skill_dirs.is_empty() {
-            return Err(CodexxError::Config("ZIP 中没有找到 SKILL.md".to_string()));
-        }
-        let mut imported_skills = 0usize;
-        for src in skill_dirs {
-            let fallback = file_name.trim_end_matches(".zip");
-            let dir_name = src.file_name().and_then(|v| v.to_str()).unwrap_or(fallback);
-            let (skill_name, _) = read_skill_metadata(&src, dir_name);
-            let dst_name = sanitize_dir_name(&skill_name, "skill");
-            let dst = skills_dir.join(dst_name);
-            if dst.exists() {
-                fs::remove_dir_all(&dst).map_err(|e| io_err(&dst, e))?;
-            }
-            copy_dir_recursive(&src, &dst)?;
-            imported_skills += 1;
-        }
-        Ok(imported_skills)
-    })();
-    let _ = fs::remove_dir_all(&tmp);
-    let imported_skills = install_result?;
-    let state = build_skills_mcp_state_inner(config_dir)?;
-    Ok(SkillsMcpActionResult {
-        imported_skills,
-        imported_mcp: 0,
-        message: format!("已从 ZIP 安装 {imported_skills} 个 Skill"),
-        state,
-    })
+    super::archive::install_archive_reader(config_dir, file_name, Cursor::new(bytes))
 }
 
 fn ccswitch_skill_meta_by_directory() -> Result<HashMap<String, CcSwitchSkillMeta>> {

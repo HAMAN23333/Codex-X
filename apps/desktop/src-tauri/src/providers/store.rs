@@ -781,6 +781,7 @@ fn sync_provider_toml_from_fields(provider: &mut SavedProvider) -> Result<()> {
             CodexxError::Config(format!("供应商 TOML 缺少 [model_providers.{provider_id}]"))
         })?;
     table["name"] = value(provider.provider_name.clone());
+    super::transport::configure_third_party_transport(table, &provider.base_url, true);
     table["base_url"] = value(provider.base_url.clone());
     table["wire_api"] = value(provider.wire_api.clone());
     table["requires_openai_auth"] = value(provider.requires_openai_auth);

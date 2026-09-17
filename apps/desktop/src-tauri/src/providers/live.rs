@@ -596,8 +596,16 @@ pub(super) fn persist_detected_live_custom_provider(
 }
 
 pub(crate) fn build_provider_toml_draft_inner(
+    provider: SavedProvider,
+    config_dir: Option<String>,
+) -> Result<String> {
+    build_provider_toml_draft_with_origin_inner(provider, config_dir, false)
+}
+
+pub(crate) fn build_provider_toml_draft_with_origin_inner(
     mut provider: SavedProvider,
     config_dir: Option<String>,
+    new_provider: bool,
 ) -> Result<String> {
     if provider.id.trim().is_empty() {
         provider.id = custom_provider_id(&provider.provider_name);
@@ -630,6 +638,11 @@ pub(crate) fn build_provider_toml_draft_inner(
     doc["model"] = value(provider.model.trim());
     let providers = ensure_table(doc.as_table_mut(), "model_providers")?;
     let table = ensure_table(providers, &provider_id)?;
+    super::transport::configure_third_party_transport(
+        table,
+        &provider.base_url,
+        saved_template.is_some() && !new_provider,
+    );
     table["name"] = value(provider.provider_name.trim());
     table["base_url"] = value(provider.base_url.trim().trim_end_matches('/'));
     table["wire_api"] = value(provider.wire_api.trim());
@@ -1055,6 +1068,8 @@ fn merge_provider_toml_into_live(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| experimental_bearer_token_from_doc(&source, Some(source_provider_id.as_str())));
+    let source_base_url = source_provider["base_url"].as_str().unwrap().to_string();
+    super::transport::configure_third_party_transport(&mut source_provider, &source_base_url, true);
     let requires_openai_auth = source_provider
         .get("requires_openai_auth")
         .and_then(|item| item.as_bool())
@@ -1249,6 +1264,7 @@ where
         let providers = ensure_table(root, "model_providers")?;
         providers.remove(live_provider_key);
         let provider_table = ensure_table(providers, live_provider_key)?;
+        super::transport::configure_third_party_transport(provider_table, base_url, false);
         provider_table["name"] = value(provider_name);
         provider_table["base_url"] = value(base_url);
         provider_table["wire_api"] =
@@ -2016,6 +2032,160 @@ command = "docs-server"
         assert!(!draft.contains("sk-b"));
 
         fs::remove_dir_all(codex_dir).expect("remove draft test directory");
+    }
+
+    #[test]
+    fn provider_draft_does_not_inherit_official_websockets() {
+        let dir = active_provider_test_dir("transport-official", 40_021);
+        let official = build_official_config_text(&dir, Some("official-model"), false).unwrap();
+        assert_eq!(
+            official.parse::<DocumentMut>().unwrap()["model_providers"]["custom"]
+                ["supports_websockets"]
+                .as_bool(),
+            Some(true)
+        );
+        fs::write(config_path(&dir), &official).unwrap();
+        let mut target =
+            active_provider_fixture(40_021, "proxy", "My proxy", "model", "fixture-key");
+        target.toml_config = None;
+        let draft =
+            build_provider_toml_draft_inner(target, Some(dir.display().to_string())).unwrap();
+        let draft = draft.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            draft["model_providers"]["custom"]["supports_websockets"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(fs::read_to_string(config_path(&dir)).unwrap(), official);
+        fs::write(config_path(&dir), draft.to_string()).unwrap();
+        let restored = build_official_config_text(&dir, Some("official-model"), false).unwrap();
+        assert_eq!(
+            restored.parse::<DocumentMut>().unwrap()["model_providers"]["custom"]
+                ["supports_websockets"]
+                .as_bool(),
+            Some(true)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provider_draft_preserves_own_websockets_only_until_endpoint_changes() {
+        let dir = active_provider_test_dir("transport-own", 40_022);
+        let mut target =
+            active_provider_fixture(40_022, "proxy", "My proxy", "model", "fixture-key");
+        target
+            .toml_config
+            .as_mut()
+            .unwrap()
+            .push_str("supports_websockets = true\nrequest_max_retries = 7\n");
+        let render = |provider| {
+            build_provider_toml_draft_inner(provider, Some(dir.display().to_string()))
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap()
+        };
+        let unchanged = render(target.clone());
+        assert_eq!(
+            unchanged["model_providers"]["custom"]["supports_websockets"].as_bool(),
+            Some(true)
+        );
+        target.base_url = "https://new-endpoint.example/v1".into();
+        let changed = render(target);
+        assert_eq!(
+            changed["model_providers"]["custom"]["supports_websockets"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            changed["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(7)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_provider_template_keeps_common_settings_without_reusing_websocket_capability() {
+        let dir = active_provider_test_dir("transport-new-origin", 40_024);
+        let mut target =
+            active_provider_fixture(40_024, "proxy", "My proxy", "model", "fixture-key");
+        target.toml_config.as_mut().unwrap().push_str("supports_websockets = true\nrequest_max_retries = 7\n[mcp_servers.docs]\ncommand = 'fixture-mcp'\n");
+        for (new_provider, expected) in [(true, false), (false, true)] {
+            let draft = build_provider_toml_draft_with_origin_inner(
+                target.clone(),
+                Some(dir.display().to_string()),
+                new_provider,
+            )
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+            assert_eq!(
+                draft["model_providers"]["custom"]["supports_websockets"].as_bool(),
+                Some(expected)
+            );
+            assert_eq!(
+                draft["model_providers"]["custom"]["request_max_retries"].as_integer(),
+                Some(7)
+            );
+            assert_eq!(
+                draft["mcp_servers"]["docs"]["command"].as_str(),
+                Some("fixture-mcp")
+            );
+        }
+        assert!(!config_path(&dir).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_deepseek_template_activates_without_websocket_retries() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = active_provider_test_dir("transport-legacy", 40_023);
+        let mut target = active_provider_fixture(
+            40_023,
+            "old-deepseek",
+            "DeepSeek",
+            "deepseek-chat",
+            "fixture-key",
+        );
+        target.base_url = "https://api.deepseek.com".into();
+        target.toml_config = Some("model_provider='custom'\nmodel='deepseek-chat'\n[model_providers.custom]\nname='DeepSeek'\nbase_url='https://api.deepseek.com'\nwire_api='responses'\nrequires_openai_auth=false\nsupports_websockets=true\nrequest_max_retries=7\n".into());
+        // Feed a pre-fix record directly through the activation path, bypassing
+        // save normalization that would already correct this historical value.
+        apply_saved_provider_locked(&target, &dir, None).unwrap();
+        let doc = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc["model_providers"]["custom"]["supports_websockets"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(7)
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://api.deepseek.com")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_toml_activation_preserves_proxy_ws_but_corrects_deepseek_ws() {
+        for (endpoint, expected) in [
+            ("https://proxy.example/v1", true),
+            ("https://api.deepseek.com/v1", false),
+        ] {
+            let source = format!("model_provider='saved'\nmodel='some-model'\n[model_providers.saved]\nname='My API'\nbase_url='{endpoint}'\nsupports_websockets=true\nrequest_max_retries=7\n");
+            let (doc, _) =
+                merge_provider_toml_into_live(Path::new("config.toml"), "", &source, None).unwrap();
+            assert_eq!(
+                doc["model_providers"]["custom"]["supports_websockets"].as_bool(),
+                Some(expected)
+            );
+            assert_eq!(
+                doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
+                Some(7)
+            );
+        }
     }
 
     fn write_active_provider_files(codex_dir: &Path, provider: &SavedProvider) -> Value {

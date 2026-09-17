@@ -21,6 +21,28 @@
   let pauseUsage = false;
   let quotaMode = "dual";
   let resetCreditsMode = "available";
+  let configHealthMode = new URLSearchParams(location.search).get("health") || "healthy";
+  let configStateError = new URLSearchParams(location.search).has("stateError");
+  let transferMode = "success";
+  let lastTransfer = null;
+  let existingImportAvailable = true;
+  const fixtureSkill = (id, name, enabled = true) => ({ id, name, description: "Fixture skill", note: "合成测试备注", directory: id, enabled, source: "Codex", path: `${codexDir}/skills/${id}`, contentHash: null, updateStatus: "未检查" });
+  const fixtureMcp = (id, name, enabled = true) => ({ id, name, enabled, transport: "stdio", source: "Codex", note: "合成测试备注", summary: "npx fixture-tools", command: "npx", url: null, configJson: { command: "npx", args: ["fixture-tools"] } });
+  const transferState = { codexDir, codexSkillsDir: `${codexDir}/skills`, disabledSkillsDir: `${codexDir}/disabled-skills`, skills: [fixtureSkill("writing", "写作助手")], mcpServers: [fixtureMcp("docs", "项目文档")], warnings: [] };
+  const fixtureSessions = ["项目排错记录", "功能设计讨论"].map((title, index) => ({ id: `fixture-session-${index + 1}`, title, modelProvider: "custom", model: "fixture-model", cwd: "/fixture/project", rolloutPath: `${codexDir}/sessions/fixture-${index}.jsonl`, updatedAtMs: Date.now() - index * 60000, archived: false, hasUserEvent: true, isSubagent: false, needsSync: false }));
+
+  function healthReport() {
+    const broken = configHealthMode !== "healthy";
+    const manual = configHealthMode === "syntax";
+    return {
+      codexDir, fingerprint: `fixture-health-${configHealthMode}`,
+      status: broken ? "issues" : "healthy", checkedAt: new Date().toISOString(),
+      canRepair: broken && !manual,
+      issues: !broken ? [] : [{ code: manual ? "syntax" : "missing-provider", title: manual ? "配置文件格式不正确" : "旧会话的供应商配置缺失",
+        description: manual ? "配置文件第 4 行附近的格式不正确，需要手动检查。" : "部分旧会话仍在使用 my_codex，但配置中已找不到这条供应商。", repairable: !manual }],
+      repairSummary: broken && !manual ? ["为 my_codex 补齐配置，继续使用当前供应商 Fixture Saved Provider。", "修复前自动备份现有配置。"] : [],
+    };
+  }
 
   function officialToml(model) {
     return `model_provider = "openai"\nmodel = ${JSON.stringify(model || "fixture-official-model")}\n`;
@@ -207,12 +229,18 @@
   }
 
   localStorage.setItem("codexx.lang", "zh");
-  localStorage.setItem("codexx.startupWizardSeen", "1");
+  const firstRunFixture = new URLSearchParams(location.search).has("firstRun");
+  if (firstRunFixture && sessionStorage.getItem("codexx.fixture.firstRunStarted") !== "1") {
+    localStorage.removeItem("codexx.startupWizardSeen");
+    sessionStorage.setItem("codexx.fixture.firstRunStarted", "1");
+  } else if (!firstRunFixture) localStorage.setItem("codexx.startupWizardSeen", "1");
   localStorage.removeItem("codexx.activeProviderId");
   localStorage.removeItem("codexx.promptCategories.v1");
 
   function snapshot() {
     return {
+      startupWizardSeen: localStorage.getItem("codexx.startupWizardSeen"),
+      transferMode, lastTransfer,
       pendingSync: pending.sync.length,
       pendingDetail: pending.detail.length,
       pendingQuota: pending.quota.length,
@@ -679,7 +707,19 @@
 
   async function dispatch(command, args) {
     switch (command) {
-      case "get_codex_state": return clone(state);
+      case "check_codex_config": return healthReport();
+      case "repair_codex_config": {
+        if (args.expectedFingerprint !== healthReport().fingerprint) throw new Error("配置已变更，请重新检查。");
+        if (!healthReport().canRepair) throw new Error("此配置需要手动检查。");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        configHealthMode = "healthy";
+        configStateError = false;
+        return { report: healthReport(), changed: true, backupId: "fixture-backup" };
+      }
+      case "open_codex_config_file": return null;
+      case "get_codex_state":
+        if (configStateError) throw new Error("Fixture：Codex 无法加载配置，Model provider my_codex not found。");
+        return clone(state);
       case "list_saved_providers": return clone(savedProviders);
       case "list_saved_prompts": return clone(savedPrompts);
       case "get_builtin_prompt_status": return clone(statuses);
@@ -707,9 +747,18 @@
         projectUrl: "https://project.example.test/", githubRepo: "fixture/example",
         nativeUpdaterSupported: false,
       };
-      case "get_startup_diagnostics": return {
-        codexDir, needsManualSelect: false, summary: "Fixture ready", items: [],
-      };
+      case "get_startup_diagnostics": {
+        if (new URLSearchParams(location.search).has("environmentError")) throw new Error("Fixture: environment check unavailable");
+        return {
+          codexDir, needsManualSelect: false, summary: "Fixture ready",
+          items: [
+            { key: "home", label: "Codex 配置目录", status: "ok", message: "已找到", path: codexDir },
+            { key: "config", label: "配置文件", status: "ok", message: "已找到", path: `${codexDir}/config.toml` },
+            { key: "auth", label: "登录信息", status: "ok", message: "已找到", path: `${codexDir}/auth.json` },
+            { key: "sessions", label: "会话记录", status: "ok", message: "已找到", path: `${codexDir}/state_5.sqlite` },
+          ],
+        };
+      }
       case "check_app_update": return {
         latestVersion: "0.3.15", htmlUrl: "https://releases.example.test/", hasUpdate: false,
       };
@@ -796,15 +845,34 @@
       case "test_provider_connection": return { ok: true, status: 200, message: "Fixture connection OK", durationMs: 1 };
       case "fetch_provider_models": return { models: [{ id: "fixture-model-a" }, { id: "fixture-model-b" }], status: 200, durationMs: 1 };
       case "get_session_sync_status": return {
-        codexDir, targetProvider: state.modelProvider, rolloutFiles: 0, sessionMetaCount: 0,
-        mismatchedRollouts: 0, mismatchedSessionMeta: 0, sqliteDbs: 1, sqliteThreads: 0,
-        topLevelThreads: 0, subagentThreads: 0, mismatchedThreads: 0, mismatchedSessions: 0,
-        needsSync: false, scanComplete: true, scanFailures: [], warnings: [], sessions: [],
+        codexDir, targetProvider: state.modelProvider, rolloutFiles: 2, sessionMetaCount: 2,
+        mismatchedRollouts: 0, mismatchedSessionMeta: 0, sqliteDbs: 1, sqliteThreads: 2,
+        topLevelThreads: 2, subagentThreads: 0, mismatchedThreads: 0, mismatchedSessions: 0,
+        needsSync: false, scanComplete: true, scanFailures: [], warnings: [], sessions: clone(fixtureSessions),
       };
-      case "get_skills_mcp_state": return {
-        codexDir, codexSkillsDir: `${codexDir}/skills`, disabledSkillsDir: `${codexDir}/disabled-skills`,
-        skills: [], mcpServers: [], warnings: [],
-      };
+      case "get_skills_mcp_state": return clone(transferState);
+      case "preview_existing_skills_mcp": return existingImportAvailable
+        ? { skills: [fixtureSkill("research", "资料整理")], mcpServers: [fixtureMcp("files", "本地文件"), fixtureMcp("search", "网页检索")], warnings: ["Fixture：一条无效配置已跳过。"] }
+        : { skills: [], mcpServers: [], warnings: [] };
+      case "import_existing_skills_mcp":
+        if (existingImportAvailable) {
+          transferState.skills.push(fixtureSkill("research", "资料整理"));
+          transferState.mcpServers.push(fixtureMcp("files", "本地文件"), fixtureMcp("search", "网页检索"));
+          existingImportAvailable = false;
+          return { importedSkills: 1, importedMcp: 2, message: "已导入 1 个 Skill、2 个 MCP", state: clone(transferState) };
+        }
+        return { importedSkills: 0, importedMcp: 0, message: "没有需要新导入的内容", state: clone(transferState) };
+      case "export_codex_sessions":
+      case "export_skills_mcp_archive":
+      case "import_skills_mcp_archive": {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        if (transferMode === "cancel") return null;
+        if (transferMode === "error") throw new Error("Fixture：无法写入所选位置，请选择其他位置。");
+        lastTransfer = { command, kind: args.kind || null, sessionIds: args.sessionIds || null };
+        if (command === "export_codex_sessions") return { path: `/fixture/exports/${args.suggestedName}.${args.sessionIds.length === 1 ? "md" : "zip"}`, exportedSessions: args.sessionIds.length, failedSessions: 0, warnings: [] };
+        if (command === "export_skills_mcp_archive") return { path: `/fixture/exports/${args.kind}.zip`, exportedSkills: args.kind === "skills" ? transferState.skills.length : 0, exportedMcp: args.kind === "mcp" ? transferState.mcpServers.length : 0 };
+        return { importedSkills: 0, importedMcp: 0, message: "内容已存在，无需重复导入", state: clone(transferState) };
+      }
       case "open_url": return undefined;
       default: throw new Error(`Fixture has no handler for command: ${command}`);
     }
@@ -852,6 +920,18 @@
     panel.append(panelBody);
     const controls = document.createElement("div");
     controls.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin-top:6px";
+    const transferSelect = document.createElement("select");
+    transferSelect.setAttribute("aria-label", "Fixture：文件操作");
+    for (const [value, label] of [["success", "文件操作成功"], ["cancel", "取消文件选择"], ["error", "文件操作失败"]]) {
+      const option = document.createElement("option"); option.value = value; option.textContent = label; transferSelect.append(option);
+    }
+    transferSelect.addEventListener("change", () => { transferMode = transferSelect.value; render(); }); controls.append(transferSelect);
+    for (const [text, mode] of [["Fixture：配置正常", "healthy"], ["Fixture：缺失供应商配置", "missing"], ["Fixture：配置语法错误", "syntax"]]) {
+      const button = document.createElement("button");
+      button.type = "button"; button.textContent = text;
+      button.addEventListener("click", () => { configHealthMode = mode; window.dispatchEvent(new Event("focus")); });
+      controls.append(button);
+    }
     for (const [text, kind, fail] of [
       ["Fixture：完成模板同步", "sync", false],
       ["Fixture：使模板同步失败", "sync", true],

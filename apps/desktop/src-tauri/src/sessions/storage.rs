@@ -922,6 +922,13 @@ pub(crate) fn sqlite_candidate_paths(codex_dir: &Path) -> Vec<PathBuf> {
     discover_sqlite_databases(codex_dir).active_paths
 }
 
+pub(crate) fn sqlite_candidate_paths_with_timeout(
+    codex_dir: &Path,
+    timeout: Duration,
+) -> Vec<PathBuf> {
+    discover_sqlite_databases_with_busy_timeout(codex_dir, Some(timeout)).active_paths
+}
+
 fn clean_session_title(values: [Option<String>; 3]) -> Option<String> {
     values
         .into_iter()

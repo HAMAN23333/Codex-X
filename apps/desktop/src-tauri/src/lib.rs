@@ -16,6 +16,7 @@ use std::process::Command;
 mod app_db;
 mod backups;
 mod ccswitch;
+mod config_health;
 mod config_migration;
 mod constants;
 mod context_config;
@@ -33,6 +34,7 @@ mod skills_mcp;
 mod sqlite_utils;
 mod state;
 mod toml_utils;
+mod transfers;
 mod updates;
 mod usage;
 
@@ -92,8 +94,8 @@ use providers::{
     upsert_provider_on_connection, CcSwitchCodexRow, ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
-    build_provider_toml_draft_inner, clear_active_provider_on_connection,
-    delete_saved_provider_inner, fetch_provider_models_inner,
+    build_provider_toml_draft_inner, build_provider_toml_draft_with_origin_inner,
+    clear_active_provider_on_connection, delete_saved_provider_inner, fetch_provider_models_inner,
     import_ccswitch_codex_providers_inner, list_saved_providers_inner, open_store,
     read_ccswitch_official_auth_inner, remember_active_provider_on_connection,
     save_active_provider_inner, save_official_config_inner, save_provider_inner,
@@ -533,6 +535,38 @@ async fn get_startup_diagnostics(config_dir: Option<String>) -> Result<StartupDi
 }
 
 #[tauri::command]
+async fn check_codex_config(
+    config_dir: Option<String>,
+) -> Result<config_health::ConfigHealthReport> {
+    tauri::async_runtime::spawn_blocking(move || {
+        config_health::check_codex_config_inner(config_dir)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("检查配置失败，请稍后重试。".to_string()))?
+}
+
+#[tauri::command]
+async fn repair_codex_config(
+    config_dir: Option<String>,
+    expected_fingerprint: String,
+) -> Result<config_health::ConfigHealthRepairResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        config_health::repair_codex_config_inner(config_dir, expected_fingerprint)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("修复配置失败，请稍后重试。".to_string()))?
+}
+
+#[tauri::command]
+async fn open_codex_config_file(config_dir: Option<String>) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        config_health::open_codex_config_file_inner(config_dir)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("打开配置文件失败，请稍后重试。".to_string()))?
+}
+
+#[tauri::command]
 async fn get_session_sync_status(
     config_dir: Option<String>,
     target_provider: Option<String>,
@@ -948,9 +982,14 @@ fn finish_provider_selection(
 async fn build_provider_toml_draft(
     provider: SavedProvider,
     config_dir: Option<String>,
+    new_provider: Option<bool>,
 ) -> Result<String> {
     tauri::async_runtime::spawn_blocking(move || {
-        build_provider_toml_draft_inner(provider, config_dir)
+        if new_provider.unwrap_or(false) {
+            build_provider_toml_draft_with_origin_inner(provider, config_dir, true)
+        } else {
+            build_provider_toml_draft_inner(provider, config_dir)
+        }
     })
     .await
     .map_err(|e| CodexxError::Config(format!("生成供应商 TOML 失败: {e}")))?
@@ -1604,8 +1643,14 @@ pub fn run() {
             toggle_codex_mcp,
             save_skills_mcp_note,
             install_skill_zip,
+            transfers::import_skills_mcp_archive,
+            transfers::export_skills_mcp_archive,
+            transfers::export_codex_sessions,
             check_skill_updates,
             get_startup_diagnostics,
+            check_codex_config,
+            repair_codex_config,
+            open_codex_config_file,
             get_session_sync_status,
             sync_sessions_provider,
             delete_codex_sessions,

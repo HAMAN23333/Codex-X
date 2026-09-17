@@ -27,6 +27,9 @@ import { orderProviderRows } from "./providerRowOrder";
 import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
 import { validateProviderModelMappings } from "./components/ProviderModelMappings";
 import { createOfficialProfileMonitor } from "./officialProfileMonitor";
+import { useConfigHealth } from "./useConfigHealth";
+import { ConfigHealthPanel, ConfigHealthStatus } from "./components/ConfigHealthPanel";
+import { ConfigHealthToast } from "./components/ConfigHealthToast";
 import type {
   AboutInfo,
   ActionResult,
@@ -574,6 +577,7 @@ function buildProviderTomlPreview(provider: SavedProvider) {
     `base_url = "${tomlEscape(baseUrl)}"`,
     `wire_api = "${tomlEscape(wireApi)}"`,
     `requires_openai_auth = ${provider.requiresOpenaiAuth ? "true" : "false"}`,
+    `supports_websockets = false`,
   ].join("\n");
 }
 
@@ -768,6 +772,9 @@ function App() {
   const [skillsMcpImportPreview, setSkillsMcpImportPreview] = React.useState<SkillsMcpImportPreview | null>(null);
   const [skillsMcpImportOpen, setSkillsMcpImportOpen] = React.useState(false);
   const [startupDiagnostics, setStartupDiagnostics] = React.useState<StartupDiagnostics | null>(null);
+  const [startupDiagnosticsError, setStartupDiagnosticsError] = React.useState("");
+  const [startupDiagnosticsLoading, setStartupDiagnosticsLoading] = React.useState(false);
+  const [startupCheckMode, setStartupCheckMode] = React.useState<"startup" | "manual">("startup");
   const [startupWizardOpen, setStartupWizardOpen] = React.useState(() => localStorage.getItem(STARTUP_WIZARD_SEEN_KEY) !== "1");
   const [startupClosing, setStartupClosing] = React.useState(false);
   const [sessionQuery, setSessionQuery] = React.useState("");
@@ -781,6 +788,8 @@ function App() {
   const [state, setState] = React.useState<CodexState | null>(null);
   const [configDir, setConfigDir] = React.useState("");
   const [configDirDraft, setConfigDirDraft] = React.useState("");
+  const [healthConfigDir, setHealthConfigDir] = React.useState("");
+  const [settingsGeneralRequest, setSettingsGeneralRequest] = React.useState(0);
   const [loading, setLoading] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(true);
   const [toast, setToast] = React.useState<string>("");
@@ -809,7 +818,8 @@ function App() {
   const [promptModeHelpOpen, setPromptModeHelpOpen] = React.useState(false);
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
-  const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
+  const nativeTransferBusyRef = React.useRef(false);
+  const [sessionExportBusy, setSessionExportBusy] = React.useState(false);
   const officialAuthEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const officialTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
@@ -1035,6 +1045,7 @@ function App() {
         ...providerForm,
         id: providerForm.id || customProviderId(providerForm.providerName || providerForm.baseUrl),
       },
+      newProvider: creatingProvider,
       configDir: configDir || null,
     })
       .then((draft) => {
@@ -1043,7 +1054,7 @@ function App() {
       .catch(() => {
         if (requestId === providerDraftRequestRef.current) setProviderTomlDraft(fallback);
       });
-  }, [configDir, providerDraftRefreshToken, providerForm, providerMode, providerTomlDirty, providerTomlPreview, state?.configText]);
+  }, [configDir, creatingProvider, providerDraftRefreshToken, providerForm, providerMode, providerTomlDirty, providerTomlPreview, state?.configText]);
 
   React.useEffect(() => {
     if (tab === "provider" && providerMode === "form") return;
@@ -1330,6 +1341,7 @@ function App() {
     skillsMcpLoadedRef.current = "";
     skillsMcpAutoLoadAttemptedRef.current = "";
     const requestedConfigDir = configDirDraft.trim();
+    setHealthConfigDir(requestedConfigDir);
     const resolvedConfigDir = requestedConfigDir || null;
     const activeCodexDir = state?.codexDir || configDir;
     setRefreshing(true);
@@ -1346,13 +1358,24 @@ function App() {
     sessionLoadRequestRef.current += 1;
 
     if (includeDiagnostics) {
+      setStartupDiagnostics(null);
+      setStartupDiagnosticsError("");
+      setStartupDiagnosticsLoading(true);
       void invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir })
         .then((diagnostics) => {
-          if (requestId === refreshRequestRef.current) setStartupDiagnostics(diagnostics);
+          if (requestId === refreshRequestRef.current) {
+            setStartupDiagnostics(diagnostics);
+            setStartupDiagnosticsLoading(false);
+          }
         })
         .catch(() => {
-          if (requestId === refreshRequestRef.current) setStartupDiagnostics(null);
+          if (requestId === refreshRequestRef.current) {
+            setStartupDiagnosticsError("unavailable");
+            setStartupDiagnosticsLoading(false);
+          }
         });
+    } else {
+      setStartupDiagnosticsLoading(false);
     }
 
     void invoke<CodexState>("get_codex_state", { configDir: resolvedConfigDir })
@@ -1374,6 +1397,7 @@ function App() {
         }
         activeConfigDirKeyRef.current = normalizedConfigDirForComparison(next.codexDir);
         setConfigDir(next.codexDir);
+        setHealthConfigDir(next.codexDir);
         setConfigDirDraft(next.codexDir);
         setState(next);
         setRefreshing(false);
@@ -1402,6 +1426,21 @@ function App() {
         setError(String(nextError));
       });
   }, [clearActionBusy, configDir, configDirDraft, invalidatePromptDetail, state?.codexDir]);
+
+  // Independent of get_codex_state: this must still work when a broken TOML
+  // prevents the normal app state from loading. No shared loading flags change.
+  const configHealth = useConfigHealth({
+    configDir: healthConfigDir,
+    canCheck: !refreshing && !loading && !actionBusy
+      && !(tab === "provider" && providerMode !== "list") && tab !== "toml",
+    canNotify: !toast && !error && !startupWizardOpen && !updatePromptOpen
+      && !loading && !refreshing && !actionBusy
+      && !(tab === "provider" && providerMode !== "list") && tab !== "toml",
+    lang,
+    reviewing: startupWizardOpen,
+    onHint: setToast,
+    onRepaired: () => refresh(startupWizardOpen),
+  });
 
   React.useEffect(() => {
     refresh(startupWizardOpen);
@@ -1779,10 +1818,11 @@ function App() {
       async () => {
         let provider = pendingProvider;
         if (!providerTomlDirty) {
-          const draftSource = providerForm.tomlConfig?.trim() || state?.configText?.trim() || "";
+          const draftSource = providerForm.tomlConfig?.trim() || "";
           const providerForDraft = normalizedProviderForm(draftSource);
           const latestDraft = await invoke<string>("build_provider_toml_draft", {
             provider: providerForDraft,
+            newProvider: creatingProvider,
             configDir: configDir || null,
           });
           provider = { ...providerForDraft, tomlConfig: latestDraft.trimEnd() };
@@ -2260,24 +2300,15 @@ function App() {
     }
   };
 
-  const installSkillZipFile = async (file?: File | null) => {
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".zip")) {
-      setError(lang === "zh" ? "请选择 .zip 技能包" : "Please choose a .zip skill package");
-      return;
-    }
-    if (file.size > 20 * 1024 * 1024) {
-      setError(lang === "zh" ? "ZIP 技能包不能超过 20MB" : "Skill ZIP must be smaller than 20MB");
-      return;
-    }
+  const installSkillZipFile = async () => {
+    if (nativeTransferBusyRef.current) return;
+    nativeTransferBusyRef.current = true;
     const request = beginSkillsMcpRequest();
     const actionToken = beginActionBusy("installSkillZip");
     setError("");
     try {
-      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
-      const result = await invoke<SkillsMcpActionResult>("install_skill_zip", { configDir: request.configDir, fileName: file.name, bytes });
-      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      const result = await invoke<SkillsMcpActionResult | null>("import_skills_mcp_archive", { configDir: request.configDir, lang });
+      if (!result || !isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
       skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result.state);
       setToast(result.message);
@@ -2285,7 +2316,54 @@ function App() {
       if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
       endActionBusy(actionToken);
-      if (skillZipImportRef.current) skillZipImportRef.current.value = "";
+      nativeTransferBusyRef.current = false;
+    }
+  };
+
+  const exportSkillsMcp = async (kind: "mcp" | "skills") => {
+    if (nativeTransferBusyRef.current) return;
+    nativeTransferBusyRef.current = true;
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy("exportSkillsMcp");
+    setError("");
+    try {
+      const result = await invoke<{ path: string; exportedSkills: number; exportedMcp: number } | null>("export_skills_mcp_archive", { configDir: request.configDir, kind, lang });
+      if (!result || !isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      const count = kind === "mcp" ? result.exportedMcp : result.exportedSkills;
+      setToast(lang === "zh" ? `已导出 ${count} 个 ${kind === "mcp" ? "MCP" : "Skills"}` : `Exported ${count} ${kind === "mcp" ? "MCP servers" : "Skills"}`);
+    } catch (e) {
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
+    } finally {
+      endActionBusy(actionToken);
+      nativeTransferBusyRef.current = false;
+    }
+  };
+
+  const exportSessions = async (ids: string[]) => {
+    if (!ids.length || nativeTransferBusyRef.current) return;
+    nativeTransferBusyRef.current = true;
+    setSessionExportBusy(true);
+    const directory = configDir;
+    const directoryKey = normalizedConfigDirForComparison(directory);
+    const generation = refreshRequestRef.current;
+    const isCurrentExport = () => generation === refreshRequestRef.current && activeConfigDirKeyRef.current === directoryKey;
+    const actionToken = beginActionBusy("exportSessions");
+    setError("");
+    try {
+      const suggestedName = ids.length === 1
+        ? sessionStatus?.sessions.find((session) => session.id === ids[0])?.title || "Codex-session"
+        : `Codex-sessions-${new Date().toISOString().slice(0, 10)}`;
+      const result = await invoke<{ path: string; exportedSessions: number; failedSessions: number; warnings: string[] } | null>("export_codex_sessions", { configDir: directory || null, sessionIds: ids, suggestedName, lang });
+      if (!result || !isCurrentExport()) return;
+      const message = lang === "zh" ? `已导出 ${result.exportedSessions} 个会话` : `Exported ${result.exportedSessions} conversation(s)`;
+      if (result.failedSessions || result.warnings.length) setError(`${message}；${result.warnings.join("；")}`);
+      else setToast(message);
+    } catch (e) {
+      if (isCurrentExport()) setError(String(e));
+    } finally {
+      endActionBusy(actionToken);
+      setSessionExportBusy(false);
+      nativeTransferBusyRef.current = false;
     }
   };
 
@@ -2710,7 +2788,7 @@ function App() {
   };
 
   const closeStartupWizard = () => {
-    localStorage.setItem(STARTUP_WIZARD_SEEN_KEY, "1");
+    if (startupCheckMode === "startup") localStorage.setItem(STARTUP_WIZARD_SEEN_KEY, "1");
     setStartupClosing(true);
     window.setTimeout(() => {
       setStartupWizardOpen(false);
@@ -2726,6 +2804,14 @@ function App() {
       clearActionBusy("loadOfficialDraft");
     }
     setTab(nextTab);
+  };
+
+  const openConfigurationChecks = () => {
+    configHealth.dismiss();
+    setStartupCheckMode("manual");
+    setStartupClosing(false);
+    setStartupWizardOpen(true);
+    refresh(true);
   };
 
   return (
@@ -2759,6 +2845,19 @@ function App() {
         onDismissMessage={() => setToast("")}
         onDismissError={() => setError("")}
       />
+      {configHealth.noticeVisible && configHealth.notice && <ConfigHealthToast
+        lang={lang}
+        report={configHealth.notice}
+        repairing={configHealth.repairing}
+        onRepair={() => void configHealth.repair()}
+        onDismiss={() => configHealth.dismiss(true)}
+        onOpenSettings={() => {
+          configHealth.dismiss();
+          setSettingsGeneralRequest((value) => value + 1);
+          changeTab("settings");
+          openConfigurationChecks();
+        }}
+      />}
       <UpdateDialog
         open={updatePromptOpen && Boolean(releaseInfo.hasUpdate)}
         lang={lang}
@@ -2776,11 +2875,25 @@ function App() {
       />
       <StartupWizardDialog
         open={startupWizardOpen}
+        mode={startupCheckMode}
         closing={startupClosing}
         lang={lang}
         diagnostics={startupDiagnostics}
+        diagnosticsError={startupDiagnosticsError ? (lang === "zh" ? "暂时无法读取环境信息，请重新检查。配置检查仍可使用。" : "Environment information is unavailable. Try again; configuration checks remain available.") : ""}
         configDir={configDirDraft}
-        loading={loading || refreshing}
+        loading={loading || refreshing || startupDiagnosticsLoading || configHealth.checking || configHealth.repairing}
+        configHealthPanel={normalizedConfigDirForComparison(configDirDraft.trim()) !== normalizedConfigDirForComparison(healthConfigDir)
+          ? <p className="cx-config-health-note" role="status">{lang === "zh" ? "目录已更改，请先点击「重新检查」查看此目录的配置。" : "The directory has changed. Choose Recheck to review its configuration."}</p>
+          : <ConfigHealthPanel
+          lang={lang}
+          report={configHealth.report}
+          checking={configHealth.checking || loading || refreshing || Boolean(actionBusy)}
+          repairing={configHealth.repairing}
+          error={configHealth.error}
+          onCheck={() => void configHealth.check()}
+          onRepair={() => void configHealth.repair()}
+          onOpenConfig={() => void configHealth.openConfig()}
+        />}
         onConfigDirChange={setConfigDirDraft}
         onRecheck={() => refresh(true)}
         onSkip={closeStartupWizard}
@@ -2990,6 +3103,8 @@ function App() {
                 sessionDeleteConfirmOpen={sessionDeleteConfirmOpen}
                 sessionDeleteBusy={sessionDeleteBusy}
                 sessionDeleteSafetyConfirmed={sessionDeleteSafetyConfirmed}
+                sessionExportBusy={sessionExportBusy}
+                onExportSessions={exportSessions}
                 onCheckSessions={checkSessions}
                 onSyncSessions={syncSessions}
                 onSessionQueryChange={(value) => {
@@ -3023,7 +3138,6 @@ function App() {
                 actionBusy={actionBusy}
                 importOpen={skillsMcpImportOpen}
                 importPreview={skillsMcpImportPreview}
-                zipInputRef={skillZipImportRef}
                 className={tab !== "skillsMcp" ? "page-pane-hidden" : undefined}
                 onTabChange={setSkillsMcpTab}
                 onLoad={loadSkillsMcp}
@@ -3031,6 +3145,7 @@ function App() {
                 onCloseImportPreview={() => setSkillsMcpImportOpen(false)}
                 onConfirmImport={importExistingSkillsMcp}
                 onInstallZip={installSkillZipFile}
+                onExport={exportSkillsMcp}
                 onCheckUpdates={checkSkillUpdatesAction}
                 onToggleSkill={toggleSkillEnabled}
                 onToggleMcp={toggleMcpEnabled}
@@ -3174,6 +3289,14 @@ function App() {
               <SettingsPage
                 lang={lang}
                 configDir={configDir}
+                generalRequest={settingsGeneralRequest}
+                configHealthStatus={<ConfigHealthStatus
+                  lang={lang}
+                  report={configHealth.report}
+                  checking={configHealth.checking || loading || refreshing || Boolean(actionBusy)}
+                  repairing={configHealth.repairing}
+                  error={configHealth.error}
+                />}
                 copy={{
                   eyebrow: "Settings",
                   title: t.settings.title,
@@ -3184,11 +3307,11 @@ function App() {
                   productTitle: t.settings.productName,
                   productDescription: t.settings.productDesc,
                   productValue: "Codex-X",
-                  recheckTitle: lang === "zh" ? "首次启动向导" : "First-run wizard",
+                  recheckTitle: lang === "zh" ? "环境与配置检查" : "Environment & configuration check",
                   recheckDescription: lang === "zh"
-                    ? "重新检测 CODEX_HOME、config.toml、auth.json 和 SQLite 会话库。"
-                    : "Recheck CODEX_HOME, config.toml, auth.json and SQLite session stores.",
-                  recheckLabel: lang === "zh" ? "重新检测" : "Recheck",
+                    ? "查看 Codex 环境与配置状态，按需检查和修复。"
+                    : "Review your Codex environment and configuration, and repair issues when needed.",
+                  recheckLabel: lang === "zh" ? "检查" : "Check",
                   restartTitle: lang === "zh" ? "Codex 桌面客户端" : "Codex desktop app",
                   restartDescription: lang === "zh"
                     ? "重新启动本机的 Codex（ChatGPT）桌面客户端，不会重启 Codex-X。"
@@ -3207,11 +3330,7 @@ function App() {
                 recheckBusy={loading || refreshing}
                 restartBusy={restartCodexBusy}
                 onRestartCodex={restartCodexDesktop}
-                onRecheck={() => {
-                  localStorage.removeItem(STARTUP_WIZARD_SEEN_KEY);
-                  setStartupWizardOpen(true);
-                  refresh(true);
-                }}
+                onRecheck={openConfigurationChecks}
               />
             )}
       </PageTransition>
