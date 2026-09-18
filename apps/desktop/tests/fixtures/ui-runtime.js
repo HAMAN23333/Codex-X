@@ -11,6 +11,7 @@
   const commands = [];
   const pending = { sync: [], detail: [], quota: [], resetCredits: [], usage: [] };
   const callbacks = new Map();
+  const eventListeners = new Map();
   let nextCallback = 1;
   let output;
   let loginButton;
@@ -26,10 +27,25 @@
   let transferMode = "success";
   let lastTransfer = null;
   let existingImportAvailable = true;
+  const defaultRoutingSettings = () => ({ version: 2, routerEnabled: false, takeoverEnabled: false, autoFailoverEnabled: false,
+    listenAddress: "127.0.0.1", listenPort: 15721, providerIds: [], maxRetries: 3, streamingFirstByteTimeout: 60,
+    streamingIdleTimeout: 120, nonStreamingTimeout: 600, circuitFailureThreshold: 4, circuitSuccessThreshold: 2,
+    circuitTimeoutSeconds: 60, circuitErrorRateThreshold: 0.6, circuitMinRequests: 10 });
+  let failoverSettings = defaultRoutingSettings();
+  const resetRoutingHealth = new Set();
+  let failoverMode = "normal";
+  let providerBaseReadFailure = false;
+  const sharedProviderTables = '\n[mcp_servers.fixture_docs]\ncommand = "fixture-docs-server"\n'
+    + '\n[mcp_servers.fixture_docs.env]\nFIXTURE_TIMEOUT = "1000"\n'
+    + '\n[desktop]\nsansFontSize = 14\ncodeFontSize = 13\n'
+    + '\n[marketplaces.fixture]\nsource_type = "local"\nsource = "/fixture/marketplace"\n'
+    + '\n[plugins."browser@fixture"]\nenabled = true\n'
+    + '\n[projects."/fixture/project"]\ntrust_level = "trusted"\n';
   const fixtureSkill = (id, name, enabled = true) => ({ id, name, description: "Fixture skill", note: "合成测试备注", directory: id, enabled, source: "Codex", path: `${codexDir}/skills/${id}`, contentHash: null, updateStatus: "未检查" });
   const fixtureMcp = (id, name, enabled = true) => ({ id, name, enabled, transport: "stdio", source: "Codex", note: "合成测试备注", summary: "npx fixture-tools", command: "npx", url: null, configJson: { command: "npx", args: ["fixture-tools"] } });
   const transferState = { codexDir, codexSkillsDir: `${codexDir}/skills`, disabledSkillsDir: `${codexDir}/disabled-skills`, skills: [fixtureSkill("writing", "写作助手")], mcpServers: [fixtureMcp("docs", "项目文档")], warnings: [] };
   const fixtureSessions = ["项目排错记录", "功能设计讨论"].map((title, index) => ({ id: `fixture-session-${index + 1}`, title, modelProvider: "custom", model: "fixture-model", cwd: "/fixture/project", rolloutPath: `${codexDir}/sessions/fixture-${index}.jsonl`, updatedAtMs: Date.now() - index * 60000, archived: false, hasUserEvent: true, isSubagent: false, needsSync: false }));
+  fixtureSessions.push({ id: "fixture-internal-guardian", title: "The following is the Codex agent history whose request action you are assessing...", modelProvider: "openai", model: "codex-auto-review", cwd: "/fixture/project", rolloutPath: `${codexDir}/sessions/guardian.jsonl`, updatedAtMs: Date.now() - 120000, archived: false, hasUserEvent: false, isSubagent: true, needsSync: false });
 
   function healthReport() {
     const broken = configHealthMode !== "healthy";
@@ -69,7 +85,7 @@
     providerName: "OpenAI Official",
     model: "fixture-official-model",
     authJson: officialAuth("one"),
-    configText: officialToml("fixture-official-model"),
+    configText: officialToml("fixture-official-model") + sharedProviderTables,
     isDefault: true,
   }]]);
 
@@ -134,7 +150,7 @@
   // Visible inherited settings for provider-preset regression checks.
   detectedProvider.tomlConfig = '# fixture inherited settings\nmodel_reasoning_effort = "high"\napproval_policy = "on-request"\n'
     + toml(detectedProvider)
-    + '\n[mcp_servers.fixture_docs]\ncommand = "fixture-docs-server"\n\n[features]\nshell_snapshot = true\n\n[projects."/fixture/project"]\ntrust_level = "trusted"\n';
+    + sharedProviderTables + '\n[features]\nshell_snapshot = true\n';
   let savedProviders = [{
     id: "fixture-saved",
     providerName: "Fixture Saved Provider",
@@ -203,6 +219,7 @@
       && Array.isArray(saved.officialProfiles)
       && saved.officialProfiles.some((profile) => profile.id === defaultOfficialId)) {
       state = saved.state;
+      if (saved.failoverSettings?.version === 2) failoverSettings = { ...defaultRoutingSettings(), ...saved.failoverSettings };
       savedProviders = saved.savedProviders;
       savedPrompts = saved.savedPrompts;
       nextOfficialId = saved.nextOfficialId;
@@ -221,6 +238,7 @@
         savedProviders,
         savedPrompts,
         nextOfficialId,
+        failoverSettings,
         officialProfiles: Array.from(officialProfiles.values()),
       }));
     } catch {
@@ -241,6 +259,7 @@
     return {
       startupWizardSeen: localStorage.getItem("codexx.startupWizardSeen"),
       transferMode, lastTransfer,
+      failoverSettings: clone(failoverSettings), failoverMode,
       pendingSync: pending.sync.length,
       pendingDetail: pending.detail.length,
       pendingQuota: pending.quota.length,
@@ -693,6 +712,50 @@
     });
   }
 
+  function emitRoutingChanged() {
+    for (const [eventId, listener] of eventListeners) {
+      if (listener.event === "provider-routing-changed") callbacks.get(listener.handler)?.({ event: listener.event, id: eventId, payload: { codexDir } });
+    }
+  }
+
+  function failoverStatus() {
+    const summary = (provider) => ({ id: provider.id, providerName: provider.providerName, model: provider.model,
+      baseUrl: provider.baseUrl, official: false, models: [...new Set([provider.model, ...(provider.modelMappings || []).map((mapping) => mapping.model)])] });
+    const providers = savedProviders.map((provider) => {
+      const reason = provider.wireApi !== "responses" ? "此供应商暂不支持 Responses 接口" : !provider.apiKey ? "请先填写 API Key" : null;
+      return { ...summary(provider), eligible: !reason, reason };
+    });
+    const profile = state.isOfficialProvider ? officialProfiles.get(state.activeOfficialProfileId || defaultOfficialId) : null;
+    const primary = profile ? { id: `official:${profile.id}`, providerName: profile.providerName, model: profile.model, models: [profile.model],
+      baseUrl: "https://chatgpt.com/codex", official: true, eligible: Boolean(profile.authJson), reason: profile.authJson ? null : "请先登录官方账号" }
+      : providers.find((provider) => provider.id === state.activeSavedProviderId) || null;
+    const running = failoverSettings.routerEnabled;
+    const takeoverActive = Boolean(running && failoverSettings.takeoverEnabled && primary?.eligible);
+    const autoFailoverActive = Boolean(takeoverActive && failoverSettings.autoFailoverEnabled && !primary.official);
+    const routes = !takeoverActive ? [] : autoFailoverActive ? failoverSettings.providerIds.map((id) => providers.find((provider) => provider.id === id)).filter(Boolean) : [primary];
+    const samples = running && ["cooling", "recovering"].includes(failoverMode);
+    const host = failoverSettings.listenAddress === "0.0.0.0" ? "127.0.0.1" : failoverSettings.listenAddress === "::" ? "[::1]" : failoverSettings.listenAddress.includes(":") ? `[${failoverSettings.listenAddress}]` : failoverSettings.listenAddress;
+    return clone({ settings: failoverSettings, running, takeoverActive, autoFailoverActive, address: running ? `http://${host}:${failoverSettings.listenPort}/v1` : null, primary, providers,
+      runtime: { requestCount: samples ? 28 : 0, failoverCount: samples ? 2 : 0, inFlight: 0, successCount: samples ? 26 : 0, failureCount: samples ? 2 : 0,
+        uptimeSeconds: running ? 365 : 0, lastRequestAt: samples ? new Date().toISOString() : null,
+        lastProviderId: samples ? routes.at(-1)?.id || null : null, lastError: null,
+        providers: routes.map((provider, index) => { const state = resetRoutingHealth.has(provider.id) || !samples ? "closed" : index === 0 ? (failoverMode === "recovering" ? "half_open" : "open") : "closed";
+          return { id: provider.id, state, cooldownSeconds: state === "open" ? 25 : 0, lastStatus: state === "closed" ? 200 : 503,
+            consecutiveFailures: state === "open" ? 4 : 0, consecutiveSuccesses: state === "half_open" ? 1 : 0, totalRequests: samples ? 14 : 0, failedRequests: state === "closed" ? 0 : 4 }; }) },
+      message: primary?.official && failoverSettings.autoFailoverEnabled ? "当前为官方登录，仅使用当前账号；自动故障转移暂不运行。" : autoFailoverActive && !routes.length ? "队列为空，请添加 API 供应商。" : null });
+  }
+
+  function seedFailover() {
+    for (const [id, providerName, model] of [["fixture-failover-primary", "主供应商", "gpt-example"], ["fixture-failover-backup-a", "备用一", "gpt-example"], ["fixture-failover-backup-b", "备用二", "gpt-example"], ["fixture-failover-other", "不同模型供应商", "other-model"]]) {
+      saveProvider({ id, providerName, model, apiKey: "sk-fixture-only-failover", baseUrl: `https://${id}.example.test/v1`, wireApi: "responses", requiresOpenaiAuth: false, tomlConfig: "", modelMappings: [] });
+    }
+    switchProvider(savedProviders.find((provider) => provider.id === "fixture-failover-primary"));
+    failoverMode = "normal";
+    failoverSettings = defaultRoutingSettings();
+    resetRoutingHealth.clear();
+    persist(); render(); emitRoutingChanged();
+  }
+
   async function invoke(command, args = {}) {
     counts[command] = (counts[command] || 0) + 1;
     commands.push(command);
@@ -707,6 +770,54 @@
 
   async function dispatch(command, args) {
     switch (command) {
+      case "get_provider_config_base": {
+        if (providerBaseReadFailure) throw new Error("Fixture：无法读取供应商配置底稿");
+        // Model a legacy route-only file with the official integration snapshot
+        // still available. Rust tests cover the actual parser/recovery rules.
+        const config = state.configText.includes("[mcp_servers")
+          ? state.configText : state.configText + sharedProviderTables;
+        return config.replace(/^\s*experimental_bearer_token\s*=.*\n?/gm, "");
+      }
+      case "get_provider_failover":
+        if (failoverMode === "error") throw new Error("Fixture：暂时无法读取运行状态");
+        return failoverStatus();
+      case "save_provider_failover": {
+        if (failoverMode === "save-error") throw new Error("Fixture：设置保存失败，原设置未改变");
+        const next = clone(args.settings);
+        const status = failoverStatus();
+        const ranges = { maxRetries: [0, 10], streamingFirstByteTimeout: [1, 120], streamingIdleTimeout: [0, 600], nonStreamingTimeout: [60, 1200], circuitFailureThreshold: [1, 20], circuitSuccessThreshold: [1, 10], circuitTimeoutSeconds: [0, 300], circuitErrorRateThreshold: [0, 1], circuitMinRequests: [5, 100] };
+        for (const [key, [min, max]] of Object.entries(ranges)) if (!Number.isFinite(next[key]) || next[key] < min || next[key] > max || key !== "circuitErrorRateThreshold" && !Number.isInteger(next[key])) throw new Error(`Fixture：参数 ${key} 超出范围`);
+        if (!Number.isInteger(next.listenPort) || next.listenPort < 1024 || next.listenPort > 65535) throw new Error("Fixture：监听端口无效");
+        const host = next.listenAddress.trim();
+        let validAddress = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) && host.split(".").every((part) => Number(part) <= 255 && String(Number(part)) === part);
+        if (host.includes(":")) { try { validAddress = new URL(`http://[${host}]/`).hostname.startsWith("["); } catch {} }
+        if (host === "localhost") validAddress = true;
+        if (!validAddress) throw new Error("Fixture：监听地址无效");
+        next.listenAddress = host === "localhost" ? "127.0.0.1" : host;
+        if (status.running && (next.listenAddress !== failoverSettings.listenAddress || next.listenPort !== failoverSettings.listenPort)) throw new Error("Fixture：停止路由后再修改监听地址");
+        if (!next.routerEnabled) next.takeoverEnabled = false;
+        if (next.takeoverEnabled && !status.primary?.eligible) throw new Error("Fixture：请先选择可用供应商或登录官方账号");
+        if (next.providerIds.length > 64 || new Set(next.providerIds).size !== next.providerIds.length || next.providerIds.some((id) => !status.providers.find((provider) => provider.id === id)?.eligible)) throw new Error("Fixture：队列包含无效或重复供应商");
+        const enablingAuto = next.autoFailoverEnabled && !failoverSettings.autoFailoverEnabled;
+        if (enablingAuto && (!next.routerEnabled || !next.takeoverEnabled)) throw new Error("Fixture：请先开启本地路由和 Codex 路由");
+        if (enablingAuto && !next.providerIds.length) {
+          if (!status.primary?.eligible || status.primary.official) throw new Error("Fixture：请添加 API 供应商到队列");
+          next.providerIds.push(status.primary.id);
+        }
+        if (enablingAuto) switchProvider(savedProviders.find((provider) => provider.id === next.providerIds[0]));
+        failoverSettings = next;
+        emitRoutingChanged();
+        return failoverStatus();
+      }
+      case "reset_provider_failover_health":
+        if (args.providerId) resetRoutingHealth.add(args.providerId); else { failoverMode = "normal"; resetRoutingHealth.clear(); }
+        return failoverStatus();
+      case "plugin:event|listen": {
+        const eventId = nextCallback++;
+        eventListeners.set(eventId, { event: args.event, handler: args.handler });
+        return eventId;
+      }
+      case "plugin:event|unlisten": eventListeners.delete(args.eventId); return null;
       case "check_codex_config": return healthReport();
       case "repair_codex_config": {
         if (args.expectedFingerprint !== healthReport().fingerprint) throw new Error("配置已变更，请重新检查。");
@@ -846,8 +957,8 @@
       case "fetch_provider_models": return { models: [{ id: "fixture-model-a" }, { id: "fixture-model-b" }], status: 200, durationMs: 1 };
       case "get_session_sync_status": return {
         codexDir, targetProvider: state.modelProvider, rolloutFiles: 2, sessionMetaCount: 2,
-        mismatchedRollouts: 0, mismatchedSessionMeta: 0, sqliteDbs: 1, sqliteThreads: 2,
-        topLevelThreads: 2, subagentThreads: 0, mismatchedThreads: 0, mismatchedSessions: 0,
+        mismatchedRollouts: 0, mismatchedSessionMeta: 0, sqliteDbs: 1, sqliteThreads: 3,
+        topLevelThreads: 2, subagentThreads: 1, mismatchedThreads: 0, mismatchedSessions: 0,
         needsSync: false, scanComplete: true, scanFailures: [], warnings: [], sessions: clone(fixtureSessions),
       };
       case "get_skills_mcp_state": return clone(transferState);
@@ -878,6 +989,7 @@
     }
   }
 
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(event, eventId) { eventListeners.delete(eventId); } };
   window.__TAURI_INTERNALS__ = {
     invoke,
     transformCallback(callback, once = false) {
@@ -1019,6 +1131,25 @@
       button.style.cssText = loginButton.style.cssText;
       button.addEventListener("click", () => setUsageMode(mode));
       controls.append(button);
+    }
+    for (const [text, action] of [
+      ["Fixture：精简的供应商配置", () => { state.configText = 'model_reasoning_effort = "high"\ndisable_response_storage = true\n' + toml(detectedProvider); providerBaseReadFailure = false; render(); }],
+      ["Fixture：供应商底稿读取失败", () => { providerBaseReadFailure = true; render(); }],
+      ["Fixture：供应商底稿读取正常", () => { providerBaseReadFailure = false; render(); }],
+      ["Fixture：准备自动切换数据", seedFailover],
+      ["Fixture：自动切换状态正常", () => { failoverMode = "normal"; render(); }],
+      ["Fixture：自动切换状态失败", () => { failoverMode = "error"; render(); }],
+      ["Fixture：自动切换保存失败", () => { failoverMode = "save-error"; render(); }],
+      ["Fixture：自动切换冷却状态", () => { failoverMode = "cooling"; resetRoutingHealth.clear(); render(); }],
+      ["Fixture：自动切换恢复状态", () => { failoverMode = "recovering"; resetRoutingHealth.clear(); render(); }],
+      ["Fixture：路由外部设置变化", () => { failoverSettings.maxRetries = failoverSettings.maxRetries === 3 ? 4 : 3; render(); emitRoutingChanged(); }],
+      ["Fixture：路由切换官方账号", () => { switchOfficial(defaultOfficialId); emitRoutingChanged(); }],
+      ["Fixture：路由切换其他模型", () => { const provider = savedProviders.find((item) => item.id === "fixture-failover-other"); if (provider) switchProvider(provider); emitRoutingChanged(); }],
+      ["Fixture：删除第一备用", () => { savedProviders = savedProviders.filter((provider) => provider.id !== failoverSettings.providerIds[0]); render(); }],
+    ]) {
+      const button = document.createElement("button");
+      button.type = "button"; button.textContent = text; button.style.cssText = loginButton.style.cssText;
+      button.addEventListener("click", action); controls.append(button);
     }
     const resetButton = document.createElement("button");
     resetButton.type = "button";

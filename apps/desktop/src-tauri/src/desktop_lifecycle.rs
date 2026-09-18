@@ -1,7 +1,7 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Emitter, Manager, WindowEvent,
 };
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -123,7 +123,37 @@ pub(crate) fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
     }
 }
 
+pub(crate) fn report_failover_lifecycle_error(app: &tauri::AppHandle, title: &str, reason: &str) {
+    let title = title.to_string();
+    let reason = reason.to_string();
+    eprintln!("{title}: {reason}");
+    let _ = app.emit("provider-failover-error", &reason);
+    tauri::async_runtime::spawn(async move {
+        rfd::AsyncMessageDialog::new()
+            .set_title(title)
+            .set_description(reason)
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show()
+            .await;
+    });
+}
+
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+        if let Err(error) = crate::failover::shutdown_all() {
+            // Keep the listener alive when restoring the direct route failed.
+            // Exiting here would strand Codex on a local address with no server.
+            api.prevent_exit();
+            restore_main_window(app);
+            report_failover_lifecycle_error(
+                app,
+                "暂时无法退出 Codex-X",
+                &format!("自动切换的连接配置还未恢复，Codex-X 将继续运行。\n\n{error}\n\n请检查配置文件是否被占用，再重试退出。"),
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     if let tauri::RunEvent::Reopen { .. } = event {
         restore_main_window(app);

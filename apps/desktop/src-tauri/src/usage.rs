@@ -219,7 +219,7 @@ impl<'de> Visitor<'de> for UsageSourceSeed {
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
         Ok(UsageSource {
-            is_subagent: self.0 == 0 && value.trim().eq_ignore_ascii_case("subagent"),
+            is_subagent: self.0 == 0 && crate::sessions::source_kind_is_internal(value),
             parent: (self.0 == 3).then(|| value.to_owned()),
         })
     }
@@ -231,7 +231,10 @@ impl<'de> Visitor<'de> for UsageSourceSeed {
         const PATH: [&str; 3] = ["subagent", "thread_spawn", "parent_thread_id"];
         let mut source = UsageSource::default();
         while let Some(key) = map.next_key::<String>()? {
-            if PATH.get(self.0).copied() == Some(key.as_str()) {
+            if self.0 == 0 && key == "internal" {
+                map.next_value::<IgnoredAny>()?;
+                source.is_subagent = true;
+            } else if PATH.get(self.0).copied() == Some(key.as_str()) {
                 let child = map.next_value_seed(UsageSourceSeed(self.0 + 1))?;
                 source.is_subagent |= self.0 == 0;
                 source.parent = child.parent;
@@ -286,6 +289,7 @@ struct LogPayload {
     thread_id: Option<String>,
     forked_from_id: Option<String>,
     source: Option<UsageSource>,
+    thread_source: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
     info: Option<TokenInfo>,
@@ -413,7 +417,11 @@ impl ParsedLog {
                 self.is_subagent = payload
                     .source
                     .as_ref()
-                    .is_some_and(|source| source.is_subagent);
+                    .is_some_and(|source| source.is_subagent)
+                    || payload
+                        .thread_source
+                        .as_deref()
+                        .is_some_and(crate::sessions::thread_source_is_internal);
                 self.replays_parent = forked.is_some();
                 self.spawn_parent = spawned.clone();
                 self.invalid_spawn_parent = self.id.is_some() && self.id == self.spawn_parent;
@@ -857,6 +865,7 @@ struct SessionLog {
 fn combine_files(
     cache: &DirectoryCache,
     coverage: &mut UsageCoverage,
+    indexed_identities: &HashMap<String, crate::sessions::UsageThreadIdentity>,
 ) -> BTreeMap<String, SessionLog> {
     let mut sessions: BTreeMap<String, SessionLog> = BTreeMap::new();
     let mut issues = ParseIssues::default();
@@ -907,7 +916,38 @@ fn combine_files(
         }
         session.events.extend(parsed.events.iter().cloned());
     }
-    for session in sessions.values_mut() {
+    let mut canonical_files: Option<HashMap<PathBuf, &CachedFile>> = None;
+    for (id, session) in &mut sessions {
+        // Keep token records from every copy, but use the current database's
+        // actual rollout for identity. A stale archived/internal copy with the
+        // same ID must not hide a user conversation or supply a different parent.
+        let authoritative = indexed_identities
+            .get(id)
+            .and_then(|identity| identity.rollout_path.as_ref())
+            .and_then(|path| {
+                cache.files.get(path).or_else(|| {
+                    let canonical = path.canonicalize().ok()?;
+                    canonical_files
+                        .get_or_insert_with(|| {
+                            cache
+                                .files
+                                .iter()
+                                .filter_map(|(path, entry)| {
+                                    path.canonicalize().ok().map(|path| (path, entry))
+                                })
+                                .collect()
+                        })
+                        .get(&canonical)
+                        .copied()
+                })
+            })
+            .map(|entry| &entry.parsed)
+            .filter(|parsed| parsed.meta_seen && parsed.id.as_ref() == Some(id));
+        if let Some(parsed) = authoritative {
+            session.is_subagent = parsed.is_subagent;
+            session.spawn_parent.clone_from(&parsed.spawn_parent);
+            session.invalid_spawn_parent = parsed.invalid_spawn_parent;
+        }
         // The same rollout can coexist in sessions and archived_sessions, or
         // have overlapping resume segments. Merge its token records once.
         let mut seen = HashSet::new();
@@ -1104,7 +1144,7 @@ impl Bucket {
 
 fn conversation_identities(
     sessions: &BTreeMap<String, SessionLog>,
-    codex_dir: &Path,
+    indexed_identities: HashMap<String, crate::sessions::UsageThreadIdentity>,
 ) -> HashMap<String, crate::sessions::UsageThreadIdentity> {
     let mut identities = sessions
         .iter()
@@ -1116,18 +1156,24 @@ fn conversation_identities(
                     classification_known: session.is_subagent,
                     parent_id: session.spawn_parent.clone(),
                     parent_conflict: session.invalid_spawn_parent,
+                    rollout_path: None,
                 },
             )
         })
         .collect::<HashMap<_, _>>();
-    for (id, mut indexed) in crate::sessions::usage_thread_identities(codex_dir) {
+    for (id, mut indexed) in indexed_identities {
         // Older indexes may have only id/title columns. Absence of a source
         // marker must not erase a positive subagent classification in the log.
         if !indexed.classification_known && identities.contains_key(&id) {
             continue;
         }
-        // The session manager's current SQLite classification is authoritative.
-        // A source-only subagent marker may still need its rollout's parent ID.
+        // A generic user/default database marker must not promote a thread
+        // whose own rollout explicitly identifies it as an internal task.
+        if identities.get(&id).is_some_and(|log| log.is_subagent) {
+            indexed.is_subagent = true;
+            indexed.classification_known = true;
+        }
+        // A source-only internal marker may still need its rollout's parent ID.
         if indexed.is_subagent && indexed.parent_id.is_none() && !indexed.parent_conflict {
             if let Some(log) = identities.get(&id) {
                 indexed.parent_id.clone_from(&log.parent_id);
@@ -1207,8 +1253,9 @@ where
         .and_then(|date| midnight(&timezone, date))
         .map(|time| time.with_timezone(&Utc));
     let range_end = now.with_timezone(&Utc);
-    let sessions = combine_files(cache, &mut coverage);
-    let identities = conversation_identities(&sessions, codex_dir);
+    let indexed_identities = crate::sessions::usage_thread_identities(codex_dir);
+    let sessions = combine_files(cache, &mut coverage, &indexed_identities);
+    let identities = conversation_identities(&sessions, indexed_identities);
     let mut total = Bucket::default();
     let mut days: BTreeMap<NaiveDate, Bucket> = BTreeMap::new();
     let mut models: BTreeMap<String, Bucket> = BTreeMap::new();
@@ -2044,7 +2091,7 @@ mod tests {
         )
         .unwrap();
         let changed = fixture.stats("all", None);
-        assert_eq!(changed.sessions[0].id, "child");
+        assert_eq!(changed.sessions[0].id, "main");
         assert_eq!(changed.totals.total_tokens, 55);
     }
 
@@ -2089,7 +2136,95 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(fixture.stats("all", None).totals.session_count, 2);
+        assert_eq!(fixture.stats("all", None).totals.session_count, 1);
+    }
+
+    #[test]
+    fn guardian_and_memory_usage_stays_counted_without_creating_user_conversation_rows() {
+        let mut fixture = Fixture::new();
+        for (index, source) in [
+            json!({"internal":"guardian"}),
+            json!({"internal":"memory_consolidation"}),
+            json!("internal_guardian"),
+            json!("subagent_review"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("internal-{index}");
+            let mut metadata = meta(&id, "2026-09-08T01:00:00Z", None);
+            metadata["payload"]["source"] = source;
+            fixture.write(
+                &format!("sessions/{id}.jsonl"),
+                &[
+                    metadata,
+                    context("codex-auto-review"),
+                    total("2026-09-08T01:00:01Z", 50, 5),
+                ],
+            );
+        }
+        let stats = fixture.stats("all", None);
+        assert_eq!(stats.totals.total_tokens, 220);
+        assert_eq!(stats.totals.session_count, 0);
+        assert!(stats.sessions.is_empty());
+    }
+
+    #[test]
+    fn current_rollout_controls_classification_while_duplicate_usage_is_preserved() {
+        let mut fixture = Fixture::new();
+        let current = [
+            meta("main", "2026-09-08T01:00:00Z", None),
+            context("model"),
+            total("2026-09-08T01:00:01Z", 100, 10),
+        ];
+        fixture.write("sessions/current.jsonl", &current);
+        let mut stale = current.to_vec();
+        stale[0]["payload"]["source"] = json!({"internal":"guardian"});
+        stale.push(total("2026-09-08T01:00:02Z", 150, 15));
+        fixture.write("archived_sessions/stale-copy.jsonl", &stale);
+        let db = rusqlite::Connection::open(fixture.dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, thread_source TEXT, source TEXT, rollout_path TEXT);
+            INSERT INTO threads VALUES ('main', 'User conversation', 'user', 'cli', 'sessions/current.jsonl');").unwrap();
+        let stats = fixture.stats("all", None);
+        assert_eq!(stats.totals.total_tokens, 165);
+        assert_eq!(stats.totals.session_count, 1);
+        assert_eq!(stats.sessions.len(), 1);
+        assert_eq!(stats.sessions[0].id, "main");
+        assert_eq!(stats.sessions[0].totals.total_tokens, 165);
+
+        // An explicit internal source in the authoritative file still wins
+        // over generic user/cli labels, even with a normal duplicate present.
+        db.execute("UPDATE threads SET rollout_path = 'archived_sessions/stale-copy.jsonl' WHERE id = 'main'", []).unwrap();
+        let internal = fixture.stats("all", None);
+        assert_eq!(internal.totals.total_tokens, 165);
+        assert_eq!(internal.totals.session_count, 0);
+        assert!(internal.sessions.is_empty());
+    }
+
+    #[test]
+    fn first_metadata_thread_source_hides_internal_tasks_without_database_markers() {
+        let mut fixture = Fixture::new();
+        for (index, source) in ["guardian_review", "memory_consolidation"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("internal-{index}");
+            let mut metadata = meta(&id, "2026-09-08T01:00:00Z", None);
+            metadata["payload"]["source"] = json!("cli");
+            metadata["payload"]["thread_source"] = json!(source);
+            fixture.write(
+                &format!("sessions/{id}.jsonl"),
+                &[
+                    metadata,
+                    context("model"),
+                    total("2026-09-08T01:00:01Z", 50, 5),
+                ],
+            );
+        }
+        let stats = fixture.stats("all", None);
+        assert_eq!(stats.totals.total_tokens, 110);
+        assert_eq!(stats.totals.session_count, 0);
+        assert!(stats.sessions.is_empty());
     }
 
     #[test]

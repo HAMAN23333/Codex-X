@@ -8,10 +8,12 @@ use crate::paths::home_dir;
 use crate::sqlite_utils::{sql_select_column, sqlite_has_table, table_column_set};
 use crate::{config_path, string_value};
 use rusqlite::{Connection, OpenFlags};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use toml_edit::DocumentMut;
@@ -36,6 +38,9 @@ fn is_rollout_file(path: &Path) -> bool {
 }
 
 pub(super) fn rollout_filename_matches_id(path: &Path, id: &str) -> bool {
+    if let Some(thread_id) = rollout_filename_thread_id(path) {
+        return thread_id == id;
+    }
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
@@ -201,12 +206,13 @@ pub(super) fn scan_provider_rollouts(
     codex_dir: &Path,
     target_provider: &str,
     excluded_thread_ids: &HashSet<String>,
+    authoritative_rollout_paths: &HashMap<String, String>,
 ) -> Result<RolloutScan> {
     scan_rollouts_with_thread_filter(
         codex_dir,
         target_provider,
         None,
-        None,
+        Some(authoritative_rollout_paths),
         false,
         Some(excluded_thread_ids),
         true,
@@ -226,7 +232,7 @@ pub(super) fn scan_rollouts_for_thread_ids(
         Some(rollout_paths_by_thread_id),
         false,
         None,
-        false,
+        true,
     )
 }
 
@@ -295,6 +301,34 @@ fn scan_rollouts_with_thread_filter(
             .canonicalize()
             .ok()
             .and_then(|canonical| referenced.get(&canonical));
+        let identity = match read_rollout_identity(&path) {
+            Ok(identity) => identity,
+            Err(failure) => {
+                scan.scan_failures.push(failure);
+                continue;
+            }
+        };
+        let identity_id = identity.payload.id.as_deref().unwrap_or_default().trim();
+        if expected_thread_ids
+            .is_some_and(|expected| expected.len() != 1 || !expected.contains(identity_id))
+        {
+            scan.scan_failures.push(format!(
+                "活动 SQLite 引用的会话文件与线程 ID 不一致: {}",
+                path.display()
+            ));
+            continue;
+        }
+        let authoritative_identity = rollout_paths_by_thread_id.is_none_or(|authority| {
+            is_authoritative_rollout(codex_dir, &path, identity_id, authority)
+        });
+        if identity.payload.is_internal() {
+            if authoritative_identity {
+                scan.internal_thread_ids.insert(identity_id.to_string());
+            }
+            if exclude_source_marked_subagents {
+                continue;
+            }
+        }
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -328,20 +362,21 @@ fn scan_rollouts_with_thread_filter(
                             record.get_mut("payload").and_then(Value::as_object_mut)
                         {
                             file_session_meta_count += 1;
-                            if thread_id.is_none() {
+                            if file_session_meta_count == 1 {
                                 thread_id = payload
                                     .get("id")
                                     .and_then(Value::as_str)
                                     .map(ToString::to_string);
-                            }
-                            if cwd.is_none() {
                                 cwd = payload
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .and_then(normalize_workspace_path);
-                            }
-                            if payload.get("source").is_some_and(source_value_is_subagent) {
-                                is_subagent = true;
+                                is_subagent =
+                                    payload.get("source").is_some_and(source_value_is_subagent)
+                                        || payload
+                                            .get("thread_source")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(thread_source_is_internal);
                             }
                             if payload.get("model_provider").and_then(Value::as_str)
                                 != Some(target_provider)
@@ -367,6 +402,13 @@ fn scan_rollouts_with_thread_filter(
             next_text.push_str(line_ending);
         }
 
+        if is_subagent && authoritative_identity {
+            if let Some(id) = thread_id.as_ref() {
+                if expected_thread_ids.is_none_or(|expected| expected.contains(id)) {
+                    scan.internal_thread_ids.insert(id.clone());
+                }
+            }
+        }
         if (exclude_source_marked_subagents && is_subagent)
             || thread_id
                 .as_ref()
@@ -385,6 +427,11 @@ fn scan_rollouts_with_thread_filter(
                 "会话文件包含 {invalid_session_meta} 条无法读取的 session_meta: {}",
                 path.display()
             ));
+        }
+        if invalid_json_lines > 0 || invalid_session_meta > 0 {
+            // A broken orphan remains a warning, but must never become a
+            // provider/catalog candidate merely because one metadata line parsed.
+            continue;
         }
 
         if file_session_meta_count == 0 {
@@ -416,6 +463,7 @@ fn scan_rollouts_with_thread_filter(
             continue;
         }
         scan.session_meta_count += file_session_meta_count;
+        scan.provider_candidate_paths.insert(path.clone());
         scan.thread_ids.insert(thread_id.clone());
         if let Some(cwd) = cwd {
             scan.cwd_by_thread_id.insert(thread_id.clone(), cwd);
@@ -1093,12 +1141,10 @@ pub(super) fn sqlite_subagent_thread_ids(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                if thread_source.eq_ignore_ascii_case("subagent") {
+                if thread_source_is_internal(thread_source) {
                     ids.insert(id);
-                } else {
-                    ids.remove(&id);
+                    continue;
                 }
-                continue;
             }
 
             if let Some(source) = source
@@ -1108,8 +1154,6 @@ pub(super) fn sqlite_subagent_thread_ids(
             {
                 if source_text_is_subagent(source) {
                     ids.insert(id);
-                } else {
-                    ids.remove(&id);
                 }
             }
         }
@@ -1120,19 +1164,264 @@ pub(super) fn sqlite_subagent_thread_ids(
 
 pub(crate) fn source_value_is_subagent(source: &Value) -> bool {
     match source {
-        Value::String(source) => source.trim().eq_ignore_ascii_case("subagent"),
-        Value::Object(source) => source.contains_key("subagent"),
+        Value::String(source) => source_kind_is_internal(source),
+        Value::Object(source) => source.contains_key("subagent") || source.contains_key("internal"),
         _ => false,
     }
 }
 
-fn source_text_is_subagent(source: &str) -> bool {
+pub(crate) fn source_kind_is_internal(source: &str) -> bool {
+    let source = source.trim().to_ascii_lowercase();
+    source == "subagent"
+        || source == "internal"
+        || source.starts_with("subagent_")
+        || source.starts_with("internal_")
+}
+
+pub(crate) fn thread_source_is_internal(source: &str) -> bool {
+    matches!(
+        source.trim().to_ascii_lowercase().as_str(),
+        "subagent" | "guardian_review" | "memory_consolidation"
+    ) || source_text_is_subagent(source)
+}
+
+pub(crate) fn source_text_is_subagent(source: &str) -> bool {
     let source = source.trim();
-    source.eq_ignore_ascii_case("subagent")
+    source_kind_is_internal(source)
         || serde_json::from_str::<Value>(source)
             .ok()
             .as_ref()
             .is_some_and(source_value_is_subagent)
+}
+
+// Only retain identity fields from the first rollout record. Instructions and
+// other potentially large metadata are streamed past, never stored or logged.
+#[derive(Default)]
+struct InternalSource(bool);
+
+impl<'de> Deserialize<'de> for InternalSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct SourceVisitor;
+        impl<'de> Visitor<'de> for SourceVisitor {
+            type Value = InternalSource;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("session source")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(InternalSource(source_kind_is_internal(value)))
+            }
+
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut internal = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    internal |= key == "subagent" || key == "internal";
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Ok(InternalSource(internal))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(InternalSource(false))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(InternalSource(false))
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                _: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(InternalSource(false))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(InternalSource(false))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(InternalSource(false))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(InternalSource(false))
+            }
+        }
+        deserializer.deserialize_any(SourceVisitor)
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct RolloutIdentityPayload {
+    id: Option<String>,
+    #[serde(default)]
+    source: InternalSource,
+    thread_source: Option<String>,
+}
+
+impl RolloutIdentityPayload {
+    fn is_internal(&self) -> bool {
+        self.source.0
+            || self
+                .thread_source
+                .as_deref()
+                .is_some_and(thread_source_is_internal)
+    }
+}
+
+#[derive(Deserialize)]
+struct RolloutIdentityRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    payload: RolloutIdentityPayload,
+}
+
+/// Classify only the rollout's own first metadata record. A user-created fork
+/// can replay an internal parent's metadata later without becoming internal.
+pub(super) fn rollout_text_is_internal(text: &str) -> bool {
+    RolloutIdentityRecord::deserialize(&mut serde_json::Deserializer::from_str(text))
+        .is_ok_and(|record| record.kind == "session_meta" && record.payload.is_internal())
+}
+
+pub(super) fn rollout_path_has_syncable_identity(path: &Path) -> Result<bool> {
+    read_rollout_identity(path)
+        .map(|record| !record.payload.is_internal())
+        .map_err(CodexxError::Config)
+}
+
+fn is_filename_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// Codex thread/revert keeps the thread ID and appends a distinct rollout ID:
+/// rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl. The suffix is never the
+/// conversation identity. Share this parser with lookup/deletion fallback so
+/// neither path can accidentally select a different thread by its rollout ID.
+fn rollout_filename_thread_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    let core = stem
+        .rsplit_once('_')
+        .and_then(|(prefix, rollout_id)| {
+            if !is_filename_uuid(rollout_id) {
+                return None;
+            }
+            let thread_id = prefix.get(prefix.len().checked_sub(36)?..)?;
+            let delimiter = prefix.get(prefix.len().checked_sub(37)?..prefix.len() - 36)?;
+            (is_filename_uuid(thread_id) && delimiter == "-").then_some(prefix)
+        })
+        .unwrap_or(stem);
+    let thread_id = core.get(core.len().checked_sub(36)?..)?;
+    let delimiter = core.get(core.len().checked_sub(37)?..core.len() - 36)?;
+    (is_filename_uuid(thread_id) && delimiter == "-").then_some(thread_id)
+}
+
+fn read_rollout_identity(path: &Path) -> std::result::Result<RolloutIdentityRecord, String> {
+    let file = fs::File::open(path)
+        .map_err(|_| format!("无法读取会话文件来源信息: {}", path.display()))?;
+    let record = RolloutIdentityRecord::deserialize(&mut serde_json::Deserializer::from_reader(
+        BufReader::new(file),
+    ))
+    .map_err(|_| {
+        format!(
+            "会话文件包含无法解析的 JSON 或无法读取会话文件来源信息: {}",
+            path.display()
+        )
+    })?;
+    if record.kind != "session_meta" {
+        return Err(format!("会话文件缺少起始 session_meta: {}", path.display()));
+    }
+    let Some(id) = record
+        .payload
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return Err(format!("会话来源信息缺少线程 ID: {}", path.display()));
+    };
+    if rollout_filename_thread_id(path).is_some_and(|filename_id| filename_id != id) {
+        return Err(format!(
+            "会话来源信息与文件线程 ID 不一致: {}",
+            path.display()
+        ));
+    }
+    Ok(record)
+}
+
+fn is_authoritative_rollout(
+    codex_dir: &Path,
+    path: &Path,
+    id: &str,
+    authority: &HashMap<String, String>,
+) -> bool {
+    let Some(authoritative_path) = authority.get(id) else {
+        return true;
+    };
+    let raw = PathBuf::from(authoritative_path);
+    let resolved = if raw.is_absolute() {
+        raw
+    } else {
+        codex_dir.join(raw)
+    };
+    resolved
+        .canonicalize()
+        .ok()
+        .zip(path.canonicalize().ok())
+        .is_some_and(|(expected, actual)| expected == actual)
+}
+
+/// Read rollout identities independently of the SQLite provider candidate list.
+/// This also protects internal threads whose database source is missing/stale.
+/// Any failure is returned as a scan failure so an unknown identity cannot be
+/// silently promoted into a visible Desktop catalog entry.
+pub(super) fn rollout_internal_thread_ids(
+    codex_dir: &Path,
+    authoritative_rollout_paths: &HashMap<String, String>,
+) -> (HashSet<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut failures = Vec::new();
+    let mut ids = HashSet::new();
+    collect_rollout_paths(&codex_dir.join("sessions"), &mut paths, &mut failures);
+    for path in paths {
+        let record = match read_rollout_identity(&path) {
+            Ok(record) => record,
+            Err(failure) => {
+                failures.push(failure);
+                continue;
+            }
+        };
+        let id = record.payload.id.as_deref().unwrap_or_default().trim();
+        if !is_authoritative_rollout(codex_dir, &path, id, authoritative_rollout_paths) {
+            continue;
+        }
+        if record.payload.is_internal() {
+            ids.insert(id.to_string());
+        }
+    }
+    (ids, failures)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1141,11 +1430,13 @@ pub(crate) struct UsageThreadIdentity {
     pub(crate) classification_known: bool,
     pub(crate) parent_id: Option<String>,
     pub(crate) parent_conflict: bool,
+    /// Only the current database's rollout reference can override stale copies.
+    pub(crate) rollout_path: Option<PathBuf>,
 }
 
 fn usage_identities_on_connection(
     conn: &Connection,
-) -> Result<HashMap<String, (bool, bool, HashSet<String>)>> {
+) -> Result<HashMap<String, (bool, bool, HashSet<String>, Option<String>)>> {
     if !sqlite_has_table(conn, "threads")? {
         return Ok(HashMap::new());
     }
@@ -1156,9 +1447,10 @@ fn usage_identities_on_connection(
     let subagents = sqlite_subagent_thread_ids(conn, &cols)?;
     let source = sql_select_column(&cols, "source", "NULL");
     let thread_source = sql_select_column(&cols, "thread_source", "NULL");
+    let rollout_path = sql_select_column(&cols, "rollout_path", "NULL");
     let mut statement = conn
         .prepare(&format!(
-            "SELECT id, {source}, {thread_source} FROM threads"
+            "SELECT id, {source}, {thread_source}, {rollout_path} FROM threads"
         ))
         .map_err(|error| CodexxError::Database(error.to_string()))?;
     let rows = statement
@@ -1167,12 +1459,13 @@ fn usage_identities_on_connection(
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1).ok().flatten(),
                 row.get::<_, Option<String>>(2).ok().flatten(),
+                row.get::<_, Option<String>>(3).ok().flatten(),
             ))
         })
         .map_err(|error| CodexxError::Database(error.to_string()))?;
     let mut identities = HashMap::new();
     for row in rows {
-        let (id, source, thread_source) =
+        let (id, source, thread_source, rollout_path) =
             row.map_err(|error| CodexxError::Database(error.to_string()))?;
         if id.trim().is_empty() {
             continue;
@@ -1202,7 +1495,10 @@ fn usage_identities_on_connection(
                 parents.insert(parent);
             }
         }
-        identities.insert(id, (is_subagent, classification_known, parents));
+        identities.insert(
+            id,
+            (is_subagent, classification_known, parents, rollout_path),
+        );
     }
     if sqlite_has_table(conn, "thread_spawn_edges")? {
         let cols = table_column_set(conn, "thread_spawn_edges")?;
@@ -1221,7 +1517,7 @@ fn usage_identities_on_connection(
             for row in rows {
                 let (child, parent) =
                     row.map_err(|error| CodexxError::Database(error.to_string()))?;
-                if let Some((true, _, parents)) = identities.get_mut(&child) {
+                if let Some((true, _, parents, _)) = identities.get_mut(&child) {
                     if let Some(parent) = parent
                         .map(|value| value.trim().to_string())
                         .filter(|value| !value.is_empty())
@@ -1241,7 +1537,7 @@ pub(crate) fn usage_thread_identities(codex_dir: &Path) -> HashMap<String, Usage
     let timeout = Duration::from_millis(50);
     let discovery = discover_sqlite_databases_with_busy_timeout(codex_dir, Some(timeout));
     let mut active_ids = HashSet::new();
-    let mut combined = HashMap::<String, (bool, bool, HashSet<String>)>::new();
+    let mut combined = HashMap::<String, (bool, bool, HashSet<String>, Option<String>)>::new();
     for path in discovery.active_first_session_paths() {
         let Ok(conn) = Connection::open_with_flags(
             &path,
@@ -1256,14 +1552,17 @@ pub(crate) fn usage_thread_identities(codex_dir: &Path) -> HashMap<String, Usage
             continue;
         };
         let is_active = discovery.active_paths.contains(&path);
-        for (id, (is_subagent, classification_known, parents)) in identities {
+        for (id, (is_subagent, classification_known, parents, rollout_path)) in identities {
             if is_active {
                 active_ids.insert(id.clone());
-                combined.insert(id, (is_subagent, classification_known, parents));
+                combined.insert(
+                    id,
+                    (is_subagent, classification_known, parents, rollout_path),
+                );
             } else if !active_ids.contains(&id) {
                 let existing = combined
                     .entry(id)
-                    .or_insert_with(|| (false, false, HashSet::new()));
+                    .or_insert_with(|| (false, false, HashSet::new(), None));
                 existing.0 |= is_subagent;
                 existing.1 |= classification_known;
                 existing.2.extend(parents);
@@ -1272,20 +1571,34 @@ pub(crate) fn usage_thread_identities(codex_dir: &Path) -> HashMap<String, Usage
     }
     combined
         .into_iter()
-        .map(|(id, (is_subagent, classification_known, parents))| {
-            let parent_conflict = is_subagent && parents.len() > 1;
-            let parent_id =
-                (is_subagent && parents.len() == 1).then(|| parents.into_iter().next().unwrap());
-            (
-                id,
-                UsageThreadIdentity {
-                    is_subagent,
-                    classification_known,
-                    parent_id,
-                    parent_conflict,
-                },
-            )
-        })
+        .map(
+            |(id, (is_subagent, classification_known, parents, rollout_path))| {
+                let parent_conflict = is_subagent && parents.len() > 1;
+                let parent_id = (is_subagent && parents.len() == 1)
+                    .then(|| parents.into_iter().next().unwrap());
+                let rollout_path =
+                    rollout_path
+                        .filter(|path| !path.trim().is_empty())
+                        .map(|path| {
+                            let path = PathBuf::from(path);
+                            if path.is_absolute() {
+                                path
+                            } else {
+                                codex_dir.join(path)
+                            }
+                        });
+                (
+                    id,
+                    UsageThreadIdentity {
+                        is_subagent,
+                        classification_known,
+                        parent_id,
+                        parent_conflict,
+                        rollout_path,
+                    },
+                )
+            },
+        )
         .collect()
 }
 
@@ -1340,7 +1653,7 @@ pub(super) fn scan_sqlite_with_paths(
     let mut syncable_thread_ids = HashSet::new();
     let mut archived_thread_ids = HashSet::new();
     let mut rollout_paths_by_thread_id = HashMap::new();
-    let mut subagent_ids = HashSet::new();
+    let mut subagent_ids = rollouts.internal_thread_ids.clone();
     let mut mismatched_ids = HashSet::new();
     for path in sqlite_paths {
         let conn = match Connection::open_with_flags(
@@ -1533,7 +1846,8 @@ pub(super) fn list_session_previews_with_paths(
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty());
                 let is_archived = archived != 0;
-                let is_subagent = subagent_thread_ids.contains(&id);
+                let is_subagent =
+                    subagent_thread_ids.contains(&id) || rollouts.internal_thread_ids.contains(&id);
                 let needs_sync = !is_archived
                     && !is_subagent
                     && (rollouts.mismatched_thread_ids.contains(&id)
@@ -1579,11 +1893,23 @@ pub(super) fn list_session_previews_with_paths(
             .then_with(|| a.id.cmp(&b.id))
     });
     let mut seen = HashSet::new();
-    let sessions = candidates
+    // Internal tasks can greatly outnumber their parents. Apply the display
+    // limit after reserving space for real conversations, otherwise hiding the
+    // newest internal rows in the frontend could leave an empty session list.
+    let (ordinary, internal): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .filter(|session| seen.insert(session.id.clone()))
+        .partition(|session| !session.is_subagent);
+    let mut sessions = ordinary
+        .into_iter()
+        .chain(internal)
         .take(limit.max(1))
-        .collect();
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok((sessions, warnings))
 }
 
@@ -1647,7 +1973,277 @@ mod tests {
     }
 
     #[test]
-    fn usage_thread_identity_reuses_edges_source_and_authoritative_thread_source() {
+    fn internal_sources_cover_serialized_and_display_forms_without_title_heuristics() {
+        for source in [
+            "subagent",
+            " subagent_review ",
+            "subagent_thread_spawn_parent_d1",
+            "subagent_memory_consolidation",
+            "internal",
+            "internal_guardian",
+            "internal_memory_consolidation",
+            r#"{"internal":"guardian"}"#,
+            r#"{"internal":"memory_consolidation"}"#,
+            r#"{"subagent":"review"}"#,
+            r#"{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}"#,
+        ] {
+            assert!(source_text_is_subagent(source), "{source}");
+        }
+        for source in [
+            "cli",
+            "vscode",
+            "exec",
+            "mcp",
+            "unknown",
+            "user",
+            "codex-auto-review",
+            r#"{"custom":"chatgpt"}"#,
+            r#"{"custom":"codex-auto-review"}"#,
+        ] {
+            assert!(!source_text_is_subagent(source), "{source}");
+        }
+        for source in ["subagent", "guardian_review", "memory_consolidation"] {
+            assert!(thread_source_is_internal(source));
+        }
+        assert!(!thread_source_is_internal("future_feature"));
+    }
+
+    #[test]
+    fn sqlite_internal_classification_keeps_edges_and_all_current_internal_sources() {
+        let dir = temp_codex_dir("current-internal-sources");
+        let conn = create_identity_database(&dir.join("state_10.sqlite"));
+        conn.execute_batch(
+            r#"INSERT INTO threads VALUES
+            ('parent', 'user', 'cli'),
+            ('empty-user', NULL, NULL),
+            ('user-fork', 'user', 'vscode'),
+            ('guardian', 'guardian_review', 'exec'),
+            ('memory', 'memory_consolidation', NULL),
+            ('internal-source', 'user', '{"internal":"guardian"}'),
+            ('edge-cli', NULL, 'cli'),
+            ('edge-user', 'user', 'cli'),
+            ('edge-future', 'future_feature', 'unknown'),
+            ('review-display', NULL, 'subagent_review');
+            INSERT INTO thread_spawn_edges VALUES
+            ('parent', 'edge-cli'), ('parent', 'edge-user'), ('parent', 'edge-future');"#,
+        )
+        .unwrap();
+        let cols = table_column_set(&conn, "threads").unwrap();
+        let internal = sqlite_subagent_thread_ids(&conn, &cols).unwrap();
+        assert_eq!(
+            internal,
+            [
+                "guardian",
+                "memory",
+                "internal-source",
+                "edge-cli",
+                "edge-user",
+                "edge-future",
+                "review-display"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        );
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rollout_identity_streams_large_headers_and_ignores_replayed_parent_metadata() {
+        let dir = temp_codex_dir("rollout-internal-identities");
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let large_instructions = "x".repeat(3 * 1024 * 1024);
+        let internal = serde_json::json!({"type":"session_meta","payload":{"id":"internal","source":{"internal":"guardian"},"base_instructions":{"text":large_instructions}}}).to_string();
+        fs::write(
+            dir.join("sessions/rollout-test-internal.jsonl"),
+            format!("{internal}\nnot even JSON body\n"),
+        )
+        .unwrap();
+        let fork = serde_json::json!({"type":"session_meta","payload":{"id":"fork","source":"vscode","thread_source":"user","forked_from_id":"internal"}}).to_string();
+        let fork_text = format!("{fork}\n{internal}\n");
+        fs::write(dir.join("sessions/rollout-test-fork.jsonl"), &fork_text).unwrap();
+        assert!(rollout_text_is_internal(&internal));
+        assert!(!rollout_text_is_internal(&fork_text));
+        let (ids, failures) = rollout_internal_thread_ids(&dir, &HashMap::new());
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(ids, HashSet::from(["internal".to_string()]));
+        let scan =
+            scan_provider_rollouts(&dir, "custom", &HashSet::new(), &HashMap::new()).unwrap();
+        assert_eq!(scan.internal_thread_ids, ids);
+        assert!(scan.thread_ids.contains("fork"));
+        assert!(!scan.thread_ids.contains("internal"));
+        assert_eq!(scan.changes.len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reverted_rollout_filenames_match_the_thread_not_the_rollout_id() {
+        let thread = "019f6000-0000-7000-8000-000000000901";
+        let rollout = "019f6000-0000-7000-8000-000000000902";
+        for extension in ["jsonl", "jsonl.zst"] {
+            let ordinary =
+                PathBuf::from(format!("rollout-2026-09-17T13-10-16-{thread}.{extension}"));
+            let reverted = PathBuf::from(format!(
+                "rollout-2026-09-17T13-10-16-{thread}_{rollout}.{extension}"
+            ));
+            let other_thread =
+                PathBuf::from(format!("rollout-2026-09-17T13-10-16-{rollout}.{extension}"));
+            assert_eq!(rollout_filename_thread_id(&ordinary), Some(thread));
+            assert_eq!(rollout_filename_thread_id(&reverted), Some(thread));
+            assert!(rollout_filename_matches_id(&ordinary, thread));
+            assert!(rollout_filename_matches_id(&reverted, thread));
+            assert!(!rollout_filename_matches_id(&reverted, rollout));
+            assert!(!rollout_filename_matches_id(
+                &reverted,
+                &format!("{thread}_{rollout}")
+            ));
+            assert!(!rollout_filename_matches_id(&other_thread, thread));
+            assert!(rollout_filename_matches_id(&other_thread, rollout));
+            let legacy_prefix = PathBuf::from(format!("rollout-custom_label-{thread}.{extension}"));
+            assert_eq!(rollout_filename_thread_id(&legacy_prefix), Some(thread));
+        }
+        assert!(rollout_filename_matches_id(
+            Path::new("rollout-test-legacy-id.jsonl"),
+            "legacy-id"
+        ));
+    }
+
+    #[test]
+    fn reverted_rollout_identity_preserves_strict_metadata_and_internal_checks() {
+        let dir = temp_codex_dir("reverted-rollout-identity");
+        let thread = "019f6000-0000-7000-8000-000000000911";
+        let rollout = "019f6000-0000-7000-8000-000000000912";
+        let path = dir.join(format!(
+            "rollout-2026-09-17T13-10-16-{thread}_{rollout}.jsonl"
+        ));
+        let write_meta = |id: &str, source: Value| {
+            let record = serde_json::json!({"type":"session_meta", "payload":{
+                "id":id, "source":source, "thread_source":"user", "model_provider":"openai"
+            }});
+            fs::write(&path, format!("{record}\n")).unwrap();
+        };
+        write_meta(thread, serde_json::json!("vscode"));
+        assert_eq!(
+            read_rollout_identity(&path).unwrap().payload.id.as_deref(),
+            Some(thread)
+        );
+        assert!(rollout_path_has_syncable_identity(&path).unwrap());
+        for wrong_id in [rollout, "019f6000-0000-7000-8000-000000000913"] {
+            write_meta(wrong_id, serde_json::json!("vscode"));
+            assert!(read_rollout_identity(&path).is_err());
+            assert!(rollout_path_has_syncable_identity(&path).is_err());
+        }
+        write_meta(thread, serde_json::json!({"internal":"guardian"}));
+        assert!(read_rollout_identity(&path).unwrap().payload.is_internal());
+        assert!(!rollout_path_has_syncable_identity(&path).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rollout_identity_rejects_wrong_thread_id_and_malformed_headers() {
+        let dir = temp_codex_dir("rollout-unknown-identities");
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        fs::write(dir.join("sessions/rollout-test-019f6000-0000-7000-8000-000000000301.jsonl"), r#"{"type":"session_meta","payload":{"id":"019f6000-0000-7000-8000-000000000302","source":{"internal":"guardian"}}}"#).unwrap();
+        fs::write(dir.join("sessions/rollout-test-broken.jsonl"), "{broken").unwrap();
+        fs::write(
+            dir.join("sessions/rollout-test-missing.jsonl"),
+            r#"{"type":"session_meta","payload":{"source":{"internal":"guardian"}}}"#,
+        )
+        .unwrap();
+        let (ids, failures) = rollout_internal_thread_ids(&dir, &HashMap::new());
+        assert!(ids.is_empty());
+        assert_eq!(failures.len(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn current_rollout_authority_ignores_a_stale_internal_copy_of_the_same_thread() {
+        let dir = temp_codex_dir("rollout-authoritative-classification");
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let current = dir.join("sessions/rollout-current.jsonl");
+        let copy = dir.join("sessions/rollout-copy-shared.jsonl");
+        let normal_copy = dir.join("sessions/rollout-normal-copy-shared.jsonl");
+        let normal = r#"{"type":"session_meta","payload":{"id":"shared","source":"vscode","model_provider":"openai"}}"#;
+        fs::write(&current, normal).unwrap();
+        fs::write(&normal_copy, normal).unwrap();
+        fs::write(&copy, r#"{"type":"session_meta","payload":{"id":"shared","source":{"internal":"guardian"},"model_provider":"openai"}}"#).unwrap();
+        let authority = HashMap::from([("shared".to_string(), current.display().to_string())]);
+        let (ids, failures) = rollout_internal_thread_ids(&dir, &authority);
+        assert!(ids.is_empty());
+        assert!(failures.is_empty());
+        let scan = scan_provider_rollouts(&dir, "custom", &HashSet::new(), &authority).unwrap();
+        assert!(scan.internal_thread_ids.is_empty());
+        assert_eq!(scan.thread_ids, HashSet::from(["shared".to_string()]));
+        assert_eq!(scan.changes.len(), 2);
+        assert_eq!(
+            scan.provider_candidate_paths,
+            HashSet::from([current, normal_copy])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rollout_internal_identity_keeps_previews_and_sync_candidates_consistent() {
+        let dir = temp_codex_dir("internal-preview-alignment");
+        let database = dir.join("state_10.sqlite");
+        create_thread_database(&database, "internal", "openai");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("INSERT INTO threads VALUES ('parent', 'openai', 'Parent', 3), ('empty-user', 'openai', NULL, 2), ('user-named-review', 'openai', 'codex-auto-review', 1);").unwrap();
+        drop(conn);
+        let rollouts = RolloutScan {
+            internal_thread_ids: HashSet::from(["internal".to_string()]),
+            ..RolloutScan::default()
+        };
+        let paths = [database];
+        let sqlite = scan_sqlite_with_paths(&paths, &rollouts, "custom").unwrap();
+        assert_eq!(sqlite.subagent_threads, 1);
+        assert!(!sqlite.syncable_thread_ids.contains("internal"));
+        assert!(!sqlite.mismatched_thread_ids.contains("internal"));
+        for id in ["parent", "empty-user", "user-named-review"] {
+            assert!(sqlite.syncable_thread_ids.contains(id));
+        }
+        let (previews, failures) =
+            list_session_previews_with_paths(&paths, &rollouts, "custom", 100).unwrap();
+        assert!(failures.is_empty());
+        for preview in previews {
+            assert_eq!(preview.is_subagent, preview.id == "internal");
+            assert_eq!(preview.needs_sync, preview.id != "internal");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn internal_tasks_do_not_exhaust_the_preview_limit_before_user_conversations() {
+        let dir = temp_codex_dir("preview-limit-keeps-users");
+        let database = dir.join("state_10.sqlite");
+        create_thread_database(&database, "older-parent", "openai");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN source TEXT;
+            INSERT INTO threads VALUES ('new-internal-one', 'openai', 'Internal', 100, 'internal_guardian'),
+              ('new-internal-two', 'openai', 'Internal', 99, 'subagent_review'),
+              ('new-internal-three', 'openai', 'Internal', 98, 'subagent'),
+              ('older-user-fork', 'openai', NULL, 2, 'vscode');").unwrap();
+        drop(conn);
+        let (previews, warnings) =
+            list_session_previews_with_paths(&[database], &RolloutScan::default(), "custom", 2)
+                .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            previews
+                .iter()
+                .map(|preview| preview.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older-user-fork", "older-parent"]
+        );
+        assert!(previews
+            .iter()
+            .all(|preview| !preview.is_subagent && preview.needs_sync));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_thread_identity_preserves_current_internal_evidence_despite_user_label() {
         let dir = temp_codex_dir("usage-identities-source");
         let path = dir.join("state_10.sqlite");
         let conn = create_identity_database(&path);
@@ -1669,6 +2265,7 @@ mod tests {
                 is_subagent: true,
                 parent_id: Some("parent".into()),
                 parent_conflict: false,
+                rollout_path: None,
             }
         );
         assert_eq!(identities["source"], identities["edge"]);
@@ -1679,19 +2276,21 @@ mod tests {
                 is_subagent: true,
                 parent_id: None,
                 parent_conflict: false,
+                rollout_path: None,
             }
         );
         assert_eq!(identities["source-only"], identities["thread-source"]);
+        assert_eq!(identities["user-override"], identities["edge"]);
         assert_eq!(
-            identities["user-override"],
+            identities["parent"],
             UsageThreadIdentity {
                 classification_known: true,
                 is_subagent: false,
                 parent_id: None,
                 parent_conflict: false,
+                rollout_path: None,
             }
         );
-        assert_eq!(identities["parent"], identities["user-override"]);
         assert_eq!(fs::read(&path).unwrap(), before);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1718,6 +2317,7 @@ mod tests {
                     classification_known: false,
                     parent_id: None,
                     parent_conflict: false,
+                    rollout_path: None,
                 }
             );
         }
@@ -1750,6 +2350,7 @@ mod tests {
                 is_subagent: false,
                 parent_id: None,
                 parent_conflict: false,
+                rollout_path: None,
             }
         );
         assert_eq!(
@@ -1783,6 +2384,7 @@ mod tests {
                 is_subagent: true,
                 parent_id: None,
                 parent_conflict: true,
+                rollout_path: None,
             }
         );
         assert_eq!(identities["legacy"], identities["conflict"]);

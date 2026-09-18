@@ -5,7 +5,7 @@ use super::official_auth::{
     auth_value_has_material, build_official_config_text,
     capture_live_official_config_before_provider_switch, document_is_official,
     live_config_is_official, official_config_candidate, official_snapshot_path,
-    save_official_config_snapshot, validate_official_config_text,
+    save_official_config_snapshot, saved_official_profile_candidate, validate_official_config_text,
 };
 use super::{
     custom_provider_id, delete_provider_inner, experimental_bearer_token_from_doc,
@@ -73,7 +73,7 @@ pub(super) enum LiveAuthAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LiveWriteOrder {
+pub(crate) enum LiveWriteOrder {
     AuthFirst,
     ConfigFirst,
 }
@@ -87,7 +87,7 @@ fn config_snapshot_is_official(config: Option<&[u8]>) -> Option<bool> {
     Some(document_is_official(&doc))
 }
 
-fn replacement_write_order(
+pub(crate) fn replacement_write_order(
     current_config: Option<&[u8]>,
     target_config: Option<&[u8]>,
 ) -> LiveWriteOrder {
@@ -536,6 +536,7 @@ pub(crate) fn detected_live_custom_provider(codex_dir: &Path) -> Result<Option<S
         return Ok(None);
     }
     let doc = parse_toml_document(&cfg, &text)?;
+    let doc = crate::failover::direct_document(codex_dir, &doc)?;
     let Some(provider_id) = string_value(&doc, "model_provider") else {
         return Ok(None);
     };
@@ -595,6 +596,138 @@ pub(super) fn persist_detected_live_custom_provider(
     save_detected_provider_with_rollback_inner(codex_dir, live)
 }
 
+// These keys belong to a provider/model selection, rather than shared Codex
+// integrations. Keep this explicit: model_instructions_file, for example, is shared.
+const PROVIDER_MODEL_ROOTS: &[&str] = &[
+    "model",
+    "review_model",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "model_verbosity",
+    "model_context_window",
+    "model_auto_compact_token_limit",
+    "model_supports_reasoning_summaries",
+    "model_catalog_json",
+    "service_tier",
+    "disable_response_storage",
+];
+
+fn is_provider_only_document(doc: &DocumentMut) -> bool {
+    doc.as_table().iter().all(|(key, _)| {
+        PROVIDER_MODEL_ROOTS.contains(&key)
+            || matches!(
+                key,
+                "model_provider" | "model_providers" | "experimental_bearer_token"
+            )
+    })
+}
+
+fn common_config_handled(codex_dir: &Path) -> Result<bool> {
+    open_store()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_common_config_state WHERE codex_dir = ?1)",
+            [crate::paths::normalized_path_scope(codex_dir)],
+            |row| row.get(0),
+        )
+        .map_err(|error| CodexxError::Database(error.to_string()))
+}
+
+fn mark_common_config_handled(codex_dir: &Path) -> Result<()> {
+    open_store()?.execute(
+        "INSERT OR IGNORE INTO provider_common_config_state (codex_dir, handled_at) VALUES (?1, ?2)",
+        (crate::paths::normalized_path_scope(codex_dir), crate::now_rfc3339()),
+    ).map_err(|error| CodexxError::Database(error.to_string()))?;
+    Ok(())
+}
+
+fn provider_config_base_document(codex_dir: &Path) -> Result<DocumentMut> {
+    let cfg = config_path(codex_dir);
+    let text = read_to_string_if_exists(&cfg)?;
+    // A broken live file must be surfaced, not silently replaced with a snapshot.
+    let current = parse_toml_document(&cfg, &text)?;
+    let mut current = crate::failover::direct_document(codex_dir, &current)?;
+    if is_provider_only_document(&current) && !common_config_handled(codex_dir)? {
+        let snapshot = saved_official_profile_candidate(
+            codex_dir,
+            super::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID,
+        )?;
+        if let Some(text) = snapshot.and_then(|snapshot| snapshot.config_text) {
+            let official = parse_toml_document(&cfg, &text)?;
+            // Only recover shared integration tables from the trusted same-home
+            // snapshot. Never recover old auth, routing, execution or model defaults.
+            for key in [
+                "mcp_servers",
+                "desktop",
+                "marketplaces",
+                "plugins",
+                "projects",
+            ] {
+                if current.get(key).is_none() {
+                    if let Some(item) = official
+                        .get(key)
+                        .filter(|item| item.as_table_like().is_some())
+                    {
+                        current.as_table_mut().insert(key, item.clone());
+                    }
+                }
+            }
+        }
+    }
+    strip_provider_bearer_tokens(&mut current);
+    Ok(current)
+}
+
+pub(crate) fn get_provider_config_base_inner(config_dir: Option<String>) -> Result<String> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    Ok(provider_config_base_document(&codex_dir)?
+        .to_string()
+        .trim_end()
+        .to_string())
+}
+
+fn overlay_provider_template(base: &mut DocumentMut, template: &DocumentMut) -> Result<()> {
+    for (key, item) in template.as_table().iter() {
+        if key == "model_providers" {
+            let providers = ensure_table(base.as_table_mut(), key)?;
+            if let Some(tables) = item.as_table() {
+                for (id, table) in tables.iter() {
+                    providers.insert(id, table.clone());
+                }
+            }
+        } else {
+            base.as_table_mut().insert(key, item.clone());
+        }
+    }
+    Ok(())
+}
+
+fn clear_foreign_provider_credentials(
+    table: &mut toml_edit::Table,
+    base_url: &str,
+    own_template: bool,
+) {
+    let same_endpoint = table
+        .get("base_url")
+        .and_then(Item::as_str)
+        .is_some_and(|old| {
+            super::store::canonical_provider_base_url(old)
+                == super::store::canonical_provider_base_url(base_url)
+        });
+    if !own_template || !same_endpoint {
+        for key in [
+            "experimental_bearer_token",
+            "env_key",
+            "env_key_instructions",
+            "auth",
+            "http_headers",
+            "env_http_headers",
+            "query_params",
+        ] {
+            table.remove(key);
+        }
+    }
+}
+
 pub(crate) fn build_provider_toml_draft_inner(
     provider: SavedProvider,
     config_dir: Option<String>,
@@ -617,11 +750,20 @@ pub(crate) fn build_provider_toml_draft_with_origin_inner(
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty());
-    let base_text = match saved_template {
-        Some(text) => text.to_string(),
-        None => read_to_string_if_exists(&cfg)?,
+    let mut doc = match saved_template {
+        Some(text) => {
+            let template = parse_toml_document(&cfg, text)?;
+            let template = crate::failover::direct_document(&codex_dir, &template)?;
+            if is_provider_only_document(&template) {
+                let mut base = provider_config_base_document(&codex_dir)?;
+                overlay_provider_template(&mut base, &template)?;
+                base
+            } else {
+                template
+            }
+        }
+        None => provider_config_base_document(&codex_dir)?,
     };
-    let mut doc = parse_toml_document(&cfg, &base_text)?;
     strip_provider_bearer_tokens(&mut doc);
 
     let provider_id = saved_template
@@ -638,6 +780,11 @@ pub(crate) fn build_provider_toml_draft_with_origin_inner(
     doc["model"] = value(provider.model.trim());
     let providers = ensure_table(doc.as_table_mut(), "model_providers")?;
     let table = ensure_table(providers, &provider_id)?;
+    clear_foreign_provider_credentials(
+        table,
+        &provider.base_url,
+        saved_template.is_some() && !new_provider,
+    );
     super::transport::configure_third_party_transport(
         table,
         &provider.base_url,
@@ -1017,11 +1164,28 @@ pub(crate) fn reset_official_provider_inner(
     rollback_persisted_provider(result, provider_rollback)
 }
 
+#[cfg(test)]
 fn merge_provider_toml_into_live(
     cfg: &Path,
     current_text: &str,
     provider_text: &str,
     explicit_api_key: Option<String>,
+) -> Result<(DocumentMut, Option<String>)> {
+    merge_provider_toml_into_live_with_policy(
+        cfg,
+        current_text,
+        provider_text,
+        explicit_api_key,
+        false,
+    )
+}
+
+fn merge_provider_toml_into_live_with_policy(
+    cfg: &Path,
+    current_text: &str,
+    provider_text: &str,
+    explicit_api_key: Option<String>,
+    explicit_full_config: bool,
 ) -> Result<(DocumentMut, Option<String>)> {
     let source = parse_toml_document(cfg, provider_text)?;
     let model = string_value(&source, "model")
@@ -1099,7 +1263,7 @@ fn merge_provider_toml_into_live(
             .as_table()
             .iter()
             .any(|(key, _)| !matches!(key, "model_provider" | "model" | "model_providers"));
-    let mut live = if has_complete_config {
+    let mut live = if explicit_full_config || has_complete_config {
         source
     } else {
         parse_toml_document(cfg, current_text)?
@@ -1125,7 +1289,14 @@ fn save_provider_toml_config_locked<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
-    save_provider_toml_config_with_catalog_locked(codex_dir, input, old_config, pre_persist, None)
+    save_provider_toml_config_with_catalog_locked(
+        codex_dir,
+        input,
+        old_config,
+        pre_persist,
+        None,
+        false,
+    )
 }
 
 fn save_provider_toml_config_with_catalog_locked<F>(
@@ -1134,6 +1305,7 @@ fn save_provider_toml_config_with_catalog_locked<F>(
     old_config: Option<Vec<u8>>,
     pre_persist: F,
     saved: Option<&SavedProvider>,
+    explicit_full_config: bool,
 ) -> Result<ActionResult>
 where
     F: FnOnce(&Path) -> Result<()>,
@@ -1145,11 +1317,12 @@ where
         pre_persist(codex_dir)?;
         let backup_id = create_backup(codex_dir, "save-provider-toml")?;
         let current_text = text_from_snapshot(&cfg, old_config.as_deref())?;
-        let (mut doc, api_key) = merge_provider_toml_into_live(
+        let (mut doc, api_key) = merge_provider_toml_into_live_with_policy(
             &cfg,
             &current_text,
             input.config_text.trim_end(),
             input.api_key,
+            explicit_full_config,
         )?;
         if let Some(saved) = saved {
             // Resolve the menu after sparse legacy templates inherit common
@@ -1185,7 +1358,13 @@ where
         Ok(live) => live,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
-    finish_live_action(codex_dir, message, backup_id, &live, snapshot.as_ref())
+    let result = finish_live_action(codex_dir, message, backup_id, &live, snapshot.as_ref())?;
+    // After a validated application, an empty shared configuration may be a
+    // deliberate edit. Do not resurrect an older official snapshot next time.
+    if let Err(error) = mark_common_config_handled(codex_dir) {
+        return rollback_after_failure(error, Some(&live), snapshot.as_ref());
+    }
+    Ok(result)
 }
 
 pub(crate) fn save_provider_toml_config_with_pre_persist<F>(
@@ -1390,18 +1569,142 @@ pub(crate) fn save_active_provider_inner(
     save_active_provider_with_apply(provider, config_dir, apply_saved_provider_locked)
 }
 
+pub(crate) fn save_active_provider_with_common_config_inner(
+    provider: SavedProvider,
+    config_dir: Option<String>,
+) -> Result<ActionResult> {
+    save_active_provider_with_apply(provider, config_dir, |saved, dir, before| {
+        apply_saved_provider_with_policy_locked(saved, dir, before, true)
+    })
+}
+
 fn apply_saved_provider_locked(
     saved: &SavedProvider,
     codex_dir: &Path,
     active_config: Option<Vec<u8>>,
+) -> Result<ActionResult> {
+    apply_saved_provider_with_policy_locked(saved, codex_dir, active_config, false)
+}
+
+fn provider_activation_document(saved: &SavedProvider, codex_dir: &Path) -> Result<DocumentMut> {
+    let draft =
+        build_provider_toml_draft_inner(saved.clone(), Some(codex_dir.display().to_string()))?;
+    let target = parse_toml_document(&config_path(codex_dir), &draft)?;
+    let preferences = saved
+        .toml_config
+        .as_deref()
+        .map(|text| parse_toml_document(&config_path(codex_dir), text))
+        .transpose()?
+        .unwrap_or_default();
+    let mut current = provider_config_base_document(codex_dir)?;
+    for key in PROVIDER_MODEL_ROOTS {
+        // Privacy is shared, even though legacy thin templates included it.
+        if *key == "disable_response_storage" {
+            continue;
+        }
+        match preferences.get(key) {
+            Some(item) => {
+                current.as_table_mut().insert(key, item.clone());
+            }
+            None if *key != "model_catalog_json" => {
+                current.as_table_mut().remove(key);
+            }
+            None => {}
+        }
+    }
+    // Model catalogs are finalized by prepare_model_catalog. Its existing rule
+    // removes app-owned catalogs while retaining an explicitly supplied user file.
+    current["model"] = value(saved.model.clone());
+    let provider_id = string_value(&target, "model_provider")
+        .ok_or_else(|| CodexxError::Config("供应商配置缺少 model_provider".to_string()))?;
+    current["model_provider"] = value(provider_id.clone());
+    let table = target
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .cloned()
+        .ok_or_else(|| CodexxError::Config("供应商配置缺少模型接口设置".to_string()))?;
+    ensure_table(current.as_table_mut(), "model_providers")?.insert(&provider_id, table);
+    strip_provider_bearer_tokens(&mut current);
+    Ok(current)
+}
+
+pub(super) fn official_activation_config_text(
+    codex_dir: &Path,
+    target_text: &str,
+) -> Result<String> {
+    let target = parse_toml_document(&config_path(codex_dir), target_text)?;
+    let mut current = provider_config_base_document(codex_dir)?;
+    for key in PROVIDER_MODEL_ROOTS {
+        if *key == "disable_response_storage" {
+            continue;
+        }
+        match target.get(key) {
+            Some(item) => {
+                current.as_table_mut().insert(key, item.clone());
+            }
+            None if *key != "model_catalog_json" => {
+                current.as_table_mut().remove(key);
+            }
+            None => {}
+        }
+    }
+    // Official routing and account constraints come only from the selected
+    // official configuration. Never inherit a third-party endpoint or credential.
+    for key in [
+        "model_provider",
+        "model_providers",
+        "base_url",
+        "experimental_bearer_token",
+        "auth",
+        "auth_mode",
+        "tokens",
+        "openai_api_key",
+        "api_key",
+        "api_base",
+        "chatgpt_base_url",
+        "forced_login_method",
+        "forced_chatgpt_workspace_id",
+        "env_key",
+        "env_key_instructions",
+        "http_headers",
+        "env_http_headers",
+        "query_params",
+    ] {
+        current.as_table_mut().remove(key);
+        if let Some(item) = target.get(key) {
+            current.as_table_mut().insert(key, item.clone());
+        }
+    }
+    let model = string_value(&target, "model");
+    Ok(validate_official_config_text(codex_dir, &current.to_string(), model.as_deref())?.0)
+}
+
+fn apply_saved_provider_with_policy_locked(
+    saved: &SavedProvider,
+    codex_dir: &Path,
+    active_config: Option<Vec<u8>>,
+    apply_common_config: bool,
 ) -> Result<ActionResult> {
     if !saved.model_mappings.is_empty() && saved.wire_api != "responses" {
         return Err(CodexxError::Config(
             "模型映射需要供应商提供 Responses 兼容接口，请检查 Wire API 设置".into(),
         ));
     }
-    let config_text =
-        build_provider_toml_draft_inner(saved.clone(), Some(codex_dir.display().to_string()))?;
+    let config_text = if apply_common_config {
+        match saved.toml_config.as_deref() {
+            Some(text) => {
+                let doc = parse_toml_document(&config_path(codex_dir), text)?;
+                crate::failover::direct_document(codex_dir, &doc)?.to_string()
+            }
+            None => build_provider_toml_draft_inner(
+                saved.clone(),
+                Some(codex_dir.display().to_string()),
+            )?,
+        }
+    } else {
+        provider_activation_document(saved, codex_dir)?.to_string()
+    };
     save_provider_toml_config_with_catalog_locked(
         codex_dir,
         ProviderTomlInput {
@@ -1412,6 +1715,7 @@ fn apply_saved_provider_locked(
         active_config,
         |_| Ok(()),
         Some(saved),
+        true,
     )
 }
 
@@ -3428,5 +3732,620 @@ experimental_bearer_token = "sk-external"
         delete_provider_inner(&first.id).unwrap();
         delete_provider_inner(&second.id).unwrap();
         fs::remove_dir_all(codex_dir).unwrap();
+    }
+    const INHERITED_COMMON_FIXTURE: &str = r#"
+[desktop]
+notifications = false
+[marketplaces.fixture]
+source = "current-local-source"
+[plugins."fixture@local"]
+enabled = true
+[projects."/fixture/project"]
+trust_level = "trusted"
+[mcp_servers.current]
+command = "current-mcp"
+[mcp_servers.current.env]
+MCP_KEY = "current-mcp-key"
+[future_common]
+mode = "current-future-mode"
+"#;
+
+    #[test]
+    fn thin_provider_draft_inherits_live_common_and_keeps_explicit_model_preferences() {
+        let dir = active_provider_test_dir("thin-draft-inheritance", 70_001);
+        let current = active_provider_fixture(70_001, "current", "Current", "old-model", "old-key");
+        let text = format!(
+            "{}{}",
+            current.toml_config.as_ref().unwrap(),
+            INHERITED_COMMON_FIXTURE
+        );
+        fs::write(config_path(&dir), &text).unwrap();
+        fs::write(auth_path(&dir), b"{\"OPENAI_API_KEY\":\"old-auth\"}").unwrap();
+        let auth = fs::read(auth_path(&dir)).unwrap();
+        let mut target =
+            active_provider_fixture(70_002, "target", "Target", "new-model", "new-key");
+        let mut template = target
+            .toml_config
+            .as_deref()
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        template["model_reasoning_effort"] = value("low");
+        template["disable_response_storage"] = value(true);
+        template["model_context_window"] = value(128000);
+        target.toml_config = Some(template.to_string());
+        for new_provider in [true, false] {
+            let draft = build_provider_toml_draft_with_origin_inner(
+                target.clone(),
+                Some(dir.display().to_string()),
+                new_provider,
+            )
+            .unwrap();
+            let draft = draft.parse::<DocumentMut>().unwrap();
+            assert_eq!(
+                draft["mcp_servers"]["current"]["env"]["MCP_KEY"].as_str(),
+                Some("current-mcp-key")
+            );
+            assert_eq!(draft["desktop"]["notifications"].as_bool(), Some(false));
+            assert_eq!(
+                draft["marketplaces"]["fixture"]["source"].as_str(),
+                Some("current-local-source")
+            );
+            assert_eq!(
+                draft["future_common"]["mode"].as_str(),
+                Some("current-future-mode")
+            );
+            assert_eq!(draft["model"].as_str(), Some("new-model"));
+            assert_eq!(draft["model_reasoning_effort"].as_str(), Some("low"));
+            assert_eq!(draft["model_context_window"].as_integer(), Some(128000));
+        }
+        assert_eq!(fs::read_to_string(config_path(&dir)).unwrap(), text);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), auth);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn thin_live_draft_recovers_only_integration_tables_from_same_home_official_snapshot() {
+        let dir = active_provider_test_dir("thin-live-snapshot", 70_003);
+        let current =
+            active_provider_fixture(70_003, "current", "Current", "current-model", "current-key");
+        let mut text = current
+            .toml_config
+            .as_deref()
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        text["model_reasoning_effort"] = value("low");
+        text["disable_response_storage"] = value(true);
+        text["model_providers"]["custom"]["experimental_bearer_token"] = value("current-bearer");
+        let text = text.to_string();
+        fs::write(config_path(&dir), &text).unwrap();
+        fs::write(auth_path(&dir), b"{\"OPENAI_API_KEY\":\"current-auth\"}").unwrap();
+        let auth = fs::read(auth_path(&dir)).unwrap();
+        let official = format!("model_provider = 'openai'\nmodel = 'official-model'\nmodel_reasoning_effort = 'xhigh'\nmodel_context_window = 1000000\nmodel_catalog_json = '/official-only-models.json'\nsandbox_mode = 'danger-full-access'\napproval_policy = 'never'\nservice_tier = 'priority'\nnotify = ['never-copy-this-command']\nexperimental_bearer_token = 'official-only-key'\n{INHERITED_COMMON_FIXTURE}");
+        save_official_config_snapshot(
+            &dir,
+            Some(official),
+            Some("official-model".into()),
+            &json!({"auth_mode":"chatgpt","tokens":{"access_token":"official-private-token"}}),
+        )
+        .unwrap();
+        let snapshot_path = super::super::official_auth::official_snapshot_path_for_profile(
+            &dir,
+            super::super::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID,
+        )
+        .unwrap();
+        let snapshot = fs::read(&snapshot_path).unwrap();
+        let base = get_provider_config_base_inner(Some(dir.display().to_string())).unwrap();
+        let doc = base.parse::<DocumentMut>().unwrap();
+        for key in [
+            "mcp_servers",
+            "desktop",
+            "marketplaces",
+            "plugins",
+            "projects",
+        ] {
+            assert!(doc.get(key).is_some(), "missing inherited {key}");
+        }
+        for key in [
+            "sandbox_mode",
+            "approval_policy",
+            "service_tier",
+            "notify",
+            "future_common",
+            "model_context_window",
+            "model_catalog_json",
+            "experimental_bearer_token",
+        ] {
+            assert!(doc.get(key).is_none(), "unexpected snapshot key {key}");
+        }
+        assert_eq!(doc["model"].as_str(), Some("current-model"));
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("low"));
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+        assert!(!base.contains("official-only"));
+        assert!(!base.contains("official-private-token"));
+        assert!(!base.contains("current-bearer"));
+        assert_eq!(fs::read_to_string(config_path(&dir)).unwrap(), text);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), auth);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        // A copied snapshot from a different CODEX_HOME is not a trusted fallback.
+        let mut wrong_scope: Value = serde_json::from_slice(&snapshot).unwrap();
+        wrong_scope["codexDir"] = json!(dir.join("different-home").display().to_string());
+        fs::write(&snapshot_path, serde_json::to_vec(&wrong_scope).unwrap()).unwrap();
+        let isolated = get_provider_config_base_inner(Some(dir.display().to_string()))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(isolated.get("mcp_servers").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn normal_saved_activation_preserves_current_common_for_full_and_thin_templates() {
+        let _guard = crate::app_db::test_db_guard();
+        for full_template in [false, true] {
+            let tag = if full_template { 70_005 } else { 70_004 };
+            let dir = active_provider_test_dir("activation-common", tag);
+            let current = active_provider_fixture(
+                tag,
+                &format!("inherit-current-{tag}"),
+                "Current",
+                "old-model",
+                "old-key",
+            );
+            let current = save_provider_inner(current).unwrap();
+            let mut live = current
+                .toml_config
+                .as_deref()
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            live["disable_response_storage"] = value(true);
+            live["model_context_window"] = value(1000000);
+            live["model_auto_compact_token_limit"] = value(900000);
+            let live = format!("{}{}", live, INHERITED_COMMON_FIXTURE);
+            fs::write(config_path(&dir), &live).unwrap();
+            remember_active_provider_on_connection(&open_store().unwrap(), &dir, &current.id)
+                .unwrap();
+            let mut target = active_provider_fixture(
+                tag + 20,
+                &format!("inherit-target-{tag}"),
+                "Target",
+                "target-model",
+                "target-key",
+            );
+            let mut template = target
+                .toml_config
+                .as_deref()
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            template["model_reasoning_effort"] = value("high");
+            if full_template {
+                template["disable_response_storage"] = value(false);
+                template["model_context_window"] = value(128000);
+            }
+            target.toml_config = Some(template.to_string());
+            if full_template {
+                target
+                    .toml_config
+                    .as_mut()
+                    .unwrap()
+                    .push_str(&INHERITED_COMMON_FIXTURE.replace("current-", "stale-"));
+            }
+            let target = save_provider_inner(target).unwrap();
+            activate_saved_provider_inner(Some(dir.display().to_string()), target.id.clone())
+                .unwrap();
+            let applied = fs::read_to_string(config_path(&dir))
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                applied["mcp_servers"]["current"]["env"]["MCP_KEY"].as_str(),
+                Some("current-mcp-key")
+            );
+            assert_eq!(applied["desktop"]["notifications"].as_bool(), Some(false));
+            assert_eq!(
+                applied["marketplaces"]["fixture"]["source"].as_str(),
+                Some("current-local-source")
+            );
+            assert_eq!(
+                applied["future_common"]["mode"].as_str(),
+                Some("current-future-mode")
+            );
+            assert_eq!(applied["model"].as_str(), Some("target-model"));
+            assert_eq!(applied["model_reasoning_effort"].as_str(), Some("high"));
+            assert_eq!(applied["disable_response_storage"].as_bool(), Some(true));
+            if full_template {
+                assert_eq!(applied["model_context_window"].as_integer(), Some(128000));
+            } else {
+                assert!(applied.get("model_context_window").is_none());
+            }
+            assert!(applied.get("model_auto_compact_token_limit").is_none());
+            let before = live.parse::<DocumentMut>().unwrap();
+            for key in [
+                "mcp_servers",
+                "desktop",
+                "marketplaces",
+                "plugins",
+                "projects",
+                "future_common",
+            ] {
+                assert_eq!(
+                    applied[key].to_string(),
+                    before[key].to_string(),
+                    "shared table changed: {key}"
+                );
+            }
+            assert_eq!(
+                applied["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+                Some("target-key")
+            );
+            assert!(!applied.to_string().contains("stale-"));
+            delete_provider_inner(&current.id).unwrap();
+            delete_provider_inner(&target.id).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn active_edits_preserve_common_by_default_and_apply_explicit_manual_removal() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = active_provider_test_dir("active-common-policy", 70_006);
+        let provider = save_provider_inner(active_provider_fixture(
+            70_006,
+            "active-common-policy-70006",
+            "Active",
+            "model",
+            "active-key",
+        ))
+        .unwrap();
+        fs::write(
+            config_path(&dir),
+            format!(
+                "{}{}",
+                provider.toml_config.as_ref().unwrap(),
+                INHERITED_COMMON_FIXTURE
+            ),
+        )
+        .unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &provider.id).unwrap();
+        let mut edited = provider.clone();
+        edited.provider_name = "Renamed".into();
+        edited.model = "new-model".into();
+        save_active_provider_inner(edited, Some(dir.display().to_string())).unwrap();
+        let after_normal = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            after_normal["mcp_servers"]["current"]["command"].as_str(),
+            Some("current-mcp")
+        );
+        let edited = saved_provider(&provider.id);
+        // The explicit editor supplied only provider settings: deleted common
+        // tables must stay deleted rather than being silently inherited again.
+        save_active_provider_with_common_config_inner(edited, Some(dir.display().to_string()))
+            .unwrap();
+        let after_explicit = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(after_explicit.get("mcp_servers").is_none());
+        assert!(after_explicit.get("desktop").is_none());
+        assert!(after_explicit.get("future_common").is_none());
+        assert_eq!(after_explicit["model"].as_str(), Some("new-model"));
+        delete_provider_inner(&provider.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provider_base_and_activation_do_not_hide_a_malformed_live_file() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = active_provider_test_dir("malformed-base", 70_007);
+        let malformed = "model = [\n[mcp_servers\n";
+        fs::write(config_path(&dir), malformed).unwrap();
+        let mut target = active_provider_fixture(
+            70_007,
+            "malformed-base-70007",
+            "Target",
+            "model",
+            "fixture-key",
+        );
+        assert!(get_provider_config_base_inner(Some(dir.display().to_string())).is_err());
+        assert!(
+            build_provider_toml_draft_inner(target.clone(), Some(dir.display().to_string()))
+                .is_err()
+        );
+        target
+            .toml_config
+            .as_mut()
+            .unwrap()
+            .push_str(INHERITED_COMMON_FIXTURE);
+        let target = save_provider_inner(target).unwrap();
+        assert!(
+            activate_saved_provider_inner(Some(dir.display().to_string()), target.id.clone())
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(config_path(&dir)).unwrap(), malformed);
+        assert!(!auth_path(&dir).exists());
+        delete_provider_inner(&target.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_or_changed_provider_drafts_drop_vendor_credentials_but_keep_mcp_env() {
+        let dir = active_provider_test_dir("credential-inheritance", 70_008);
+        let mut source =
+            active_provider_fixture(70_008, "credential-source", "Source", "model", "source-key");
+        source.toml_config.as_mut().unwrap().push_str("env_key = 'OLD_API_KEY'\nenv_key_instructions = 'old instructions'\nauth = { command = 'old-auth-command' }\nhttp_headers = { 'X-API-Key' = 'old-header-key' }\nenv_http_headers = { 'X-Project' = 'OLD_PROJECT' }\nquery_params = { api_key = 'old-query-key' }\n");
+        source
+            .toml_config
+            .as_mut()
+            .unwrap()
+            .push_str(INHERITED_COMMON_FIXTURE);
+        for (new_provider, change_endpoint) in [(true, false), (false, true), (false, false)] {
+            let mut target = source.clone();
+            if change_endpoint {
+                target.base_url = "https://different.example.test/v1".into();
+            }
+            let doc = build_provider_toml_draft_with_origin_inner(
+                target,
+                Some(dir.display().to_string()),
+                new_provider,
+            )
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+            let route = doc["model_providers"]["custom"].as_table().unwrap();
+            for key in [
+                "env_key",
+                "env_key_instructions",
+                "auth",
+                "http_headers",
+                "env_http_headers",
+                "query_params",
+            ] {
+                assert_eq!(
+                    route.contains_key(key),
+                    !new_provider && !change_endpoint,
+                    "unexpected inherited {key}"
+                );
+            }
+            assert_eq!(
+                doc["mcp_servers"]["current"]["env"]["MCP_KEY"].as_str(),
+                Some("current-mcp-key")
+            );
+        }
+        assert!(!config_path(&dir).exists());
+        assert!(!auth_path(&dir).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    fn write_common_recovery_snapshot(dir: &Path) {
+        let official = format!(
+            "model_provider = 'openai'\nmodel = 'official-model'\n{INHERITED_COMMON_FIXTURE}"
+        );
+        save_official_config_snapshot(
+            dir,
+            Some(official),
+            Some("official-model".into()),
+            &json!({"auth_mode":"chatgpt","tokens":{"access_token":"snapshot-fixture-token"}}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_empty_common_config_does_not_resurrect_on_later_drafts_or_activation() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = active_provider_test_dir("intentional-empty-common", 70_009);
+        let current = save_provider_inner(active_provider_fixture(
+            70_009,
+            "intentional-empty-current",
+            "Current",
+            "current-model",
+            "current-key",
+        ))
+        .unwrap();
+        fs::write(config_path(&dir), current.toml_config.as_ref().unwrap()).unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &current.id).unwrap();
+        write_common_recovery_snapshot(&dir);
+        let preview = get_provider_config_base_inner(Some(dir.display().to_string())).unwrap();
+        assert!(preview.contains("[mcp_servers.current]"));
+        assert!(
+            !common_config_handled(&dir).unwrap(),
+            "preview must not consume recovery"
+        );
+        let mut target = active_provider_fixture(
+            70_010,
+            "intentional-empty-target",
+            "Target",
+            "target-model",
+            "target-key",
+        );
+        target
+            .toml_config
+            .as_mut()
+            .unwrap()
+            .push_str(INHERITED_COMMON_FIXTURE);
+        let target = save_provider_inner(target).unwrap();
+        assert!(
+            !common_config_handled(&dir).unwrap(),
+            "inactive save must not consume recovery"
+        );
+        // Explicitly applying the edited minimal document intentionally removes
+        // all integration tables even though an older official snapshot has them.
+        save_active_provider_with_common_config_inner(
+            current.clone(),
+            Some(dir.display().to_string()),
+        )
+        .unwrap();
+        assert!(common_config_handled(&dir).unwrap());
+        let base = get_provider_config_base_inner(Some(dir.display().to_string()))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(base.get("mcp_servers").is_none());
+        let new_target =
+            active_provider_fixture(70_011, "new-empty-draft", "New", "new-model", "new-key");
+        let draft = build_provider_toml_draft_with_origin_inner(
+            new_target,
+            Some(dir.display().to_string()),
+            true,
+        )
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+        assert!(draft.get("mcp_servers").is_none());
+        activate_saved_provider_inner(Some(dir.display().to_string()), target.id.clone()).unwrap();
+        let applied = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        for key in [
+            "mcp_servers",
+            "desktop",
+            "marketplaces",
+            "plugins",
+            "projects",
+        ] {
+            assert!(
+                applied.get(key).is_none(),
+                "intentionally removed {key} was resurrected"
+            );
+        }
+        // Completion in one CODEX_HOME cannot suppress recovery in another.
+        let other = active_provider_test_dir("unhandled-other-home", 70_012);
+        fs::write(config_path(&other), current.toml_config.as_ref().unwrap()).unwrap();
+        write_common_recovery_snapshot(&other);
+        assert!(
+            get_provider_config_base_inner(Some(other.display().to_string()))
+                .unwrap()
+                .contains("[mcp_servers.current]")
+        );
+        assert!(!common_config_handled(&other).unwrap());
+        delete_provider_inner(&current.id).unwrap();
+        delete_provider_inner(&target.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn failed_recovery_marker_write_rolls_back_live_files_and_keeps_recovery_available() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = active_provider_test_dir("common-marker-failure", 70_013);
+        let current = save_provider_inner(active_provider_fixture(
+            70_013,
+            "common-marker-current",
+            "Current",
+            "current-model",
+            "current-key",
+        ))
+        .unwrap();
+        fs::write(config_path(&dir), current.toml_config.as_ref().unwrap()).unwrap();
+        fs::write(auth_path(&dir), b"{\"OPENAI_API_KEY\":\"current-key\"}").unwrap();
+        remember_active_provider_on_connection(&open_store().unwrap(), &dir, &current.id).unwrap();
+        write_common_recovery_snapshot(&dir);
+        let target = save_provider_inner(active_provider_fixture(
+            70_014,
+            "common-marker-target",
+            "Target",
+            "target-model",
+            "target-key",
+        ))
+        .unwrap();
+        let config_before = fs::read(config_path(&dir)).unwrap();
+        let auth_before = fs::read(auth_path(&dir)).unwrap();
+        let scope = crate::paths::normalized_path_scope(&dir).replace('\'', "''");
+        open_store().unwrap().execute_batch(&format!("CREATE TRIGGER reject_common_marker BEFORE INSERT ON provider_common_config_state WHEN NEW.codex_dir = '{scope}' BEGIN SELECT RAISE(ABORT, 'marker-blocked'); END;")).unwrap();
+        let error =
+            activate_saved_provider_inner(Some(dir.display().to_string()), target.id.clone())
+                .expect_err("marker write must not report success");
+        open_store()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_common_marker")
+            .unwrap();
+        assert!(error.to_string().contains("marker-blocked"), "{error}");
+        assert_eq!(fs::read(config_path(&dir)).unwrap(), config_before);
+        assert_eq!(fs::read(auth_path(&dir)).unwrap(), auth_before);
+        assert!(!common_config_handled(&dir).unwrap());
+        assert!(
+            get_provider_config_base_inner(Some(dir.display().to_string()))
+                .unwrap()
+                .contains("[mcp_servers.current]")
+        );
+        activate_saved_provider_inner(Some(dir.display().to_string()), target.id.clone()).unwrap();
+        assert!(common_config_handled(&dir).unwrap());
+        assert!(fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .contains("[mcp_servers.current]"));
+        delete_provider_inner(&current.id).unwrap();
+        delete_provider_inner(&target.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn recovered_common_survives_official_third_party_round_trip_with_auth_isolation() {
+        let _guard = crate::app_db::test_db_guard();
+        let dir = active_provider_test_dir("official-common-roundtrip", 70_015);
+        fs::write(config_path(&dir), "model_provider = 'openai'\nmodel = 'official-selected'\ndisable_response_storage = true\n").unwrap();
+        let official_auth = json!({"auth_mode":"chatgpt","tokens":{"access_token":"roundtrip-official-token","account_id":"roundtrip-account"}});
+        write_json(&auth_path(&dir), &official_auth).unwrap();
+        write_common_recovery_snapshot(&dir);
+        let third = save_provider_inner(active_provider_fixture(
+            70_015,
+            "common-roundtrip-third",
+            "Third",
+            "third-model",
+            "third-key",
+        ))
+        .unwrap();
+        let assert_common = || {
+            let doc = fs::read_to_string(config_path(&dir))
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            for key in [
+                "mcp_servers",
+                "desktop",
+                "marketplaces",
+                "plugins",
+                "projects",
+            ] {
+                assert!(doc.get(key).is_some(), "roundtrip lost {key}");
+            }
+            assert_eq!(
+                doc["mcp_servers"]["current"]["env"]["MCP_KEY"].as_str(),
+                Some("current-mcp-key")
+            );
+            doc
+        };
+        activate_saved_provider_inner(Some(dir.display().to_string()), third.id.clone()).unwrap();
+        assert_eq!(assert_common()["model"].as_str(), Some("third-model"));
+        assert!(common_config_handled(&dir).unwrap());
+        super::super::official_profiles::switch_official_profile_inner(
+            Some(dir.display().to_string()),
+            super::super::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
+        )
+        .unwrap();
+        let official = assert_common();
+        assert_eq!(official["model"].as_str(), Some("official-selected"));
+        assert!(document_is_official(&official));
+        assert!(!official.to_string().contains("third-key"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(auth_path(&dir)).unwrap()).unwrap(),
+            official_auth
+        );
+        activate_saved_provider_inner(Some(dir.display().to_string()), third.id.clone()).unwrap();
+        let third_doc = assert_common();
+        assert_eq!(third_doc["model"].as_str(), Some("third-model"));
+        assert_eq!(
+            third_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("third-key")
+        );
+        assert!(!third_doc.to_string().contains("roundtrip-official-token"));
+        assert!(!fs::read_to_string(auth_path(&dir))
+            .unwrap_or_default()
+            .contains("roundtrip-official-token"));
+        delete_provider_inner(&third.id).unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 }

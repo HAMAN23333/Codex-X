@@ -2,7 +2,10 @@ use super::catalog::{
     apply_catalog_updates, catalog_columns, create_catalog_rollback_tables,
     restore_catalog_updates, CatalogRepairThread,
 };
-use super::storage::{apply_session_changes, restore_session_changes};
+use super::storage::{
+    apply_session_changes, restore_session_changes, rollout_path_has_syncable_identity,
+    rollout_text_is_internal, sqlite_subagent_thread_ids,
+};
 use super::types::{RolloutScan, SessionFileChange};
 use crate::error::{CodexxError, Result};
 use crate::file_io::io_err;
@@ -182,6 +185,11 @@ fn apply_sqlite_updates(
     let mut sorted_thread_ids = syncable_thread_ids.iter().collect::<Vec<_>>();
     sorted_thread_ids.sort();
     for update in pending.iter_mut() {
+        let internal_ids = if update.thread_columns.contains("id") {
+            sqlite_subagent_thread_ids(&update.conn, &update.thread_columns)?
+        } else {
+            HashSet::new()
+        };
         if update.thread_columns.contains("id") && update.thread_columns.contains("model_provider")
         {
             let archived_filter = if update.thread_columns.contains("archived") {
@@ -203,6 +211,9 @@ fn apply_sqlite_updates(
                  WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1{archived_filter}"
             );
             for thread_id in &sorted_thread_ids {
+                if internal_ids.contains(*thread_id) {
+                    continue;
+                }
                 update
                     .conn
                     .execute(&snapshot_sql, (target_provider, thread_id))
@@ -234,7 +245,7 @@ fn apply_sqlite_updates(
                  WHERE id = ?2 AND COALESCE(cwd, '') <> ?1{archived_filter}"
             );
             for (thread_id, cwd) in &rollouts.cwd_by_thread_id {
-                if !syncable_thread_ids.contains(thread_id) {
+                if !syncable_thread_ids.contains(thread_id) || internal_ids.contains(thread_id) {
                     continue;
                 }
                 update
@@ -247,12 +258,16 @@ fn apply_sqlite_updates(
                     .map_err(|error| CodexxError::Database(error.to_string()))?;
             }
         }
+        let local_syncable_ids = syncable_thread_ids
+            .difference(&internal_ids)
+            .cloned()
+            .collect();
         let catalog_counts = apply_catalog_updates(
             &update.conn,
             &update.catalog_columns,
             target_provider,
             catalog_sources,
-            syncable_thread_ids,
+            &local_syncable_ids,
         )?;
         update.counts.provider_rows += catalog_counts.provider_rows;
         update.counts.catalog_insert_rows += catalog_counts.inserted_rows;
@@ -402,6 +417,8 @@ pub(super) fn mutation_error(original: CodexxError, recovery_errors: Vec<String>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MutationPoint {
     BeforeSqliteLock,
+    BeforeRolloutMutation,
+    AfterRolloutMutation,
     AfterSqliteCommit(usize),
 }
 
@@ -409,6 +426,30 @@ pub(super) struct MutationResult {
     pub(super) applied_rollouts: usize,
     pub(super) skipped_rollouts: Vec<PathBuf>,
     pub(super) sqlite_updates: SqliteUpdateCounts,
+}
+
+// A file may be reclassified after scanning. In particular, the general file
+// writer skips concurrently changed rollouts; that must not leave their old IDs
+// eligible for a catalog insert or a provider update in this transaction.
+fn validate_rollout_classification(rollouts: &RolloutScan) -> Result<()> {
+    let mut paths = rollouts.provider_candidate_paths.clone();
+    for change in &rollouts.changes {
+        if rollout_text_is_internal(&change.original_text) {
+            return Err(CodexxError::Config(
+                "内部会话不能同步为普通会话。".to_string(),
+            ));
+        }
+        paths.insert(change.path.clone());
+    }
+    for path in paths {
+        if !rollout_path_has_syncable_identity(&path)? {
+            return Err(CodexxError::Config(format!(
+                "会话类型已变化，已停止同步；请重新检查会话：{}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn execute_provider_sync_mutation<F>(
@@ -424,8 +465,12 @@ where
     F: FnMut(MutationPoint) -> Result<()>,
 {
     let result = (|| -> Result<MutationResult> {
+        hook(MutationPoint::BeforeRolloutMutation)?;
+        validate_rollout_classification(rollouts)?;
         let (applied_rollouts, skipped_rollouts) = apply_session_changes(&rollouts.changes)?;
         journal.applied_rollouts = applied_rollouts;
+        hook(MutationPoint::AfterRolloutMutation)?;
+        validate_rollout_classification(rollouts)?;
         apply_sqlite_updates(
             pending_sqlite,
             rollouts,

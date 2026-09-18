@@ -194,7 +194,7 @@ export type ProvidersPageProps = {
   onWireApiChange: (value: string) => void;
   onRequiresAuthChange: (value: boolean) => void;
   onToggleApiKeyVisibility: () => void;
-  onProviderTomlDraftChange: (value: string) => void;
+  onProviderTomlDraftChange: (value: string, origin?: "manual" | "context") => void;
   onResetProviderToml: () => void;
   onSaveProvider: () => void;
 };
@@ -868,7 +868,7 @@ function ProviderForm({
         <div className="cx-providers-section-heading cx-providers-section-heading--with-action">
           <div><h3>{copy.tomlTitle}</h3><p>{copy.tomlDescription}</p></div>
           <div className="cx-providers-context-actions">
-            <ContextWindowControl lang={lang} configText={providerTomlDraft} onConfigChange={onProviderTomlDraftChange} disabled={formBusy} onBusyChange={setContextWindowBusy} />
+            <ContextWindowControl lang={lang} configText={providerTomlDraft} onConfigChange={(value) => onProviderTomlDraftChange(value, "context")} disabled={formBusy} onBusyChange={setContextWindowBusy} />
             <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={onResetProviderToml} disabled={formBusy}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
           </div>
         </div>

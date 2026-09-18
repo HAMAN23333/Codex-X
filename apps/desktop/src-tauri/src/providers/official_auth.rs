@@ -201,7 +201,13 @@ fn live_official_config_text(codex_dir: &Path) -> Result<Option<String>> {
     }
     let text = fs::read_to_string(&path).map_err(|error| io_err(&path, error))?;
     let doc = parse_toml_document(&path, &text)?;
-    Ok(document_is_official(&doc).then_some(text))
+    let direct = crate::failover::direct_document(codex_dir, &doc)?;
+    let text = if direct.to_string() == doc.to_string() {
+        text
+    } else {
+        direct.to_string()
+    };
+    Ok(document_is_official(&direct).then_some(text))
 }
 
 fn remove_bearer_tokens(doc: &mut toml_edit::DocumentMut) {
@@ -229,7 +235,8 @@ pub(crate) fn build_official_config_text(
     } else {
         String::new()
     };
-    let mut doc = parse_toml_document(&path, &text)?;
+    let doc = parse_toml_document(&path, &text)?;
+    let mut doc = crate::failover::direct_document(codex_dir, &doc)?;
 
     doc["model_provider"] = value("custom");
     doc.as_table_mut().remove("base_url");
@@ -302,6 +309,7 @@ pub(crate) fn live_config_is_official(codex_dir: &Path) -> Result<bool> {
     }
     let text = fs::read_to_string(&path).map_err(|error| io_err(&path, error))?;
     let doc = parse_toml_document(&path, &text)?;
+    let doc = crate::failover::direct_document(codex_dir, &doc)?;
     Ok(document_is_official(&doc))
 }
 

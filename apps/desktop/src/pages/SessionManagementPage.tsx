@@ -161,7 +161,7 @@ export function SessionManagementPage({
     ? {
         syncEyebrow: "会话同步",
         title: "会话管理",
-        description: "检查本地会话是否位于官方与中转共用的会话列表，需要时一键同步。不会修改聊天内容。",
+        description: "同步普通会话到共享列表，内部任务不参与同步。不会修改聊天内容。",
         syncTo: "同步到",
         check: "检查会话",
         checking: "检查中...",
@@ -170,7 +170,7 @@ export function SessionManagementPage({
         clickToCheck: "点击检查会话",
         scanIncomplete: "无法确认同步状态，请查看下方原因",
         needsSync: (count: number) => `有 ${count} 条会话需要同步`,
-        allSynced: "全部会话已同步",
+        allSynced: "普通会话已同步",
         sessionCount: (count: number) => `${count} 条会话`,
         local: "本地会话",
         list: "会话列表",
@@ -192,6 +192,7 @@ export function SessionManagementPage({
         selectSession: "选择会话",
         archived: "已归档",
         internal: "内部",
+        internalHint: "内部任务仅供查看，不参与会话同步。",
         pending: "待同步",
         unknownProvider: "未知供应商",
         noModel: "未记录",
@@ -214,7 +215,7 @@ export function SessionManagementPage({
     : {
         syncEyebrow: "SESSION SYNC",
         title: "Session management",
-        description: "Keep local sessions in one history shared by official and third-party providers. Chat content is not changed.",
+        description: "Keep user conversations in one shared history. Internal tasks are excluded from sync; chat content is unchanged.",
         syncTo: "Sync to",
         check: "Check sessions",
         checking: "Checking...",
@@ -223,7 +224,7 @@ export function SessionManagementPage({
         clickToCheck: "Check sessions to get started",
         scanIncomplete: "Unable to verify sync status. See the reason below.",
         needsSync: (count: number) => `${count} session(s) need syncing`,
-        allSynced: "All sessions are synced",
+        allSynced: "User conversations are synced",
         sessionCount: (count: number) => `${count} sessions`,
         local: "LOCAL SESSIONS",
         list: "Sessions",
@@ -245,6 +246,7 @@ export function SessionManagementPage({
         selectSession: "Select session",
         archived: "Archived",
         internal: "Internal",
+        internalHint: "Internal tasks are available for inspection and excluded from session sync.",
         pending: "Needs sync",
         unknownProvider: "Unknown provider",
         noModel: "Not recorded",
@@ -400,6 +402,7 @@ export function SessionManagementPage({
                 className={cx("cx-session-toggle", showInternalSessions && "cx-session-toggle--active")}
                 checked={showInternalSessions}
                 onCheckedChange={onShowInternalSessionsChange}
+                title={copy.internalHint}
                 label={copy.showInternal(sessionStatus?.subagentThreads ?? 0)}
               />
             )}
@@ -473,7 +476,7 @@ export function SessionManagementPage({
                       )}
                       {items.map((item) => (
                         <div
-                          className={cx("cx-session-row", item.needsSync && "cx-session-row--needs-sync", selectedSessionSet.has(item.id) && "cx-session-row--selected")}
+                          className={cx("cx-session-row", item.needsSync && !item.isSubagent && "cx-session-row--needs-sync", selectedSessionSet.has(item.id) && "cx-session-row--selected")}
                           key={item.id}
                           role="row"
                           onClick={(event) => {
@@ -494,8 +497,8 @@ export function SessionManagementPage({
                             <div className="cx-session-row-title">
                               <strong title={item.title}>{item.title || (isChinese ? "未命名会话" : "Untitled session")}</strong>
                               {item.archived && <span className="cx-session-state">{copy.archived}</span>}
-                              {item.isSubagent && <span className="cx-session-state">{copy.internal}</span>}
-                              {item.needsSync && <span className="cx-session-state cx-session-state--warn">{copy.pending}</span>}
+                              {item.isSubagent && <span className="cx-session-state" title={copy.internalHint}>{copy.internal}</span>}
+                              {item.needsSync && !item.isSubagent && <span className="cx-session-state cx-session-state--warn">{copy.pending}</span>}
                             </div>
                             {!sessionGroupByCwd && <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath, 72, isChinese ? "未记录路径" : "No path recorded")}</p>}
                           </div>

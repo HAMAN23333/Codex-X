@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 5;
+const APP_DB_SCHEMA_VERSION: i64 = 7;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -208,6 +208,14 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             provider_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS provider_failover (
+            codex_dir TEXT PRIMARY KEY,
+            record_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS provider_common_config_state (
+            codex_dir TEXT PRIMARY KEY,
+            handled_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS official_profiles (
             codex_dir TEXT NOT NULL,
             id TEXT NOT NULL,
@@ -392,7 +400,17 @@ mod tests {
             PRAGMA user_version = 4;").unwrap();
         drop(legacy);
         let migrated = DatabaseInitializer::new().open_at(&path).unwrap();
-        assert_eq!(schema_version(&migrated).unwrap(), 5);
+        assert_eq!(schema_version(&migrated).unwrap(), APP_DB_SCHEMA_VERSION);
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_common_config_state",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
         let stored = crate::providers::list_saved_providers_on_connection(&migrated).unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].model_mappings.is_empty());

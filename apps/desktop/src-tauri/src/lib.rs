@@ -22,6 +22,7 @@ mod constants;
 mod context_config;
 mod desktop_lifecycle;
 mod error;
+mod failover;
 mod file_io;
 mod live_config;
 mod paths;
@@ -608,9 +609,15 @@ async fn read_ccswitch_official_auth(
 
 #[tauri::command]
 async fn import_ccswitch_codex_providers(db_path: Option<String>) -> Result<ImportResult> {
-    tauri::async_runtime::spawn_blocking(move || import_ccswitch_codex_providers_inner(db_path))
-        .await
-        .map_err(|e| CodexxError::Config(format!("导入 cc-switch Provider 失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = import_ccswitch_codex_providers_inner(db_path)?;
+        failover::refresh_saved_routes().map_err(|error| {
+            CodexxError::Config(format!("供应商已导入，但自动切换状态更新失败：{error}"))
+        })?;
+        Ok(result)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("导入 cc-switch Provider 失败: {e}")))?
 }
 
 fn get_about_info_inner(config_dir: Option<String>) -> Result<AboutInfo> {
@@ -979,6 +986,15 @@ fn finish_provider_selection(
 }
 
 #[tauri::command]
+async fn get_provider_config_base(config_dir: Option<String>) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        providers::get_provider_config_base_inner(config_dir)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("读取供应商通用配置失败: {error}")))?
+}
+
+#[tauri::command]
 async fn build_provider_toml_draft(
     provider: SavedProvider,
     config_dir: Option<String>,
@@ -996,7 +1012,11 @@ async fn build_provider_toml_draft(
 }
 
 fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider> {
-    save_provider_inner(provider)
+    let saved = save_provider_inner(provider)?;
+    failover::refresh_saved_routes().map_err(|error| {
+        CodexxError::Config(format!("供应商已保存，但自动切换状态更新失败：{error}"))
+    })?;
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -1043,16 +1063,45 @@ async fn get_usage_statistics(
 }
 
 #[tauri::command]
+async fn get_provider_failover(config_dir: Option<String>) -> Result<failover::FailoverStatus> {
+    tauri::async_runtime::spawn_blocking(move || failover::get_status(config_dir))
+        .await
+        .map_err(|error| CodexxError::Config(format!("读取自动切换设置失败: {error}")))?
+}
+
+#[tauri::command]
+async fn save_provider_failover(
+    config_dir: Option<String>,
+    settings: failover::FailoverSettings,
+) -> Result<failover::FailoverStatus> {
+    tauri::async_runtime::spawn_blocking(move || failover::save_settings(config_dir, settings))
+        .await
+        .map_err(|error| CodexxError::Config(format!("保存自动切换设置失败: {error}")))?
+}
+
+#[tauri::command]
+async fn reset_provider_failover_health(
+    config_dir: Option<String>,
+    provider_id: Option<String>,
+) -> Result<failover::FailoverStatus> {
+    tauri::async_runtime::spawn_blocking(move || failover::reset_health(config_dir, provider_id))
+        .await
+        .map_err(|error| CodexxError::Config(format!("重置供应商健康状态失败: {error}")))?
+}
+
+#[tauri::command]
 async fn activate_saved_provider(
     config_dir: Option<String>,
     provider_id: String,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = providers::activate_saved_provider_inner(config_dir, provider_id.clone())?;
-        Ok(finish_provider_selection(
-            result,
-            ActiveProviderSelectionUpdate::Set(provider_id),
-        ))
+        failover::with_provider_change(config_dir.clone(), || {
+            let result = providers::activate_saved_provider_inner(config_dir, provider_id.clone())?;
+            Ok(finish_provider_selection(
+                result,
+                ActiveProviderSelectionUpdate::Set(provider_id),
+            ))
+        })
     })
     .await
     .map_err(|error| CodexxError::Config(format!("启用供应商失败: {error}")))?
@@ -1062,14 +1111,25 @@ async fn activate_saved_provider(
 async fn save_active_provider(
     provider: SavedProvider,
     config_dir: Option<String>,
+    apply_common_config: Option<bool>,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let provider_id = provider.id.clone();
-        let result = save_active_provider_inner(provider, config_dir)?;
-        Ok(finish_provider_selection(
-            result,
-            ActiveProviderSelectionUpdate::Set(provider_id),
-        ))
+        let result = failover::with_provider_change(config_dir.clone(), || {
+            let provider_id = provider.id.clone();
+            let result = if apply_common_config.unwrap_or(false) {
+                providers::save_active_provider_with_common_config_inner(provider, config_dir)?
+            } else {
+                save_active_provider_inner(provider, config_dir)?
+            };
+            Ok(finish_provider_selection(
+                result,
+                ActiveProviderSelectionUpdate::Set(provider_id),
+            ))
+        })?;
+        failover::refresh_saved_routes().map_err(|error| {
+            CodexxError::Config(format!("供应商已保存，但自动切换状态更新失败：{error}"))
+        })?;
+        Ok(result)
     })
     .await
     .map_err(|e| CodexxError::Config(format!("保存活动供应商失败: {e}")))?
@@ -1077,9 +1137,14 @@ async fn save_active_provider(
 
 #[tauri::command]
 async fn delete_saved_provider(id: String, config_dir: Option<String>) -> Result<()> {
-    tauri::async_runtime::spawn_blocking(move || delete_saved_provider_inner(id.trim(), config_dir))
-        .await
-        .map_err(|e| CodexxError::Config(format!("删除供应商失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_saved_provider_inner(id.trim(), config_dir)?;
+        failover::refresh_saved_routes().map_err(|error| {
+            CodexxError::Config(format!("供应商已删除，但自动切换状态更新失败：{error}"))
+        })
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("删除供应商失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1097,14 +1162,16 @@ fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
 #[tauri::command]
 async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = switch_official_profile_inner(
-            config_dir,
-            providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
-        )?;
-        Ok(finish_provider_selection(
-            result,
-            ActiveProviderSelectionUpdate::ClearIfOfficial,
-        ))
+        failover::with_provider_change(config_dir.clone(), || {
+            let result = switch_official_profile_inner(
+                config_dir,
+                providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
+            )?;
+            Ok(finish_provider_selection(
+                result,
+                ActiveProviderSelectionUpdate::ClearIfOfficial,
+            ))
+        })
     })
     .await
     .map_err(|e| CodexxError::Config(format!("切换官方配置失败: {e}")))?
@@ -1153,9 +1220,26 @@ async fn get_official_profile(
 
 #[tauri::command]
 async fn save_official_profile(input: OfficialProfileInput) -> Result<OfficialProfileActionResult> {
-    tauri::async_runtime::spawn_blocking(move || save_official_profile_inner(input))
-        .await
-        .map_err(|error| CodexxError::Config(format!("保存官方配置失败: {error}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        // Saving a separate account is a library edit, not a manual route change.
+        let applies_live = match input.id.as_ref() {
+            Some(id) => {
+                get_official_profile_inner(input.config_dir.clone(), id.clone())?
+                    .profile
+                    .is_current
+            }
+            None => false,
+        };
+        if applies_live {
+            failover::with_provider_change(input.config_dir.clone(), || {
+                save_official_profile_inner(input)
+            })
+        } else {
+            save_official_profile_inner(input)
+        }
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("保存官方配置失败: {error}")))?
 }
 
 #[tauri::command]
@@ -1177,7 +1261,9 @@ async fn switch_official_profile(
     profile_id: String,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        switch_official_profile_inner(config_dir, profile_id)
+        failover::with_provider_change(config_dir.clone(), || {
+            switch_official_profile_inner(config_dir, profile_id)
+        })
     })
     .await
     .map_err(|error| CodexxError::Config(format!("切换官方配置失败: {error}")))?
@@ -1195,11 +1281,13 @@ async fn delete_official_profile(config_dir: Option<String>, profile_id: String)
 #[tauri::command]
 async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = providers::official_profiles::reset_default_official_profile_inner(input)?;
-        Ok(finish_provider_selection(
-            result,
-            ActiveProviderSelectionUpdate::ClearIfOfficial,
-        ))
+        failover::with_provider_change(input.config_dir.clone(), || {
+            let result = providers::official_profiles::reset_default_official_profile_inner(input)?;
+            Ok(finish_provider_selection(
+                result,
+                ActiveProviderSelectionUpdate::ClearIfOfficial,
+            ))
+        })
     })
     .await
     .map_err(|e| CodexxError::Config(format!("新建官方配置失败: {e}")))?
@@ -1208,16 +1296,18 @@ async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionRes
 #[tauri::command]
 async fn save_official_config(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = save_official_config_inner(
-            input.config_dir,
-            input.model,
-            input.auth_json,
-            input.config_text,
-        )?;
-        Ok(finish_provider_selection(
-            result,
-            ActiveProviderSelectionUpdate::ClearIfOfficial,
-        ))
+        failover::with_provider_change(input.config_dir.clone(), || {
+            let result = save_official_config_inner(
+                input.config_dir,
+                input.model,
+                input.auth_json,
+                input.config_text,
+            )?;
+            Ok(finish_provider_selection(
+                result,
+                ActiveProviderSelectionUpdate::ClearIfOfficial,
+            ))
+        })
     })
     .await
     .map_err(|e| CodexxError::Config(format!("保存官方配置失败: {e}")))?
@@ -1396,18 +1486,41 @@ async fn disable_external_instruction(config_dir: Option<String>) -> Result<Acti
         .map_err(|e| CodexxError::Config(format!("禁用外部提示词失败: {e}")))?
 }
 
+fn direct_provider_toml_input(mut input: ProviderTomlInput) -> Result<ProviderTomlInput> {
+    let codex_dir = resolve_codex_dir(input.config_dir.clone())?;
+    let doc = parse_toml_document(&config_path(&codex_dir), &input.config_text)?;
+    let direct = failover::direct_document(&codex_dir, &doc)?;
+    if direct.to_string() != doc.to_string() {
+        let old_id = string_value(&doc, "model_provider");
+        let old_token = providers::experimental_bearer_token_from_doc(&doc, old_id.as_deref());
+        // Only replace the known local credential echoed back by the editor.
+        // A newly entered key belongs to the user's edit and must be retained.
+        if old_token.is_some() && input.api_key.as_deref().map(str::trim) == old_token.as_deref() {
+            let direct_id = string_value(&direct, "model_provider");
+            input.api_key =
+                providers::experimental_bearer_token_from_doc(&direct, direct_id.as_deref());
+        }
+        input.config_text = direct.to_string();
+    }
+    Ok(input)
+}
+
 #[tauri::command]
 async fn save_provider_toml_config(
     input: ProviderTomlInput,
     provider_id: Option<String>,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = save_provider_toml_config_inner(input)?;
-        Ok(match provider_id {
-            Some(provider_id) => {
-                finish_provider_selection(result, ActiveProviderSelectionUpdate::Set(provider_id))
-            }
-            None => result,
+        failover::with_provider_change(input.config_dir.clone(), || {
+            let input = direct_provider_toml_input(input)?;
+            let result = save_provider_toml_config_inner(input)?;
+            Ok(match provider_id {
+                Some(provider_id) => finish_provider_selection(
+                    result,
+                    ActiveProviderSelectionUpdate::Set(provider_id),
+                ),
+                None => result,
+            })
         })
     })
     .await
@@ -1437,13 +1550,16 @@ async fn fetch_provider_models(
 #[tauri::command]
 async fn switch_provider(input: ProviderInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        let provider_id = input.provider_id.clone();
-        let result = switch_provider_inner(input)?;
-        Ok(match provider_id {
-            Some(provider_id) => {
-                finish_provider_selection(result, ActiveProviderSelectionUpdate::Set(provider_id))
-            }
-            None => result,
+        failover::with_provider_change(input.config_dir.clone(), || {
+            let provider_id = input.provider_id.clone();
+            let result = switch_provider_inner(input)?;
+            Ok(match provider_id {
+                Some(provider_id) => finish_provider_selection(
+                    result,
+                    ActiveProviderSelectionUpdate::Set(provider_id),
+                ),
+                None => result,
+            })
         })
     })
     .await
@@ -1534,11 +1650,14 @@ fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result
     let backup_config = match backup_config {
         Some(bytes) => {
             let text = text_from_snapshot(&backup_cfg, Some(&bytes))?;
-            Some(
-                migrated_legacy_prompt_config_text(&cfg, &text)?
-                    .unwrap_or(text)
-                    .into_bytes(),
-            )
+            let text = migrated_legacy_prompt_config_text(&cfg, &text)?.unwrap_or(text);
+            let doc = parse_toml_document(&cfg, &text)?;
+            let direct = failover::direct_document(&codex_dir, &doc)?;
+            Some(if direct.to_string() == doc.to_string() {
+                text.into_bytes()
+            } else {
+                direct.to_string().into_bytes()
+            })
         }
         None => None,
     };
@@ -1578,9 +1697,16 @@ fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result
 
 #[tauri::command]
 async fn restore_backup(config_dir: Option<String>, backup_id: String) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || restore_backup_inner(config_dir, backup_id))
-        .await
-        .map_err(|e| CodexxError::Config(format!("恢复备份失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        failover::with_provider_change(config_dir.clone(), || {
+            let mut result = restore_backup_inner(config_dir.clone(), backup_id)?;
+            failover::recover_stale_route(config_dir)?;
+            result.state = build_state_after_migration(PathBuf::from(&result.state.codex_dir))?;
+            Ok(result)
+        })
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("恢复备份失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1629,6 +1755,14 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             desktop_lifecycle::setup_system_tray(app)?;
+            failover::attach_app_handle(app.handle().clone());
+            if let Err(error) = failover::initialize() {
+                desktop_lifecycle::report_failover_lifecycle_error(
+                    app.handle(),
+                    "自动切换暂时无法启动",
+                    &error.to_string(),
+                );
+            }
             Ok(())
         })
         .on_window_event(desktop_lifecycle::handle_window_event)
@@ -1666,11 +1800,15 @@ pub fn run() {
             delete_saved_prompt,
             enable_saved_prompt,
             list_saved_providers,
+            get_provider_config_base,
             build_provider_toml_draft,
             save_provider,
             duplicate_provider,
             update_codex_context_window,
             get_usage_statistics,
+            get_provider_failover,
+            save_provider_failover,
+            reset_provider_failover_health,
             save_active_provider,
             activate_saved_provider,
             delete_saved_provider,
@@ -1706,3 +1844,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod failover_integration_tests;

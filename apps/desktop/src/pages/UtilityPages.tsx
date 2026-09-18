@@ -11,11 +11,13 @@ import {
   RefreshCw,
   Sparkles,
   SlidersHorizontal,
+  Shuffle,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { PageTransition } from "../components/PageTransition";
 import { Button, ModalShell } from "../components/ui";
 import { UsageStatisticsPage } from "./UsageStatisticsPage";
+import { ProviderFailoverPage } from "./ProviderFailoverPage";
 import "../styles/utility-pages.css";
 
 export type UtilityLanguage = "zh" | "en";
@@ -114,16 +116,23 @@ export type SettingsPageProps = {
   restartBusy?: boolean;
   generalRequest?: number;
   configHealthStatus?: ReactNode;
+  onChange?: () => void | Promise<void>;
 };
 
 // PageTransition keeps the previous content during its exit animation. Context
 // still propagates the current activity state so requests stop immediately,
 // while the retained usage component keeps its filters between tabs.
 const SettingsUsageActiveContext = createContext(false);
+const SettingsFailoverActiveContext = createContext(false);
 
 function SettingsUsagePanel({ lang, configDir }: Pick<SettingsPageProps, "lang" | "configDir">) {
   const active = useContext(SettingsUsageActiveContext);
   return <UsageStatisticsPage lang={lang} configDir={configDir} active={active} />;
+}
+
+function SettingsFailoverPanel({ lang, configDir, onChange }: Pick<SettingsPageProps, "lang" | "configDir" | "onChange">) {
+  const active = useContext(SettingsFailoverActiveContext);
+  return <ProviderFailoverPage lang={lang} configDir={configDir} active={active} onChange={onChange} />;
 }
 
 type SettingRowProps = {
@@ -160,10 +169,12 @@ export function SettingsPage({
   restartBusy = false,
   generalRequest = 0,
   configHealthStatus,
+  onChange,
 }: SettingsPageProps) {
-  const [tab, setTab] = useState<"general" | "usage">("general");
+  const [tab, setTab] = useState<"general" | "usage" | "failover">("general");
   useEffect(() => { setTab("general"); }, [generalRequest]);
   const [usageOpened, setUsageOpened] = useState(false);
+  const [failoverOpened, setFailoverOpened] = useState(false);
   const tabId = useId();
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
@@ -179,19 +190,20 @@ export function SettingsPage({
     <section className="cx-utility cx-page cx-page--settings">
       <PageHeader eyebrow={copy.eyebrow} title={copy.title} />
       <div className="cx-settings-tabs" role="tablist" aria-label={lang === "zh" ? "设置页面" : "Settings pages"}>
-        {(["general", "usage"] as const).map((value, index) => {
-          const Icon = value === "general" ? SlidersHorizontal : BarChart3;
-          const select = () => { setTab(value); if (value === "usage") setUsageOpened(true); };
+        {(["general", "usage", "failover"] as const).map((value, index, tabs) => {
+          const Icon = value === "general" ? SlidersHorizontal : value === "usage" ? BarChart3 : Shuffle;
+          const select = () => { setTab(value); if (value === "usage") setUsageOpened(true); if (value === "failover") setFailoverOpened(true); };
           return <button key={value} ref={(element) => { tabRefs.current[index] = element; }} type="button" role="tab" id={`${tabId}-${value}-tab`} aria-controls={`${tabId}-${value}-panel`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className="cx-settings-tab" onClick={select} onKeyDown={(event) => {
             if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
             event.preventDefault();
-            const next = event.key === "Home" ? 0 : event.key === "End" ? 1 : 1 - index;
+            const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
             tabRefs.current[next]?.click();
             tabRefs.current[next]?.focus();
-          }}><Icon size={14} aria-hidden="true" />{value === "general" ? (lang === "zh" ? "通用设置" : "General") : (lang === "zh" ? "用量统计" : "Usage statistics")}</button>;
+          }}><Icon size={14} aria-hidden="true" />{value === "general" ? (lang === "zh" ? "通用设置" : "General") : value === "usage" ? (lang === "zh" ? "用量统计" : "Usage statistics") : (lang === "zh" ? "路由与故障转移" : "Routing & failover")}</button>;
         })}
       </div>
       <SettingsUsageActiveContext.Provider value={active && tab === "usage"}>
+      <SettingsFailoverActiveContext.Provider value={active && tab === "failover"}>
         <PageTransition pageKey={`settings:${tab}`}>
           <div className="cx-settings-panel cx-page-settings-list" role="tabpanel" id={`${tabId}-general-panel`} aria-labelledby={`${tabId}-general-tab`} hidden={tab !== "general"}>
             <SettingRow
@@ -268,7 +280,11 @@ export function SettingsPage({
           <div className="cx-settings-panel" role="tabpanel" id={`${tabId}-usage-panel`} aria-labelledby={`${tabId}-usage-tab`} hidden={tab !== "usage"}>
             {usageOpened && <SettingsUsagePanel lang={lang} configDir={configDir} />}
           </div>
+          <div className="cx-settings-panel" role="tabpanel" id={`${tabId}-failover-panel`} aria-labelledby={`${tabId}-failover-tab`} hidden={tab !== "failover"}>
+            {failoverOpened && <SettingsFailoverPanel lang={lang} configDir={configDir} onChange={onChange} />}
+          </div>
         </PageTransition>
+      </SettingsFailoverActiveContext.Provider>
       </SettingsUsageActiveContext.Provider>
 
       <ModalShell

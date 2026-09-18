@@ -2,6 +2,7 @@ import React from "react";
 import { flushSync } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Loader2 } from "lucide-react";
 import {
   SessionManagementPage,
@@ -757,6 +758,7 @@ function App() {
   const [officialProfiles, setOfficialProfiles] = React.useState<OfficialProfileSummary[]>([]);
   const [editingOfficialProfileId, setEditingOfficialProfileId] = React.useState<string | null>(DEFAULT_OFFICIAL_PROFILE_ID);
   const [creatingProvider, setCreatingProvider] = React.useState(false);
+  const [providerCreationBase, setProviderCreationBase] = React.useState("");
   const [selectedPresetId, setSelectedPresetId] = React.useState("custom");
   const [selectedPresetVariantId, setSelectedPresetVariantId] = React.useState("");
   const [officialAuthDirty, setOfficialAuthDirty] = React.useState(false);
@@ -797,6 +799,7 @@ function App() {
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
   const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
+  const [providerCommonConfigDirty, setProviderCommonConfigDirty] = React.useState(false);
   const [providerDraftRefreshToken, setProviderDraftRefreshToken] = React.useState(0);
   const [providerApiKeyVisible, setProviderApiKeyVisible] = React.useState(false);
   const [providerTestingId, setProviderTestingId] = React.useState("");
@@ -825,6 +828,7 @@ function App() {
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerModelsRequestRef = React.useRef(0);
   const providerDraftRequestRef = React.useRef(0);
+  const providerCreationRequestRef = React.useRef(0);
   const officialDraftRequestRef = React.useRef(0);
   const officialProfilesRequestRef = React.useRef(0);
   const officialProfilesLiveRef = React.useRef(officialProfiles);
@@ -853,6 +857,11 @@ function App() {
   const skillsMcpAutoLoadAttemptedRef = React.useRef("");
   const skillsMcpRequestRef = React.useRef(0);
   const activeConfigDirKeyRef = React.useRef("");
+  const routingWakeRef = React.useRef<() => void>(() => {});
+  const routingRequestRefreshRef = React.useRef<() => void>(() => {});
+  const routingUiRef = React.useRef({ ready: false, editing: false });
+  routingUiRef.current = { ready: Boolean(state) && !refreshing, editing: providerMode !== "list" };
+
   const themeTransitionTimerRef = React.useRef<number | null>(null);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm), [providerForm]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
@@ -1391,6 +1400,7 @@ function App() {
           setCreatingProvider(false);
           setEditingDetectedProvider(false);
           setProviderTomlDirty(false);
+          setProviderCommonConfigDirty(false);
           setProviderTomlDraft("");
           setAvailableProviderModels([]);
           setProviderModelsLoading(false);
@@ -1446,6 +1456,88 @@ function App() {
     refresh(startupWizardOpen);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  React.useEffect(() => {
+    const directory = configDir;
+    const scope = normalizedConfigDirForComparison(directory);
+    if (!scope) return;
+    let disposed = false;
+    let inFlight = false;
+    let pending = false;
+    let eventRevision = 0;
+    let unlisten: (() => void) | undefined;
+    const canRead = () => !disposed
+      && routingUiRef.current.ready && !routingUiRef.current.editing
+      && document.visibilityState !== "hidden"
+      && scope === activeConfigDirKeyRef.current
+      && loadingTokensRef.current.size === 0 && actionBusyTokensRef.current.size === 0;
+    const drain = async () => {
+      if (!pending || inFlight || !canRead()) return;
+      pending = false;
+      inFlight = true;
+      const eventGeneration = eventRevision;
+      const refreshGeneration = refreshRequestRef.current;
+      const loadingGeneration = loadingGenerationRef.current;
+      const actionGeneration = actionBusyGenerationRef.current;
+      const profileGeneration = officialProfilesRequestRef.current;
+      const stillCurrent = () => canRead()
+        && refreshGeneration === refreshRequestRef.current
+        && loadingGeneration === loadingGenerationRef.current
+        && actionGeneration === actionBusyGenerationRef.current
+        && eventGeneration === eventRevision;
+      try {
+        const [next, profiles] = await Promise.allSettled([
+          invoke<CodexState>("get_codex_state", { configDir: directory }),
+          invoke<OfficialProfileSummary[]>("list_official_profiles", { configDir: directory }),
+        ]);
+        if (!stillCurrent()) {
+          pending = !disposed;
+          return;
+        }
+        if (next.status === "fulfilled" && normalizedConfigDirForComparison(next.value.codexDir) === scope) {
+          setState((current) => current && stillCurrent()
+            && normalizedConfigDirForComparison(current.codexDir) === scope ? next.value : current);
+        }
+        if (profiles.status === "fulfilled" && profileGeneration === officialProfilesRequestRef.current) {
+          officialProfilesRequestRef.current += 1;
+          officialProfilesLiveRef.current = profiles.value;
+          setOfficialProfiles(profiles.value);
+        }
+      } catch {
+        // A transient bridge failure leaves the current screen and drafts intact.
+      } finally {
+        inFlight = false;
+        // Coalesce events arriving during a read. A busy action/editor will
+        // resume this pending update after it closes, preserving unsaved drafts.
+        if (pending && canRead()) void drain();
+      }
+    };
+    const wake = () => { void drain(); };
+    const request = () => { pending = true; eventRevision += 1; wake(); };
+    routingWakeRef.current = wake;
+    routingRequestRefreshRef.current = request;
+    const onFocus = () => request();
+    const onVisibility = () => { if (document.visibilityState !== "hidden") request(); };
+    // Backend paths may be canonical while this home is a symlink/alias. Events
+    // are hints only: always re-read this configured home, never the payload path.
+    void listen<{ codexDir: string }>("provider-routing-changed", () => request())
+      .then((release) => { if (disposed) release(); else unlisten = release; }).catch(() => {});
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      disposed = true;
+      pending = false;
+      unlisten?.();
+      if (routingWakeRef.current === wake) routingWakeRef.current = () => {};
+      if (routingRequestRefreshRef.current === request) routingRequestRefreshRef.current = () => {};
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [configDir]);
+
+  React.useEffect(() => {
+    routingWakeRef.current();
+  }, [loading, actionBusy, refreshing, providerMode]);
 
   React.useEffect(() => {
     const directory = state?.codexDir;
@@ -1831,7 +1923,7 @@ function App() {
         const applyAfterSave = editingDetectedProvider
           || Boolean(editingProviderId && editingProviderId === effectiveActiveProviderId);
         const applied = applyAfterSave
-          ? await invoke<ActionResult>("save_active_provider", { provider, configDir: configDir || null })
+          ? await invoke<ActionResult>("save_active_provider", { provider, configDir: configDir || null, applyCommonConfig: providerCommonConfigDirty })
           : null;
         if (!applyAfterSave) await invoke<SavedProvider>("save_provider", { provider });
         const providerList = await invoke<SavedProvider[]>("list_saved_providers");
@@ -1844,6 +1936,7 @@ function App() {
         setEditingProviderId(null);
         setEditingDetectedProvider(false);
         setProviderTomlDirty(false);
+        setProviderCommonConfigDirty(false);
         setToast(applied && pendingProvider.modelMappings?.length
           ? (lang === "zh" ? "已保存，请重启 Codex 更新模型菜单" : "Saved. Restart Codex to update its model menu")
           : applied
@@ -2368,6 +2461,7 @@ function App() {
   };
 
   const openOfficialEdit = async (profileId = DEFAULT_OFFICIAL_PROFILE_ID) => {
+    providerCreationRequestRef.current += 1;
     const requestId = ++officialDraftRequestRef.current;
     const actionToken = beginActionBusy("loadOfficialDraft");
     const profile = officialProfiles.find((item) => item.id === profileId);
@@ -2498,30 +2592,44 @@ function App() {
     }
   };
 
-  const newCustomProviderForm = (): SavedProvider => ({
+  const newCustomProviderForm = (configText = providerCreationBase): SavedProvider => ({
     ...blankProviderForm,
     model: state?.model?.trim() || blankProviderForm.model,
     wireApi: currentProvider?.wireApi?.trim() || blankProviderForm.wireApi,
     requiresOpenaiAuth: currentProvider?.requiresOpenaiAuth ?? blankProviderForm.requiresOpenaiAuth,
-    tomlConfig: state?.configText?.trim() || "",
+    tomlConfig: configText.trim(),
   });
 
   const openAddProvider = () => {
-    officialDraftRequestRef.current += 1;
-    setCreatingProvider(true);
-    setSelectedPresetId("custom");
-    setSelectedPresetVariantId("");
-    setEditingOfficialProfileId(null);
-    setOfficialAuthDirty(false);
-    setOfficialForm({ providerName: "", model: state?.model || "gpt-5.5", configText: "", authJson: "" });
-    const next = newCustomProviderForm();
-    resetAvailableProviderModels();
-    setEditingProviderId(null);
-    setEditingDetectedProvider(false);
-    setProviderForm(next);
-    setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
-    setProviderTomlDirty(false);
-    setProviderMode("form");
+    const requestId = ++providerCreationRequestRef.current;
+    const requestedDir = activeConfigDirKeyRef.current;
+    const contextGeneration = refreshRequestRef.current;
+    // Read a fresh, shared configuration once for this creation flow. The UI's
+    // last state may be stale or a legacy provider-only template.
+    return call(
+      () => invoke<string>("get_provider_config_base", { configDir: configDir || null }),
+      (configText) => {
+        if (requestId !== providerCreationRequestRef.current || requestedDir !== activeConfigDirKeyRef.current
+          || contextGeneration !== refreshRequestRef.current) return;
+        officialDraftRequestRef.current += 1;
+        setProviderCreationBase(configText);
+        setCreatingProvider(true);
+        setSelectedPresetId("custom");
+        setSelectedPresetVariantId("");
+        setEditingOfficialProfileId(null);
+        setOfficialAuthDirty(false);
+        setOfficialForm({ providerName: "", model: state?.model || "gpt-5.5", configText: "", authJson: "" });
+        const next = newCustomProviderForm(configText);
+        resetAvailableProviderModels();
+        setEditingProviderId(null);
+        setEditingDetectedProvider(false);
+        setProviderForm(next);
+        setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
+        setProviderTomlDirty(false);
+        setProviderCommonConfigDirty(false);
+        setProviderMode("form");
+      },
+    );
   };
 
   const applyProviderPreset = (presetId: string, variantId: string) => {
@@ -2551,12 +2659,14 @@ function App() {
     setProviderForm(next);
     setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
     setProviderTomlDirty(false);
+    setProviderCommonConfigDirty(false);
     setProviderApiKeyVisible(false);
     setAvailableProviderModels(variant?.models.map((entry) => ({ id: entry.model })) || []);
     setProviderMode("form");
   };
 
   const openEditProvider = (provider: SavedProvider) => {
+    providerCreationRequestRef.current += 1;
     setCreatingProvider(false);
     resetAvailableProviderModels();
     setEditingProviderId(provider.id);
@@ -2564,6 +2674,7 @@ function App() {
     setProviderForm(provider);
     setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider));
     setProviderTomlDirty(false);
+    setProviderCommonConfigDirty(false);
     setProviderMode("form");
   };
 
@@ -2590,6 +2701,7 @@ function App() {
   };
 
   const openEditDetectedProvider = (provider: { id: string; providerName: string; baseUrl: string; model: string; apiKey?: string; wireApi: string; requiresOpenaiAuth: boolean }) => {
+    providerCreationRequestRef.current += 1;
     setCreatingProvider(false);
     resetAvailableProviderModels();
     const id = uniqueId(
@@ -2611,6 +2723,7 @@ function App() {
     setProviderForm(next);
     setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
     setProviderTomlDirty(false);
+    setProviderCommonConfigDirty(false);
     setProviderMode("form");
   };
 
@@ -2677,7 +2790,7 @@ function App() {
         const syncCount = sessionMismatchCount(status);
         setToast(hasMismatches
           ? (lang === "zh" ? `有 ${syncCount} 条会话需要同步` : `${syncCount} session(s) need syncing`)
-          : (lang === "zh" ? "全部会话已同步" : "All sessions are synced"));
+          : (lang === "zh" ? "普通会话已同步" : "User conversations are synced"));
       },
     );
     endActionBusy(actionToken);
@@ -3031,6 +3144,7 @@ function App() {
                   setCreatingProvider(false);
                   setEditingDetectedProvider(false);
                   setProviderTomlDirty(false);
+                  setProviderCommonConfigDirty(false);
                 }}
                 onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
                 onOfficialNameChange={(value) => setOfficialForm((current) => ({ ...current, providerName: value }))}
@@ -3059,10 +3173,11 @@ function App() {
                 onWireApiChange={(value) => setProviderForm((current) => ({ ...current, wireApi: value }))}
                 onRequiresAuthChange={(value) => setProviderForm((current) => ({ ...current, requiresOpenaiAuth: value }))}
                 onToggleApiKeyVisibility={() => setProviderApiKeyVisible((value) => !value)}
-                onProviderTomlDraftChange={(value) => {
+                onProviderTomlDraftChange={(value, origin = "manual") => {
                   providerDraftRequestRef.current += 1;
                   setProviderTomlDraft(value);
                   setProviderTomlDirty(true);
+                  if (origin === "manual") setProviderCommonConfigDirty(true);
                 }}
                 onResetProviderToml={() => {
                   providerDraftRequestRef.current += 1;
@@ -3072,6 +3187,7 @@ function App() {
                     || providerTomlPreview,
                   );
                   setProviderTomlDirty(false);
+                  setProviderCommonConfigDirty(false);
                   setProviderDraftRefreshToken((token) => token + 1);
                 }}
                 onSaveProvider={saveProviderConfig}
@@ -3289,6 +3405,7 @@ function App() {
               <SettingsPage
                 lang={lang}
                 configDir={configDir}
+                onChange={async () => { routingRequestRefreshRef.current(); }}
                 generalRequest={settingsGeneralRequest}
                 configHealthStatus={<ConfigHealthStatus
                   lang={lang}

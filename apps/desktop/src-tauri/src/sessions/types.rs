@@ -59,8 +59,12 @@ pub(crate) struct RolloutScan {
     pub(crate) mismatched_rollouts: usize,
     pub(crate) mismatched_session_meta: usize,
     pub(crate) changes: Vec<SessionFileChange>,
+    pub(crate) provider_candidate_paths: HashSet<PathBuf>,
     pub(crate) cwd_by_thread_id: HashMap<String, String>,
     pub(crate) thread_ids: HashSet<String>,
+    /// Non-user threads identified from their own rollout metadata. Retained
+    /// even when the rollout is excluded from provider synchronization.
+    pub(crate) internal_thread_ids: HashSet<String>,
     pub(crate) mismatched_thread_ids: HashSet<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) scan_failures: Vec<String>,

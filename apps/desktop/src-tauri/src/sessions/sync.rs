@@ -1,9 +1,9 @@
 use super::backup::{create_provider_sync_backup, prune_provider_sync_backups};
-use super::catalog::{scan_catalog_sync, CatalogSyncScan};
+use super::catalog::{scan_catalog_internal_thread_ids, scan_catalog_sync, CatalogSyncScan};
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
-    list_session_previews_with_paths, scan_provider_rollouts, scan_rollouts_for_thread_ids,
-    scan_sqlite_with_paths, SqliteDiscovery,
+    list_session_previews_with_paths, rollout_internal_thread_ids, scan_provider_rollouts,
+    scan_rollouts_for_thread_ids, scan_sqlite_with_paths, SqliteDiscovery,
 };
 use super::transaction::{
     execute_provider_sync_mutation, mutation_error, prepare_sqlite_updates, rollback_mutation,
@@ -85,16 +85,22 @@ fn scan_provider_sync_data(
     target_provider: &str,
     discovery: &SqliteDiscovery,
 ) -> Result<ProviderSyncScan> {
-    let active_sqlite = scan_sqlite_with_paths(
+    let active_unclassified = scan_sqlite_with_paths(
         &discovery.active_paths,
         &RolloutScan::default(),
         target_provider,
     )?;
-    let mut sqlite = scan_sqlite_with_paths(
-        &discovery.thread_paths,
-        &RolloutScan::default(),
-        target_provider,
-    )?;
+    let (mut internal_thread_ids, _classification_failures) =
+        rollout_internal_thread_ids(codex_dir, &active_unclassified.rollout_paths_by_thread_id);
+    internal_thread_ids.extend(scan_catalog_internal_thread_ids(&discovery.related_paths)?);
+    let classification = RolloutScan {
+        internal_thread_ids,
+        ..RolloutScan::default()
+    };
+    let active_sqlite =
+        scan_sqlite_with_paths(&discovery.active_paths, &classification, target_provider)?;
+    let mut sqlite =
+        scan_sqlite_with_paths(&discovery.thread_paths, &classification, target_provider)?;
     let mut syncable_thread_ids = sqlite.syncable_thread_ids.clone();
     let mut archived_thread_ids = sqlite.archived_thread_ids.clone();
     let mut subagent_thread_ids = sqlite.subagent_thread_ids.clone();
@@ -111,6 +117,7 @@ fn scan_provider_sync_data(
     }
     let mut excluded_thread_ids = archived_thread_ids.clone();
     excluded_thread_ids.extend(subagent_thread_ids.iter().cloned());
+    excluded_thread_ids.extend(classification.internal_thread_ids.iter().cloned());
     // Without an active authority, conflicting legacy classifications stay conservatively excluded.
     syncable_thread_ids.retain(|id| !excluded_thread_ids.contains(id));
     mismatched_thread_ids.retain(|id| syncable_thread_ids.contains(id));
@@ -126,9 +133,30 @@ fn scan_provider_sync_data(
         scan_provider_buckets(codex_dir, target_provider, &sqlite)?
     };
     let legacy_index_warnings = scan_legacy_index_warnings(codex_dir, target_provider, discovery);
-    let mut rollouts = scan_provider_rollouts(codex_dir, target_provider, &excluded_thread_ids)?;
+    let mut rollouts = scan_provider_rollouts(
+        codex_dir,
+        target_provider,
+        &excluded_thread_ids,
+        &active_unclassified.rollout_paths_by_thread_id,
+    )?;
     // Provider synchronization changes provider routing only; cwd remains independently managed.
     rollouts.cwd_by_thread_id.clear();
+    // Rollout metadata can reveal an internal thread even when the SQLite row
+    // has no source column (or an older index still calls it a user thread).
+    excluded_thread_ids.extend(rollouts.internal_thread_ids.iter().cloned());
+    rollouts
+        .internal_thread_ids
+        .extend(classification.internal_thread_ids.iter().cloned());
+    sqlite
+        .subagent_thread_ids
+        .extend(rollouts.internal_thread_ids.iter().cloned());
+    sqlite
+        .syncable_thread_ids
+        .retain(|id| !excluded_thread_ids.contains(id));
+    sqlite
+        .mismatched_thread_ids
+        .retain(|id| !excluded_thread_ids.contains(id));
+    sqlite.mismatched_threads = sqlite.mismatched_thread_ids.len();
     syncable_thread_ids.extend(rollouts.thread_ids.iter().cloned());
     syncable_thread_ids.retain(|id| !excluded_thread_ids.contains(id));
     let catalog = scan_catalog_sync(
@@ -152,6 +180,8 @@ fn scan_provider_sync_data(
         .cloned()
         .collect::<HashSet<_>>();
     let mut warnings = rollouts.warnings.clone();
+    // The full provider/index scans below own warnings and blocking failures;
+    // repeating the lightweight identity scan's messages would duplicate them.
     warnings.extend(active_sqlite.warnings.iter().cloned());
     warnings.extend(sqlite.warnings.iter().cloned());
     warnings.extend(legacy_index_warnings);
@@ -247,9 +277,11 @@ pub(super) fn session_sync_status_with_discovery(
     let mut mismatched_ids = sqlite_mismatch_ids.clone();
     mismatched_ids.extend(scan.rollouts.mismatched_thread_ids.iter().cloned());
     for session in &mut sessions {
-        if !session.archived && !session.is_subagent && mismatched_ids.contains(&session.id) {
-            session.needs_sync = true;
-        }
+        // The same eligibility set drives both UI status and every mutation path.
+        session.needs_sync = !session.archived
+            && !session.is_subagent
+            && scan.syncable_thread_ids.contains(&session.id)
+            && mismatched_ids.contains(&session.id);
     }
     let needs_sync = !scan.rollouts.changes.is_empty()
         || scan.sqlite.mismatched_threads > 0
@@ -672,6 +704,176 @@ mod tests {
         path
     }
 
+    fn rows_except_parent(
+        path: &Path,
+        table: &str,
+        id_column: &str,
+        parent: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn = Connection::open(path).expect("open snapshot database");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE {id_column} <> ?1 ORDER BY {id_column}"
+            ))
+            .expect("prepare row snapshot");
+        let column_count = stmt.column_count();
+        stmt.query_map([parent], |row| {
+            (0..column_count).map(|index| row.get(index)).collect()
+        })
+        .expect("read row snapshots")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect row snapshots")
+    }
+
+    #[test]
+    fn internal_rollout_evidence_prevents_catalog_reactivation_and_insertion() {
+        let codex_dir = temp_codex_dir("internal-catalog-regression");
+        write_config(&codex_dir, "custom");
+        let parent = "019f6000-0000-7000-8000-000000000900";
+        let hidden = "019f6000-0000-7000-8000-000000000901";
+        let missing = "019f6000-0000-7000-8000-000000000902";
+        let catalog_only = "019f6000-0000-7000-8000-000000000903";
+        let source_only = "019f6000-0000-7000-8000-000000000904";
+        let parent_rollout = write_rollout(&codex_dir, parent, "openai");
+        let state = codex_dir.join("state_10.sqlite");
+        create_thread_database_with_rollout(&state, parent, "openai", &parent_rollout);
+        let conn = Connection::open(&state).expect("open regression index");
+        conn.execute_batch(
+            "ALTER TABLE threads ADD COLUMN source TEXT;
+            ALTER TABLE threads ADD COLUMN thread_source TEXT;
+            ALTER TABLE threads ADD COLUMN parent_thread_id TEXT;
+            ALTER TABLE threads ADD COLUMN cwd TEXT;",
+        )
+        .expect("extend source metadata");
+        conn.execute("UPDATE threads SET title = ?1, source = 'cli', thread_source = 'user', cwd = '/tmp/project' WHERE id = ?2",
+            ("Review this error: The following is the Codex agent history whose request action you are assessing", parent))
+            .expect("set genuine parent title");
+        let mut internal_files = Vec::new();
+        for (id, rollout_source, sqlite_source) in [
+            (hidden, serde_json::json!({"internal": "guardian"}), "cli"),
+            (
+                missing,
+                serde_json::json!({"subagent": {"review": null}}),
+                "cli",
+            ),
+            (catalog_only, serde_json::json!("cli"), "cli"),
+            (source_only, serde_json::json!("cli"), "subagent_review"),
+        ] {
+            let path = write_rollout(&codex_dir, id, "openai");
+            let record = serde_json::json!({"type":"session_meta", "payload":{
+                "id": id, "model_provider":"openai", "source":rollout_source, "cwd":"/tmp/private"
+            }});
+            fs::write(&path, format!("{record}\n")).expect("write source metadata");
+            conn.execute("INSERT INTO threads (id, model_provider, title, rollout_path, source, thread_source, cwd)
+                VALUES (?1, 'openai', 'codex-auto-review', ?2, ?3, NULL, '/tmp/private')",
+                (id, path.display().to_string(), sqlite_source)).expect("insert internal source");
+            internal_files.push((
+                path.clone(),
+                fs::read(&path).expect("snapshot internal rollout"),
+            ));
+        }
+        drop(conn);
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(
+            &catalog,
+            &[
+                (parent, "openai"),
+                (hidden, "openai"),
+                (catalog_only, "openai"),
+            ],
+        );
+        let conn = Connection::open(&catalog).expect("open regression catalog");
+        conn.execute(
+            "UPDATE local_thread_catalog SET missing_candidate = 1 WHERE thread_id = ?1",
+            [hidden],
+        )
+        .expect("keep review hidden");
+        conn.execute("UPDATE local_thread_catalog SET source_kind = 'internal', thread_source = 'guardian_review', missing_candidate = 1 WHERE thread_id = ?1", [catalog_only])
+            .expect("mark catalog-only internal source");
+        drop(conn);
+        let before_threads = rows_except_parent(&state, "threads", "id", parent);
+        let before_catalog =
+            rows_except_parent(&catalog, "local_thread_catalog", "thread_id", parent);
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan mixed sources");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert_eq!(status.mismatched_sessions, 1, "{status:?}");
+        assert!(
+            status
+                .sessions
+                .iter()
+                .find(|session| session.id == parent)
+                .expect("parent preview")
+                .needs_sync
+        );
+        for session in status
+            .sessions
+            .iter()
+            .filter(|session| session.id != parent)
+        {
+            assert!(session.is_subagent, "internal preview {}", session.id);
+            assert!(
+                !session.needs_sync,
+                "internal must not be pending {}",
+                session.id
+            );
+        }
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("sync only parent");
+        assert!(!result.status.needs_sync);
+        assert_eq!(result.updated_rollouts, 1);
+        assert_eq!(thread_provider(&state, parent), "custom");
+        assert_eq!(catalog_provider(&catalog, parent), "custom");
+        assert_eq!(
+            rows_except_parent(&state, "threads", "id", parent),
+            before_threads
+        );
+        assert_eq!(
+            rows_except_parent(&catalog, "local_thread_catalog", "thread_id", parent),
+            before_catalog
+        );
+        assert!(catalog_provider_and_visibility(&catalog, missing).is_none());
+        assert!(catalog_provider_and_visibility(&catalog, source_only).is_none());
+        for (path, original) in internal_files {
+            assert_eq!(
+                fs::read(path).expect("read preserved internal rollout"),
+                original
+            );
+        }
+        fs::remove_dir_all(codex_dir).expect("remove regression fixture");
+    }
+
+    #[test]
+    fn authoritative_user_rollout_is_not_hidden_by_an_internal_duplicate() {
+        let codex_dir = temp_codex_dir("user-internal-duplicate");
+        write_config(&codex_dir, "custom");
+        let id = "019f6000-0000-7000-8000-000000000905";
+        let active = codex_dir.join("sessions/rollout-active-name.jsonl");
+        write_rollout_at(&active, id, "openai");
+        let stale = write_subagent_rollout(&codex_dir, id, "old-parent", "openai");
+        let stale_bytes = fs::read(&stale).expect("snapshot stale internal duplicate");
+        let database = codex_dir.join("state_10.sqlite");
+        create_thread_database_with_rollout(&database, id, "openai", &active);
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[]);
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan authoritative user");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert_eq!(status.subagent_threads, 0);
+        assert_eq!(status.mismatched_sessions, 1);
+        assert!(!status.sessions[0].is_subagent);
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("sync authoritative user");
+        assert_eq!(result.updated_rollouts, 1);
+        assert_eq!(thread_provider(&database, id), "custom");
+        assert_eq!(catalog_provider(&catalog, id), "custom");
+        assert_eq!(
+            fs::read(stale).expect("read untouched internal duplicate"),
+            stale_bytes
+        );
+        fs::remove_dir_all(codex_dir).expect("remove duplicate fixture");
+    }
+
     #[test]
     fn live_provider_is_used_as_the_sync_target() {
         let codex_dir = temp_codex_dir("live-provider-target");
@@ -858,6 +1060,111 @@ mod tests {
             .contains("\"model_provider\":\"custom\""));
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn reverted_rollout_sync_uses_stable_thread_id_and_keeps_internal_threads_hidden() {
+        let codex_dir = temp_codex_dir("reverted-rollout-sync");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let parent = "019f6000-0000-7000-8000-000000000920";
+        let parent_rollout_id = "019f6000-0000-7000-8000-000000000921";
+        let internal = "019f6000-0000-7000-8000-000000000922";
+        let internal_rollout_id = "019f6000-0000-7000-8000-000000000923";
+        let parent_path = codex_dir.join(format!(
+            "sessions/rollout-2026-09-17T13-10-16-{parent}_{parent_rollout_id}.jsonl"
+        ));
+        write_rollout_at(&parent_path, parent, "openai");
+        let internal_path = codex_dir.join(format!(
+            "sessions/rollout-2026-09-17T13-10-17-{internal}_{internal_rollout_id}.jsonl"
+        ));
+        let internal_metadata = serde_json::json!({"type":"session_meta","payload":{
+            "id":internal, "model_provider":"openai", "source":{"internal":"guardian"}
+        }});
+        fs::write(&internal_path, format!("{internal_metadata}\n"))
+            .expect("write reverted internal rollout");
+        let internal_bytes = fs::read(&internal_path).expect("snapshot internal rollout");
+        let database = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&database, parent, "openai", &parent_path);
+        Connection::open(&database).expect("open reverted thread index").execute(
+            "INSERT INTO threads (id, model_provider, title, rollout_path) VALUES (?1, 'openai', 'internal review', ?2)",
+            (internal, internal_path.display().to_string()),
+        ).expect("insert internal thread without database source markers");
+        let before_internal = rows_except_parent(&database, "threads", "id", parent);
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[]);
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("check reverted rollouts");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(status
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("线程 ID 不一致")));
+        assert_eq!(status.mismatched_sessions, 1);
+        assert_eq!(status.subagent_threads, 1);
+        for preview in &status.sessions {
+            assert_eq!(preview.is_subagent, preview.id == internal);
+            assert_eq!(preview.needs_sync, preview.id == parent);
+        }
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize reverted user rollout through transaction guards");
+        assert!(result.status.scan_complete);
+        assert!(!result.status.needs_sync);
+        assert_eq!(result.updated_rollouts, 1);
+        assert_eq!(thread_provider(&database, parent), SHARED_SESSION_PROVIDER);
+        assert_eq!(catalog_provider(&catalog, parent), SHARED_SESSION_PROVIDER);
+        for excluded in [parent_rollout_id, internal, internal_rollout_id] {
+            assert!(catalog_provider_and_visibility(&catalog, excluded).is_none());
+        }
+        assert_eq!(
+            rows_except_parent(&database, "threads", "id", parent),
+            before_internal
+        );
+        assert_eq!(
+            fs::read(&internal_path).expect("read unchanged internal rollout"),
+            internal_bytes
+        );
+        let record: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&parent_path)
+                .expect("read synchronized parent")
+                .trim(),
+        )
+        .expect("parse synchronized parent metadata");
+        assert_eq!(record["payload"]["id"], parent);
+        assert_eq!(record["payload"]["model_provider"], SHARED_SESSION_PROVIDER);
+        fs::remove_dir_all(codex_dir).expect("remove reverted rollout fixture");
+    }
+
+    #[test]
+    fn reverted_rollout_cannot_be_indexed_by_its_distinct_rollout_id() {
+        let codex_dir = temp_codex_dir("reverted-rollout-wrong-index-id");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let thread_id = "019f6000-0000-7000-8000-000000000924";
+        let rollout_id = "019f6000-0000-7000-8000-000000000925";
+        let path = codex_dir.join(format!(
+            "sessions/rollout-2026-09-17T13-10-16-{thread_id}_{rollout_id}.jsonl"
+        ));
+        write_rollout_at(&path, thread_id, "openai");
+        let original = fs::read(&path).expect("snapshot original rollout");
+        let database = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&database, rollout_id, "openai", &path);
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[]);
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("check mismatched reverted rollout reference");
+        assert!(!status.scan_complete);
+        assert!(status
+            .scan_failures
+            .iter()
+            .any(|failure| failure.contains("线程 ID 不一致")));
+        sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect_err("rollout ID must not substitute for its stable thread ID");
+        assert_eq!(thread_provider(&database, rollout_id), "openai");
+        assert_eq!(fs::read(&path).expect("read protected rollout"), original);
+        assert!(catalog_provider_and_visibility(&catalog, thread_id).is_none());
+        assert!(catalog_provider_and_visibility(&catalog, rollout_id).is_none());
+        fs::remove_dir_all(codex_dir).expect("remove invalid reverted reference fixture");
     }
 
     #[test]
@@ -1125,7 +1432,7 @@ mod tests {
         assert_eq!(result.updated_rollouts, 1);
         assert!(result.updated_threads > 0);
         assert_eq!(thread_provider(&active, id), SHARED_SESSION_PROVIDER);
-        assert_eq!(thread_provider(&legacy, id), SHARED_SESSION_PROVIDER);
+        assert_eq!(thread_provider(&legacy, id), "openai");
         assert_eq!(catalog_provider(&catalog, id), SHARED_SESSION_PROVIDER);
         assert!(fs::read_to_string(rollout)
             .expect("read synchronized active user rollout")

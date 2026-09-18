@@ -452,3 +452,89 @@ fn injected_failure_restores_sqlite_and_jsonl_without_touching_global_state() {
     drop(wal_guard);
     fs::remove_dir_all(codex_dir).expect("remove test directory");
 }
+
+#[test]
+fn internal_reclassification_before_mutation_aborts_without_registering_or_rewriting() {
+    for existing_provider in ["openai", "custom"] {
+        let codex_dir = temp_dir("internal-before-mutation");
+        let id = "019f6000-0000-7000-8000-000000000980";
+        let rollout = codex_dir.join(format!("sessions/rollout-test-{id}.jsonl"));
+        let existing = String::from_utf8(write_rollout(&rollout, id))
+            .expect("UTF-8 fixture")
+            .replace("openai", existing_provider);
+        fs::write(&rollout, existing).expect("set current rollout provider");
+        let database = codex_dir.join("state_10.sqlite");
+        create_thread_database(&database, id, &rollout);
+        let internal = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta", "payload":{
+                "id":id, "model_provider":existing_provider, "source":{"internal":"guardian"}
+            }})
+        );
+        let error = sync_sessions_provider_with_hook(
+            Some(codex_dir.display().to_string()),
+            None,
+            |point| {
+                if point == MutationPoint::BeforeRolloutMutation {
+                    fs::write(&rollout, &internal).expect("reclassify rollout during sync");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("reclassification must abort sync");
+        assert!(error.to_string().contains("会话类型已变化"), "{error}");
+        assert_eq!(thread_provider(&database, id), "openai");
+        assert_eq!(
+            fs::read_to_string(&rollout).expect("read internal rollout"),
+            internal
+        );
+        fs::remove_dir_all(codex_dir).expect("remove race fixture");
+    }
+}
+
+#[test]
+fn internal_reclassification_after_file_writes_rolls_back_other_files_and_all_databases() {
+    let codex_dir = temp_dir("internal-after-rollout-mutation");
+    let parent = "019f6000-0000-7000-8000-000000000981";
+    let child = "019f6000-0000-7000-8000-000000000982";
+    let parent_rollout = codex_dir.join(format!("sessions/rollout-test-{parent}.jsonl"));
+    let child_rollout = codex_dir.join(format!("sessions/rollout-test-{child}.jsonl"));
+    let original_parent = write_rollout(&parent_rollout, parent);
+    write_rollout(&child_rollout, child);
+    let database = codex_dir.join("state_10.sqlite");
+    create_thread_database(&database, parent, &parent_rollout);
+    Connection::open(&database)
+        .expect("open fixture index")
+        .execute(
+            "INSERT INTO threads (id, model_provider, rollout_path) VALUES (?1, 'openai', ?2)",
+            (child, child_rollout.display().to_string()),
+        )
+        .expect("insert second thread");
+    let internal = format!(
+        "{}\n",
+        serde_json::json!({"type":"session_meta", "payload":{
+            "id":child, "model_provider":"openai", "source":{"internal":"guardian"}
+        }})
+    );
+    let error =
+        sync_sessions_provider_with_hook(Some(codex_dir.display().to_string()), None, |point| {
+            if point == MutationPoint::AfterRolloutMutation {
+                fs::write(&child_rollout, &internal)
+                    .expect("publish internal metadata during sync");
+            }
+            Ok(())
+        })
+        .expect_err("reclassification must prevent database commits");
+    assert!(error.to_string().contains("会话类型已变化"), "{error}");
+    assert_eq!(thread_provider(&database, parent), "openai");
+    assert_eq!(thread_provider(&database, child), "openai");
+    assert_eq!(
+        fs::read(&parent_rollout).expect("read restored parent"),
+        original_parent
+    );
+    assert_eq!(
+        fs::read_to_string(&child_rollout).expect("preserve newer internal source"),
+        internal
+    );
+    fs::remove_dir_all(codex_dir).expect("remove rollback fixture");
+}

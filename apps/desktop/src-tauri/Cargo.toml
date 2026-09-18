@@ -1,6 +1,6 @@
 [package]
 name = "codex-x"
-version = "0.3.18"
+version = "0.3.19"
 description = "Codex Switch & Instruct desktop manager"
 authors = ["yynxxxxx"]
 license = "MIT"
@@ -40,3 +40,8 @@ percent-encoding = "2.3"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
 tauri-plugin-single-instance = "=2.4.3"
+httparse = "1"
+getrandom = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
+flate2 = "1"
+zstd = "0.13"

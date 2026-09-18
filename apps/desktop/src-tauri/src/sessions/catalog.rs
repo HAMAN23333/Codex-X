@@ -1,3 +1,6 @@
+use super::storage::{
+    source_text_is_subagent, sqlite_subagent_thread_ids, thread_source_is_internal,
+};
 use crate::error::{CodexxError, Result};
 use crate::sqlite_utils::{sqlite_has_table, table_column_set};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, OpenFlags};
@@ -81,6 +84,59 @@ fn timestamp_expr(columns: &HashSet<String>, ms_column: &str, seconds_column: &s
     }
 }
 
+// Catalog visibility is independent of the thread index. A stale or incomplete
+// index must never turn a source-marked internal catalog row into a user thread.
+pub(super) fn catalog_internal_thread_ids(
+    conn: &Connection,
+    columns: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    if !columns.contains("thread_id") {
+        return Ok(HashSet::new());
+    }
+    let source = text_expr(columns, "source_kind", "NULL");
+    let thread_source = text_expr(columns, "thread_source", "NULL");
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT thread_id, {source}, {thread_source} FROM local_thread_catalog"
+        ))
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(database_error)?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        let (id, source, thread_source) = row.map_err(database_error)?;
+        if source.as_deref().is_some_and(source_text_is_subagent)
+            || thread_source
+                .as_deref()
+                .is_some_and(thread_source_is_internal)
+        {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+pub(super) fn scan_catalog_internal_thread_ids(paths: &[PathBuf]) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for path in paths {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(database_error)?;
+        let columns = catalog_columns(&conn)?;
+        ids.extend(catalog_internal_thread_ids(&conn, &columns)?);
+    }
+    Ok(ids)
+}
+
 fn collect_catalog_repair_threads(
     paths: &[PathBuf],
     target_provider: &str,
@@ -100,6 +156,7 @@ fn collect_catalog_repair_threads(
         if !columns.contains("id") {
             continue;
         }
+        let internal_ids = sqlite_subagent_thread_ids(&conn, &columns)?;
         let display_title = coalesce_text_expr(
             &columns,
             &["name", "title", "preview", "first_user_message"],
@@ -150,7 +207,7 @@ fn collect_catalog_repair_threads(
             .map_err(database_error)?;
         for row in rows {
             let thread = row.map_err(database_error)?;
-            if !syncable_thread_ids.contains(&thread.id) {
+            if !syncable_thread_ids.contains(&thread.id) || internal_ids.contains(&thread.id) {
                 continue;
             }
             let replace = threads
@@ -238,8 +295,13 @@ pub(super) fn scan_catalog_sync(
     target_provider: &str,
     syncable_thread_ids: &HashSet<String>,
 ) -> Result<CatalogSyncScan> {
+    let internal_ids = scan_catalog_internal_thread_ids(catalog_paths)?;
+    let syncable_thread_ids: HashSet<String> = syncable_thread_ids
+        .difference(&internal_ids)
+        .cloned()
+        .collect();
     let sources =
-        collect_catalog_repair_threads(thread_paths, target_provider, syncable_thread_ids)?;
+        collect_catalog_repair_threads(thread_paths, target_provider, &syncable_thread_ids)?;
     let mut scan = CatalogSyncScan {
         sources,
         ..CatalogSyncScan::default()
@@ -680,18 +742,35 @@ pub(super) fn apply_catalog_updates(
     sources: &HashMap<String, CatalogRepairThread>,
     provider_thread_ids: &HashSet<String>,
 ) -> Result<CatalogUpdateCounts> {
+    let internal_ids = catalog_internal_thread_ids(conn, columns)?;
+    let provider_thread_ids: HashSet<String> = provider_thread_ids
+        .difference(&internal_ids)
+        .cloned()
+        .collect();
+    let sources = sources
+        .iter()
+        .filter(|(id, thread)| {
+            provider_thread_ids.contains(*id)
+                && !source_text_is_subagent(&thread.source_kind)
+                && !thread
+                    .thread_source
+                    .as_deref()
+                    .is_some_and(thread_source_is_internal)
+        })
+        .map(|(id, thread)| (id.clone(), thread.clone()))
+        .collect::<HashMap<_, _>>();
     let mut counts = CatalogUpdateCounts::default();
     let repair_host = if !sources.is_empty() && catalog_supports_repair(columns) {
         Some(local_catalog_host_id(conn)?)
     } else {
         None
     };
-    snapshot_catalog_provider_changes(conn, columns, target_provider, provider_thread_ids)?;
+    snapshot_catalog_provider_changes(conn, columns, target_provider, &provider_thread_ids)?;
     if let Some(host_id) = repair_host.as_deref() {
-        snapshot_hidden_catalog_sources(conn, columns, host_id, sources)?;
+        snapshot_hidden_catalog_sources(conn, columns, host_id, &sources)?;
     }
     if columns.contains("model_provider") && columns.contains("thread_id") {
-        for thread_id in provider_thread_ids {
+        for thread_id in &provider_thread_ids {
             conn.execute(
                 "UPDATE local_thread_catalog SET model_provider = ?1 \
                  WHERE thread_id = ?2 AND COALESCE(model_provider, '') <> ?1",
@@ -701,9 +780,9 @@ pub(super) fn apply_catalog_updates(
         }
     }
     if let Some(host_id) = repair_host.as_deref() {
-        reactivate_catalog_sources(conn, columns, host_id, sources)?;
+        reactivate_catalog_sources(conn, columns, host_id, &sources)?;
         let (inserted, observation_sequence, max_source_updated_at) =
-            insert_missing_catalog_sources(conn, columns, host_id, sources)?;
+            insert_missing_catalog_sources(conn, columns, host_id, &sources)?;
         counts.inserted_rows = inserted;
         if inserted > 0 {
             update_catalog_sync_state(conn, host_id, observation_sequence, max_source_updated_at)?;
@@ -1113,5 +1192,31 @@ mod tests {
             catalog_state(&conn, "thread-combined"),
             ("openai".to_string(), 1, 7)
         );
+    }
+    #[test]
+    fn internal_catalog_rows_and_sources_ignore_even_explicit_sync_candidates() {
+        let conn = Connection::open_in_memory().expect("open internal catalog fixture");
+        create_catalog_schema(&conn);
+        insert_catalog_row(&conn, "hidden-review", "openai", 1);
+        conn.execute("UPDATE local_thread_catalog SET thread_source = 'guardian_review' WHERE thread_id = 'hidden-review'", [])
+            .expect("mark internal catalog source");
+        let mut internal_source = repair_source("missing-review", "custom");
+        internal_source.source_kind = r#"{"internal":"guardian"}"#.to_string();
+        internal_source.thread_source = None;
+        let sources = HashMap::from([(internal_source.id.clone(), internal_source)]);
+        let candidates = HashSet::from(["hidden-review".to_string(), "missing-review".to_string()]);
+        let counts = apply_and_commit(&conn, "custom", &sources, &candidates);
+        assert_eq!(counts.provider_rows, 0);
+        assert_eq!(counts.inserted_rows, 0);
+        assert_eq!(
+            catalog_state(&conn, "hidden-review"),
+            ("openai".to_string(), 1, 7)
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |row| {
+                row.get(0)
+            })
+            .expect("count preserved catalog");
+        assert_eq!(rows, 1);
     }
 }

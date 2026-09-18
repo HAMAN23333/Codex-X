@@ -201,6 +201,7 @@ pub(crate) fn build_state_after_migration(codex_dir: PathBuf) -> Result<CodexSta
     let auth = auth_path(&codex_dir);
     let text = read_to_string_if_exists(&cfg)?;
     let doc = parse_toml_document(&cfg, &text)?;
+    let doc = crate::failover::direct_document(&codex_dir, &doc)?;
     let model = string_value(&doc, "model");
     let model_provider = string_value(&doc, "model_provider");
     let is_official_provider = document_is_official(&doc);
@@ -235,7 +236,8 @@ pub(crate) fn build_state_after_migration(codex_dir: PathBuf) -> Result<CodexSta
         )?;
         reconcile_active_provider_on_connection(&conn, &codex_dir, &candidates)?
     } else {
-        let candidates = matching_saved_provider_ids_from_config(&text, &saved_providers);
+        let candidates =
+            matching_saved_provider_ids_from_config(&doc.to_string(), &saved_providers);
         reconcile_active_provider_on_connection(&conn, &codex_dir, &candidates)?
     };
 

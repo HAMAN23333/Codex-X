@@ -1,6 +1,7 @@
 use super::live::{
-    apply_official_config_with_snapshot_locked, persist_detected_live_custom_provider,
-    read_live_file_snapshot, AppliedLiveFiles, LiveAuthAction,
+    apply_official_config_with_snapshot_locked, official_activation_config_text,
+    persist_detected_live_custom_provider, read_live_file_snapshot, AppliedLiveFiles,
+    LiveAuthAction,
 };
 use super::official_auth::{
     build_official_config_text, capture_live_official_config_before_provider_switch,
@@ -436,6 +437,7 @@ pub(crate) fn list_official_profiles_inner(
     let selected = selected_profile_id(&codex_dir)?;
     let config_path = crate::config_path(&codex_dir);
     let config = parse_toml_document(&config_path, &read_to_string_if_exists(&config_path)?)?;
+    let config = crate::failover::direct_document(&codex_dir, &config)?;
     let is_official = document_is_official(&config);
     let live_model = crate::string_value(&config, "model");
     let live_auth = is_official
@@ -867,6 +869,7 @@ fn switch_official_profile_with_before_apply(
         &target.config_text,
         target.profile.model.as_deref(),
     )?;
+    let config = official_activation_config_text(&codex_dir, &config)?;
     let auth = parse_auth(&target.auth_json)?;
     with_mutation(&codex_dir, |mutation| {
         let previous_id = selected_profile_id(&codex_dir)?;
@@ -1533,10 +1536,14 @@ mod tests {
             Some(b.profile.id.as_str())
         );
         assert_eq!(live_auth(&dir), auth("b"));
-        assert_eq!(
-            fs::read_to_string(config_path(&dir)).unwrap().trim_end(),
-            config("b").trim_end()
-        );
+        let configured = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(configured["model"].as_str(), Some("model-b"));
+        assert!(document_is_official(&configured));
+        assert_eq!(configured["approval_policy"].as_str(), Some("never"));
+        assert_eq!(configured["features"]["web_search"].as_bool(), Some(true));
 
         let refreshed = auth("b-refreshed");
         write_json(&auth_path(&dir), &refreshed).unwrap();
@@ -1569,10 +1576,14 @@ mod tests {
         write_json(&auth_path(&dir), &auth("a-refreshed")).unwrap();
         switch(&dir, &b.profile.id);
         assert_eq!(live_auth(&dir), refreshed);
-        assert_eq!(
-            fs::read_to_string(config_path(&dir)).unwrap().trim_end(),
-            b_config.trim_end()
-        );
+        let configured = fs::read_to_string(config_path(&dir))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(configured["model"].as_str(), Some("model-b"));
+        assert!(document_is_official(&configured));
+        assert_eq!(configured["desktop"]["notify"].as_bool(), Some(true));
+        assert_eq!(configured["features"]["web_search"].as_bool(), Some(true));
         switch(&dir, DEFAULT_OFFICIAL_PROFILE_ID);
         assert_eq!(live_auth(&dir), auth("a-refreshed"));
         fs::remove_dir_all(dir).unwrap();

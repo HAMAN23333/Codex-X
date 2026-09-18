@@ -4571,7 +4571,8 @@ fn session_previews_return_subagents_with_explicit_marker() {
     let root_b = "019f6000-0000-7000-8000-000000000002";
     let child = "019f6000-0000-7000-8000-000000000003";
     let orphan_subagent = "019f6000-0000-7000-8000-000000000004";
-    let forked_user = "019f6000-0000-7000-8000-000000000005";
+    let mislabeled_child = "019f6000-0000-7000-8000-000000000005";
+    let forked_user = "019f6000-0000-7000-8000-000000000006";
     let rollout = codex_dir.join("sessions/rollout.jsonl");
     seed_thread_database(
         &database,
@@ -4579,6 +4580,7 @@ fn session_previews_return_subagents_with_explicit_marker() {
             (root_a, &rollout),
             (root_b, &rollout),
             (child, &rollout),
+            (mislabeled_child, &rollout),
             (forked_user, &rollout),
         ],
         Some((root_a, child)),
@@ -4588,6 +4590,7 @@ fn session_previews_return_subagents_with_explicit_marker() {
         "ALTER TABLE threads ADD COLUMN title TEXT;
              ALTER TABLE threads ADD COLUMN source TEXT;
              ALTER TABLE threads ADD COLUMN thread_source TEXT;
+             ALTER TABLE threads ADD COLUMN forked_from_id TEXT;
              UPDATE threads SET title = 'same title';",
     )
     .expect("extend thread schema");
@@ -4598,14 +4601,19 @@ fn session_previews_return_subagents_with_explicit_marker() {
     .expect("mark child subagent");
     conn.execute(
         "UPDATE threads SET thread_source = 'user' WHERE id = ?1",
-        [forked_user],
+        [mislabeled_child],
     )
-    .expect("mark forked user thread");
+    .expect("seed generic user label on an actual spawned child");
     conn.execute(
         "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id) VALUES (?1, ?2)",
+        (root_a, mislabeled_child),
+    )
+    .expect("insert actual child spawn edge");
+    conn.execute(
+        "UPDATE threads SET thread_source = 'user', source = 'cli', forked_from_id = ?1 WHERE id = ?2",
         (root_a, forked_user),
     )
-    .expect("insert user fork edge");
+    .expect("mark a real user fork without a spawn edge");
     conn.execute(
         "INSERT INTO threads (id, model_provider, rollout_path, title, source)
              VALUES (?1, 'openai', ?2, 'same title', ?3)",
@@ -4620,14 +4628,25 @@ fn session_previews_return_subagents_with_explicit_marker() {
 
     let rollouts = scan_rollouts(&codex_dir, "openai").expect("scan rollouts");
     let scan = scan_sqlite(&codex_dir, &rollouts, "openai").expect("scan sqlite");
-    assert_eq!(scan.sqlite_threads, 5);
+    assert_eq!(scan.sqlite_threads, 6);
     assert_eq!(scan.top_level_threads, 3);
-    assert_eq!(scan.subagent_threads, 2);
+    assert_eq!(scan.subagent_threads, 3);
+    assert!(scan.syncable_thread_ids.contains(forked_user));
+    assert!(!scan.syncable_thread_ids.contains(mislabeled_child));
 
     let (previews, warnings) =
         list_session_previews(&codex_dir, &rollouts, "openai", 50).expect("list previews");
     assert!(warnings.is_empty());
-    assert_eq!(previews.iter().filter(|item| item.is_subagent).count(), 2);
+    assert_eq!(previews.iter().filter(|item| item.is_subagent).count(), 3);
+    for preview in &previews {
+        assert_eq!(
+            preview.is_subagent,
+            [child, orphan_subagent, mislabeled_child].contains(&preview.id.as_str())
+        );
+        if preview.is_subagent {
+            assert!(!preview.needs_sync);
+        }
+    }
     assert_eq!(
         previews
             .into_iter()
@@ -4638,6 +4657,7 @@ fn session_previews_return_subagents_with_explicit_marker() {
             root_b.to_string(),
             child.to_string(),
             orphan_subagent.to_string(),
+            mislabeled_child.to_string(),
             forked_user.to_string(),
         ])
     );

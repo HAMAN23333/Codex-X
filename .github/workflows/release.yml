@@ -355,6 +355,7 @@ jobs:
           rm -rf "$portable_root"
           mkdir -p "$portable_dir"
           cp apps/desktop/src-tauri/target/release/codex-x.exe "$portable_dir/Codex-X.exe"
+          cp THIRD_PARTY_NOTICES.md "$portable_dir/THIRD_PARTY_NOTICES.md"
           touch "$portable_dir/Codex-X.portable"
           cat > "$portable_dir/README-portable.txt" <<'EOF'
           Codex-X Windows Portable
