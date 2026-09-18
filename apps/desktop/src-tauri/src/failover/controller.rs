@@ -1486,8 +1486,14 @@ fn stored_directories() -> Result<Vec<PathBuf>> {
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| CodexxError::Database(e.to_string()))?
         .map(|row| {
-            row.map(PathBuf::from)
-                .map_err(|e| CodexxError::Database(e.to_string()))
+            let scope = row.map_err(|e| CodexxError::Database(e.to_string()))?;
+            // Database scopes use lowercase forward slashes on Windows. They
+            // are comparison keys, not the canonical native paths used by the
+            // running-instance map (including Windows' verbatim \\?\ prefix).
+            // Rehydrate using the same path resolution as interactive IPC.
+            #[cfg(target_os = "windows")]
+            let scope = scope.replace('/', "\\");
+            directory(Some(scope))
         })
         .collect();
     paths

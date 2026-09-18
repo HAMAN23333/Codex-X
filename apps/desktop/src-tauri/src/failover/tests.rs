@@ -436,6 +436,21 @@ fn failed_restore_keeps_the_listener_alive() {
 }
 
 #[test]
+fn persisted_directory_scopes_resolve_to_the_interactive_runtime_key() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = Fixture::new();
+    fixture.enable();
+    let scope = normalized_path_scope(&fixture.dir);
+    let stored = stored_directories().unwrap();
+    let restored = stored
+        .iter()
+        .find(|dir| normalized_path_scope(dir) == scope)
+        .unwrap();
+    assert_eq!(*restored, directory(fixture.scope()).unwrap());
+    assert!(lock_manager().unwrap().contains_key(restored));
+}
+
+#[test]
 fn exit_restores_and_rejects_queued_enabling_then_restart_resumes_same_port() {
     let _guard = crate::app_db::test_db_guard();
     let fixture = Fixture::new();

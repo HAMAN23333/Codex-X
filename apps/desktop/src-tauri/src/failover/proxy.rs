@@ -2357,7 +2357,11 @@ mod tests {
         let started = Instant::now();
         proxy.shutdown();
         assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, proxy.port())).is_err());
+        // Windows can delay a refused connect beyond this fixture's 2-second
+        // stream-idle timeout. Bound the probe while the upstream is paused so
+        // it tests listener shutdown rather than causing an unrelated timeout.
+        let stopped_address = SocketAddr::new(proxy.listen_address(), proxy.port());
+        assert!(TcpStream::connect_timeout(&stopped_address, Duration::from_millis(100)).is_err());
         release.send(()).unwrap();
         let mut last = String::new();
         reader.read_to_string(&mut last).unwrap();
