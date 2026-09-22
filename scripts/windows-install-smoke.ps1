@@ -61,6 +61,19 @@ function Assert-Installed {
     }
   }
 }
+function Reset-FixtureInstallLocation {
+  # Tauri intentionally preserves this install-location value when keeping
+  # user data. The old MSI's AppSearch overrides command-line INSTALLDIR with
+  # it. Remove only values produced by the previous synthetic install so this
+  # fixture accurately represents a legacy default Program Files installation.
+  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\yynxxxxx\Codex-X', $true)
+  if ($null -ne $key) {
+    try {
+      $key.DeleteValue('', $false)
+      $key.DeleteValue('InstallDir', $false)
+    } finally { $key.Dispose() }
+  }
+}
 function Remove-TestNsis {
   # _?= avoids NSIS's detached temporary uninstaller process so WaitForExit
   # actually covers registry/files removal. This is NSIS's documented syntax.
@@ -84,6 +97,7 @@ try {
   Invoke-Installer $Installer '/S /UPDATE'
   Assert-Installed
   Remove-TestNsis
+  Reset-FixtureInstallLocation
 
   Write-Host 'Scenario 2: released v0.3.20 machine MSI -> current-user NSIS -> NSIS update.'
   $legacyMsi = Join-Path $Work 'Codex-X-0.3.20.msi'
@@ -97,6 +111,7 @@ try {
   if ($status -ne 0 -or $oldDirectory.Length -eq 0) { throw 'Could not read actual legacy MSI InstallLocation.' }
   $oldPath = $oldDirectory.ToString().TrimEnd('\')
   Write-Host "Actual legacy MSI InstallLocation: $oldPath"
+  if ($oldPath -ne (Join-Path $env:ProgramFiles 'Codex-X')) { throw 'The legacy fixture was not installed to Program Files.' }
   $oldExe = Join-Path $oldPath 'codex-x.exe'
   $oldHash = (Get-FileHash $oldExe).Hash
   # Guard the old directory, a non-existent child, and a junction alias. None
@@ -120,6 +135,7 @@ try {
   Invoke-Installer $Installer '/S /UPDATE'
   Assert-Installed
   Remove-TestNsis
+  Reset-FixtureInstallLocation
 
   Write-Host 'Scenario 3: MSI returns 3010 after removal; separate NSIS install continues without reboot.'
   # A separate fixture copy of the hash-verified released MSI requests a reboot

@@ -152,12 +152,15 @@ Function CXCanonicalDirectory
     Push "安装目录必须是完整路径。 / An absolute installation path is required."
     Call CXFail
   ${EndIf}
-  ClearErrors
-  GetFullPathName $CXPathFull "$CXPathInput"
-  ${If} ${Errors}
+  ; Unlike NSIS GetFullPathName, Win32's API does not require the final path
+  ; component to exist. Never turn a failed/empty result into the drive root.
+  System::Call 'kernel32::GetFullPathNameW(w "$CXPathInput",i ${NSIS_MAX_STRLEN},w .r0,p 0)i.r1'
+  ${If} $1 = 0
+  ${OrIf} $1 >= ${NSIS_MAX_STRLEN}
     Push "无法读取安装目录。 / Cannot resolve the installation directory."
     Call CXFail
   ${EndIf}
+  StrCpy $CXPathFull $0
   StrLen $0 $CXPathFull
   StrCpy $1 $CXPathFull 1 -1
   ${If} $0 > 3
@@ -224,7 +227,13 @@ Function CXRememberLegacyDirectory
     Push "旧版安装目录不是有效的完整路径，已停止迁移。 / The legacy installation path is not absolute."
     Call CXFail
   ${EndIf}
-  GetFullPathName $CXLegacyDirectory "$0"
+  System::Call 'kernel32::GetFullPathNameW(w r0,i ${NSIS_MAX_STRLEN},w .r2,p 0)i.r1'
+  ${If} $1 = 0
+  ${OrIf} $1 >= ${NSIS_MAX_STRLEN}
+    Push "无法规范化旧版安装目录。 / Cannot normalize the legacy installation directory."
+    Call CXFail
+  ${EndIf}
+  StrCpy $CXLegacyDirectory $2
   StrCpy $0 $CXLegacyDirectory 1 -1
   ${If} $0 != "\"
     StrCpy $CXLegacyDirectory "$CXLegacyDirectory\"
@@ -252,7 +261,13 @@ Function CXValidateDestination
   ${If} $0 == ""
     Return
   ${EndIf}
-  GetFullPathName $CXDestinationFull "$INSTDIR"
+  System::Call 'kernel32::GetFullPathNameW(w "$INSTDIR",i ${NSIS_MAX_STRLEN},w .r0,p 0)i.r1'
+  ${If} $1 = 0
+  ${OrIf} $1 >= ${NSIS_MAX_STRLEN}
+    Push "无法规范化新版本安装目录。 / Cannot normalize the installation destination."
+    Call CXFail
+  ${EndIf}
+  StrCpy $CXDestinationFull $0
   StrCpy $0 $CXDestinationFull 1 -1
   ${If} $0 != "\"
     StrCpy $CXDestinationFull "$CXDestinationFull\"
