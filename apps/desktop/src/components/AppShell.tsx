@@ -17,7 +17,7 @@ import {
   Zap,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { AppUpdaterPhase } from "../appUpdater";
+import { isAppUpdateBusy, type AppUpdaterPhase } from "../appUpdater";
 import { IconButton } from "./ui/IconButton";
 
 export type AppLanguage = "zh" | "en";
@@ -102,11 +102,10 @@ export function AppShell({
     ? (lang === "zh" ? "切换为浅色模式" : "Switch to light mode")
     : (lang === "zh" ? "切换为深色模式" : "Switch to dark mode");
   const ThemeIcon = theme === "dark" ? Moon : Sun;
-  const updateActionState = updatePhase === "downloading"
-    || updatePhase === "installing"
+  const updateActionState = isAppUpdateBusy(updatePhase)
     || updatePhase === "ready"
     || updatePhase === "available"
-    ? updatePhase
+    ? (isAppUpdateBusy(updatePhase) && updatePhase !== "downloading" ? "installing" : updatePhase)
     : hasUpdate
       ? "available"
       : null;

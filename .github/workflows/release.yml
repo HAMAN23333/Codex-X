@@ -177,7 +177,7 @@ jobs:
           - name: Windows x64
             platform: windows-latest
             macos: false
-            args: --bundles msi
+            args: --bundles nsis
             asset_pattern: Codex-X-[version]-windows-x64[ext]
 
     steps:
@@ -316,7 +316,7 @@ jobs:
           releaseAssetNamePattern: ${{ matrix.asset_pattern }}
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
-          updaterJsonPreferNsis: false
+          updaterJsonPreferNsis: true
           retryAttempts: 3
 
       - name: Verify updater signatures were generated
@@ -327,6 +327,14 @@ jobs:
             echo "No updater signatures were generated" >&2
             exit 1
           fi
+
+      - name: Test Windows installation and legacy MSI migration
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem apps/desktop/src-tauri/target/release/bundle/nsis -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected one NSIS installer.' }
+          ./scripts/windows-install-smoke.ps1 -Installer $installers[0].FullName
 
       - name: Verify signed and notarized macOS bundles
         if: matrix.macos
@@ -360,7 +368,7 @@ jobs:
           cat > "$portable_dir/README-portable.txt" <<'EOF'
           Codex-X Windows Portable
 
-          Double click Codex-X.exe to run. No MSI installation is required.
+          Double click Codex-X.exe to run. No installation is required.
           The portable edition uses manual downloads instead of in-app installation.
           Keep Codex-X.portable next to Codex-X.exe so the app can identify this edition.
           Microsoft Edge WebView2 Runtime is required; Windows 10/11 usually already includes it.
@@ -435,6 +443,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --release-tag "$RELEASE_TAG" \
             --rewrite-download-urls \
+            --migrate-windows-to-nsis \
             --require-signature-assets
           gh release upload "$RELEASE_TAG" latest.json --clobber
 

@@ -251,3 +251,7 @@ limitation applies to official-profile capture, independence, and storage: these
 responses are models for frontend verification. Use the Rust regression tests
 for backend guarantees. All persisted fixture credentials are synthetic and
 scoped to the local fixture origin and browser session.
+
+### 在线更新流程
+
+在 fixture 地址后加 `?updater=1`，通过侧栏更新按钮打开模拟更新窗口。点击“立即更新”后可使用控制面板依次触发验证、准备退出、启动安装及安装交接，也可模拟准备失败和更新完成。所有文件、安装器和重启操作均为内存模拟，不会下载或安装软件。暂停操作 30 秒可检查等待提示；失败时应允许重试，安装交接后不应再次启动安装。
