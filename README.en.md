@@ -424,6 +424,8 @@ This project is open-sourced under the [MIT License](https://github.com/yynxxxxx
 
 Thanks to the [LINUX DO forum](https://linux.do/) community for attention, feedback, and support.
 
+Codex-X is primarily maintained by yynxxxxx. Claude, OpenAI Codex, and ChatGPT were used as development, debugging, and documentation assistants.
+
 ## Star History
 
 <p align="center">
