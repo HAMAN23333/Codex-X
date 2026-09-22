@@ -413,6 +413,8 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 
 感谢 [LINUX DO 论坛](https://linux.do/) 社区的关注、反馈与支持。
 
+本项目由 yynxxxxx 主要维护。开发、调试和文档整理过程中使用了 Claude、OpenAI Codex 和 ChatGPT 作为辅助工具。
+
 ## Star History
 
 <p align="center">
