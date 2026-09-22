@@ -1,0 +1,24 @@
+name: Windows MSI API probe
+
+on:
+  push:
+    branches: ['codex/windows-updater-*']
+    paths: ['scripts/windows-msi-probe.ps1', '.github/workflows/windows-msi-probe.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  msi-probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --yes --no-progress
+          }
+      - shell: pwsh
+        run: ./scripts/windows-msi-probe.ps1

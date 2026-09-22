@@ -14,21 +14,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  msi-probe:
-    name: Diagnose legacy MSI discovery
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: Install NSIS compiler for the isolated probe
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
-            choco install nsis --yes --no-progress
-          }
-      - name: Compare MSI discovery in 64-bit, 32-bit and installer processes
-        shell: pwsh
-        run: ./scripts/windows-msi-probe.ps1
   windows-installer:
     name: Verify Windows update migration
     runs-on: windows-latest

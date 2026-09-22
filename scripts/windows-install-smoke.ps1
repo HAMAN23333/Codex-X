@@ -19,7 +19,7 @@ public static class CodexXMsiSmoke {
   [DllImport("msi.dll", CharSet = CharSet.Unicode)]
   public static extern uint MsiEnumRelatedProducts(string code, uint reserved, uint index, StringBuilder product);
   [DllImport("msi.dll", CharSet = CharSet.Unicode)]
-  public static extern uint MsiGetProductInfoEx(string code, string sid, uint context, string property, StringBuilder value, ref uint length);
+  public static extern uint MsiGetProductInfoEx(string code, System.IntPtr sid, uint context, string property, StringBuilder value, ref uint length);
 }
 '@
 function Related-Products {
@@ -93,7 +93,7 @@ try {
   if ($LegacyProductCode -notin @(Related-Products)) { throw 'The genuine legacy MSI did not register.' }
   $oldDirectory = [Text.StringBuilder]::new(1024)
   [uint32]$oldDirectoryLength = 1024
-  $status = [CodexXMsiSmoke]::MsiGetProductInfoEx($LegacyProductCode, $null, 4, 'InstallLocation', $oldDirectory, [ref]$oldDirectoryLength)
+  $status = [CodexXMsiSmoke]::MsiGetProductInfoEx($LegacyProductCode, [IntPtr]::Zero, 4, 'InstallLocation', $oldDirectory, [ref]$oldDirectoryLength)
   if ($status -ne 0 -or $oldDirectory.Length -eq 0) { throw 'Could not read actual legacy MSI InstallLocation.' }
   $oldPath = $oldDirectory.ToString().TrimEnd('\')
   $oldExe = Join-Path $oldPath 'codex-x.exe'

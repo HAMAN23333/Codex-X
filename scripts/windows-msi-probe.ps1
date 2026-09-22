@@ -22,7 +22,7 @@ public static class MsiProbeNative {
  [DllImport("msi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
  public static extern uint MsiEnumRelatedProductsW(string upgrade, uint reserved, uint index, StringBuilder product);
  [DllImport("msi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
- public static extern uint MsiGetProductInfoExW(string product, string sid, uint context, string property, StringBuilder value, ref uint length);
+ public static extern uint MsiGetProductInfoExW(string product, System.IntPtr sid, uint context, string property, StringBuilder value, ref uint length);
 }
 "@
 $product = [Text.StringBuilder]::new(39)
@@ -31,7 +31,7 @@ Write-Host "PS Is64Bit=$([Environment]::Is64BitProcess) EnumRelated rc=$rc produ
 foreach ($property in @('VersionString', 'InstallLocation')) {
  $value = [Text.StringBuilder]::new(1024)
  [uint32]$length = 1024
- $rc = [MsiProbeNative]::MsiGetProductInfoExW('{F71E3F3F-A463-4397-AB46-206D3FAC3FBD}', $null, 4, $property, $value, [ref]$length)
+ $rc = [MsiProbeNative]::MsiGetProductInfoExW('{F71E3F3F-A463-4397-AB46-206D3FAC3FBD}', [IntPtr]::Zero, 4, $property, $value, [ref]$length)
  Write-Host "PS Is64Bit=$([Environment]::Is64BitProcess) machine $property rc=$rc value=$value"
 }
 '@
@@ -55,6 +55,7 @@ Function .onInit
  System::Call 'msi::MsiGetProductInfoExW(w "{F71E3F3F-A463-4397-AB46-206D3FAC3FBD}",p 0,i 4,w "InstallLocation",w .r0,*i 1024)i.r1'
  FileWriteUTF16LE $9 "Machine InstallLocation result=$1 value=$0$\r$\n"
  FileClose $9
+ SetErrorLevel 0
  Quit
 FunctionEnd
 Section
@@ -76,7 +77,8 @@ try {
  & $compiler /V3 $nsisPath
  if ($LASTEXITCODE -ne 0) { throw 'Native NSIS probe compilation failed.' }
  Run-Wait (Join-Path $work 'probe.exe') '/S'
- Get-Content (Join-Path $work 'nsis-probe.log')
 } finally {
+ $probeLog = Join-Path $work 'nsis-probe.log'
+ if (Test-Path $probeLog) { Get-Content $probeLog }
  Run-Wait "$env:SystemRoot\System32\msiexec.exe" "/x {F71E3F3F-A463-4397-AB46-206D3FAC3FBD} /qn /norestart /L*v `"$work\uninstall.log`""
 }
