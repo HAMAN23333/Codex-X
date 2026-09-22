@@ -96,6 +96,7 @@ try {
   $status = [CodexXMsiSmoke]::MsiGetProductInfoEx($LegacyProductCode, [IntPtr]::Zero, 4, 'InstallLocation', $oldDirectory, [ref]$oldDirectoryLength)
   if ($status -ne 0 -or $oldDirectory.Length -eq 0) { throw 'Could not read actual legacy MSI InstallLocation.' }
   $oldPath = $oldDirectory.ToString().TrimEnd('\')
+  Write-Host "Actual legacy MSI InstallLocation: $oldPath"
   $oldExe = Join-Path $oldPath 'codex-x.exe'
   $oldHash = (Get-FileHash $oldExe).Hash
   # Guard the old directory, a non-existent child, and a junction alias. None

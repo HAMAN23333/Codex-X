@@ -231,6 +231,8 @@ Function CXRememberLegacyDirectory
   ${EndIf}
   StrCpy $CXPathInput $CXLegacyDirectory
   Call CXCanonicalDirectory
+  Push "MSI legacy directory: lexical=$CXLegacyDirectory real=$CXPathResult"
+  Call CXLog
   ; Retain both lexical and resolved names. A later junction change must not
   ; redirect a delayed removal from the old lexical path into the new app.
   ; Kept outside the normal uninstall key so an interrupted/retried migration
@@ -258,6 +260,8 @@ Function CXValidateDestination
   StrCpy $CXPathInput $CXDestinationFull
   Call CXCanonicalDirectory
   StrCpy $CXDestinationReal $CXPathResult
+  Push "Destination guard: requested=$INSTDIR lexical=$CXDestinationFull real=$CXDestinationReal"
+  Call CXLog
   StrCpy $CXDirectoryIndex 0
   cx_check_reserved:
     EnumRegValue $0 HKCU "${CX_DIRECTORY_KEY}" $CXDirectoryIndex
@@ -270,6 +274,8 @@ Function CXValidateDestination
       Call CXFail
     ${EndIf}
     StrCpy $CXReservedPath $1
+    Push "Reserved directory: key=$0 value=$CXReservedPath"
+    Call CXLog
     StrCpy $2 $0 5
     ${If} $2 == "Path_"
       ; Re-resolve the old lexical name as well: a junction may have changed
@@ -278,6 +284,8 @@ Function CXValidateDestination
       Call CXCanonicalDirectory
       StrLen $2 $CXPathResult
       StrCpy $3 $CXDestinationReal $2
+      Push "Resolved reserved guard: reserved=$CXPathResult target-prefix=$3"
+      Call CXLog
       ${If} $3 == $CXPathResult
         Push "新版本不能安装到旧目录指向的位置。请选择独立目录。 / The chosen path resolves inside a legacy installation directory."
         Call CXFail
@@ -287,6 +295,8 @@ Function CXValidateDestination
     StrLen $2 $1
     StrCpy $3 $CXDestinationFull $2
     StrCpy $4 $CXDestinationReal $2
+    Push "Reserved prefix guard: reserved=$1 lexical-prefix=$3 real-prefix=$4"
+    Call CXLog
     ; NSIS StrCmp / LogicLib == are case insensitive. All names end in '\',
     ; so sibling folders such as Codex-X-New do not falsely match Codex-X.
     ${If} $3 == $1
@@ -438,7 +448,7 @@ Function CXMigrateLegacyMsi
   StrCpy $CXMigrations 0
   cx_migrate_next:
   Call CXDetectLegacyMsi
-  ${If} $CXLegacyProduct = ""
+  ${If} $CXLegacyProduct == ""
     Return
   ${EndIf}
   IntOp $CXMigrations $CXMigrations + 1
