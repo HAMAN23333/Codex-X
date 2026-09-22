@@ -10,7 +10,7 @@ import {
   Sparkles,
 } from "lucide-react";
 
-import { INITIAL_APP_UPDATER_STATE, type AppUpdaterState } from "../appUpdater";
+import { INITIAL_APP_UPDATER_STATE, isAppUpdateBusy, type AppUpdaterState } from "../appUpdater";
 import type { Lang, StartupDiagnostics } from "../types";
 import { Button, ModalShell } from "./ui";
 
@@ -102,7 +102,7 @@ export function UpdateDialog({
     latestVersion: latestVersion ?? null,
   };
   const phase = updaterState.phase;
-  const isBusy = phase === "downloading" || phase === "installing";
+  const isBusy = isAppUpdateBusy(phase);
   const totalBytes = updaterState.totalBytes;
   const hasKnownProgress = totalBytes !== null && totalBytes > 0;
   const progress = totalBytes !== null && totalBytes > 0
@@ -119,8 +119,14 @@ export function UpdateDialog({
           : "检测到新版本，可前往下载页获取对应平台的安装包。",
         downloadingTitle: "正在下载更新",
         downloadingDescription: "请保持 Codex-X 打开，下载完成后会自动安装。",
-        installingTitle: "正在安装更新",
-        installingDescription: "即将完成，请暂时不要关闭软件。",
+        verifyingTitle: "正在验证安装包",
+        verifyingDescription: "下载已完成，正在确认安装包完整可靠。",
+        preparingTitle: "正在准备更新",
+        preparingDescription: "正在保存状态并恢复连接配置，完成后会自动退出并开始安装。",
+        installingTitle: "正在启动安装程序",
+        installingDescription: "请稍候。如系统询问是否允许安装，请确认授权。",
+        handedOffTitle: "安装程序已启动",
+        handedOffDescription: "Codex-X 即将退出，请在安装窗口继续。首次升级旧版时，系统可能需要一次管理员授权。",
         readyTitle: "更新已准备好",
         readyDescription: "重新启动 Codex-X 即可使用新版本。",
         errorTitle: "更新没有完成",
@@ -135,7 +141,16 @@ export function UpdateDialog({
         close: "关闭",
         updateNow: "立即更新",
         downloading: "正在下载",
-        installing: "正在安装",
+        verifying: "验证安装包",
+        preparing: "准备退出",
+        installing: "启动安装程序",
+        handedOff: "等待安装程序",
+        slowTitle: "这一步比平时慢一些",
+        slowDescription: phase === "downloading"
+          ? "暂时没有收到新的下载数据，正在等待网络恢复。请勿重复点击更新。"
+          : "仍在等待当前步骤完成。请查看是否有系统授权或安装窗口等待操作，不要重复启动安装。",
+        detailLabel: "失败原因",
+        logLabel: "安装日志",
         restart: "重新启动",
         retry: "重试",
         downloadPage: "打开下载页",
@@ -150,8 +165,14 @@ export function UpdateDialog({
           : "A new version is available from the download page for your platform.",
         downloadingTitle: "Downloading update",
         downloadingDescription: "Keep Codex-X open. Installation starts automatically after download.",
-        installingTitle: "Installing update",
-        installingDescription: "Almost done. Please keep the app open.",
+        verifyingTitle: "Verifying installer",
+        verifyingDescription: "Download complete. Checking the installer before making changes.",
+        preparingTitle: "Preparing update",
+        preparingDescription: "Saving state and restoring connection settings before exiting to install.",
+        installingTitle: "Starting installer",
+        installingDescription: "Please wait. Approve the installation if your system asks for permission.",
+        handedOffTitle: "Installer started",
+        handedOffDescription: "Codex-X will exit. Continue in the installer window. Upgrading an older installation may ask for administrator permission once.",
         readyTitle: "Update is ready",
         readyDescription: "Restart Codex-X to use the new version.",
         errorTitle: "Update did not finish",
@@ -166,39 +187,39 @@ export function UpdateDialog({
         close: "Close",
         updateNow: "Update now",
         downloading: "Downloading",
-        installing: "Installing",
+        verifying: "Verifying installer",
+        preparing: "Preparing to exit",
+        installing: "Starting installer",
+        handedOff: "Waiting for installer",
+        slowTitle: "Taking a little longer",
+        slowDescription: phase === "downloading"
+          ? "Waiting for more download data. Please do not start another update."
+          : "Still waiting for this step to finish. Check for a system permission or installer window requiring your attention. Do not start another installation.",
+        detailLabel: "What went wrong",
+        logLabel: "Installation log",
         restart: "Restart",
         retry: "Try again",
         downloadPage: "Open download page",
         releaseNotes: "What's new",
       };
 
-  const title = phase === "checking"
-    ? copy.checkingTitle
-    : phase === "available"
-      ? copy.availableTitle
-      : phase === "downloading"
-        ? copy.downloadingTitle
-        : phase === "installing"
-          ? copy.installingTitle
-          : phase === "ready"
-            ? copy.readyTitle
-            : phase === "error"
-              ? copy.errorTitle
-              : copy.idleTitle;
-  const description = phase === "checking"
-    ? copy.checkingDescription
-    : phase === "available"
-      ? copy.availableDescription
-      : phase === "downloading"
-        ? copy.downloadingDescription
-        : phase === "installing"
-          ? copy.installingDescription
-          : phase === "ready"
-            ? copy.readyDescription
-            : phase === "error"
-              ? copy.errorDescription
-              : copy.idleDescription;
+  const phaseCopy = {
+    checking: [copy.checkingTitle, copy.checkingDescription],
+    available: [copy.availableTitle, copy.availableDescription],
+    downloading: [copy.downloadingTitle, copy.downloadingDescription],
+    verifying: [copy.verifyingTitle, copy.verifyingDescription],
+    preparing: [copy.preparingTitle, copy.preparingDescription],
+    installing: [copy.installingTitle, copy.installingDescription],
+    "handed-off": [copy.handedOffTitle, copy.handedOffDescription],
+    ready: [copy.readyTitle, copy.readyDescription],
+    error: [copy.errorTitle, copy.errorDescription],
+    idle: [copy.idleTitle, copy.idleDescription],
+  };
+  const [title, description] = phaseCopy[phase];
+  const progressLabel = phase === "downloading" ? copy.downloading
+    : phase === "verifying" ? copy.verifying : phase === "preparing" ? copy.preparing
+      : phase === "handed-off" ? copy.handedOff : phase === "ready" ? copy.restart : copy.installing;
+  const indeterminate = isBusy && (phase !== "downloading" || progress === null);
 
   const handleClose = () => {
     if (!isBusy) onClose();
@@ -239,7 +260,7 @@ export function UpdateDialog({
         : isBusy
           ? (
               <Button disabled icon={<Loader2 className="spin" size={16} />}>
-                {phase === "downloading" ? copy.downloading : copy.installing}
+                {progressLabel}
               </Button>
             )
           : <Button variant="secondary" onClick={handleClose}>{copy.close}</Button>;
@@ -272,10 +293,10 @@ export function UpdateDialog({
         <div><dt>{copy.latest}</dt><dd>{updaterState.latestVersion || latestVersion || "-"}</dd></div>
       </dl>
 
-      {(phase === "downloading" || phase === "installing" || phase === "ready") && (
+      {(isBusy || phase === "ready") && (
         <div className="cx-update-progress" aria-live="polite">
           <div className="cx-update-progress-copy">
-            <span>{phase === "downloading" ? copy.downloading : phase === "installing" ? copy.installing : copy.restart}</span>
+            <span>{progressLabel}</span>
             <strong>
               {phase === "downloading"
                 ? hasKnownProgress
@@ -289,18 +310,31 @@ export function UpdateDialog({
             </strong>
           </div>
           <div
-            className={`cx-update-progress-track${progress === null && phase === "downloading" ? " cx-update-progress-track--indeterminate" : ""}`}
+            className={`cx-update-progress-track${indeterminate ? " cx-update-progress-track--indeterminate" : ""}`}
             role="progressbar"
-            aria-label={phase === "downloading" ? copy.downloading : copy.installing}
+            aria-label={progressLabel}
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-valuenow={phase === "ready" ? 100 : progress ?? undefined}
+            aria-valuenow={phase === "ready" ? 100 : indeterminate ? undefined : progress ?? undefined}
           >
-            <span style={{ width: phase === "ready" || phase === "installing" ? "100%" : progress === null ? "38%" : `${progress}%` }} />
+            <span style={{ width: phase === "ready" ? "100%" : indeterminate ? "38%" : `${progress}%` }} />
           </div>
         </div>
       )}
 
+      {updaterState.takingLonger && isBusy && (
+        <section className="cx-update-notes" role="status">
+          <strong>{copy.slowTitle}</strong>
+          <p>{copy.slowDescription}</p>
+        </section>
+      )}
+      {phase === "error" && updaterState.errorMessage && (
+        <section className="cx-update-notes" role="alert">
+          <strong>{copy.detailLabel}</strong>
+          <p>{updaterState.errorMessage}</p>
+          {updaterState.logPath && <p className="cx-update-log-path">{copy.logLabel}: {updaterState.logPath}</p>}
+        </section>
+      )}
       {updaterState.notes && phase !== "checking" && (
         <section className="cx-update-notes">
           <strong>{copy.releaseNotes}</strong>

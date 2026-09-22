@@ -1615,6 +1615,47 @@ pub(crate) fn shutdown_all() -> Result<()> {
     result
 }
 
+/// Only an update handoff that has not launched an installer may resume the
+/// saved routes. A successful handoff keeps the shutdown gate closed until exit.
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn resume_after_failed_update() -> Result<()> {
+    SHUTTING_DOWN.store(false, Ordering::Release);
+    let expected: Vec<_> = stored_directories()?
+        .into_iter()
+        .map(|dir| load_record(&dir).map(|record| (dir, record.settings)))
+        .collect::<Result<_>>()?;
+    let initialized = initialize();
+    let runtimes = lock_manager()?;
+    let mut recovered = initialized.is_ok();
+    for (dir, settings) in expected {
+        if !settings.router_enabled {
+            continue;
+        }
+        let active = runtimes.get(&dir);
+        let restored = active.is_some()
+            && (!settings.takeover_enabled
+                || active.is_some_and(|runtime| runtime.journal.is_some()));
+        if !restored {
+            recovered = false;
+            // Startup is allowed to degrade to direct mode. An unsuccessful
+            // update must not silently turn the user's saved preferences off.
+            let mut record = load_record(&dir)?;
+            record.settings = settings;
+            record.message = Some(
+                "更新未启动，原路由暂时无法恢复；设置已保留，请检查端口或配置后重新启用。".into(),
+            );
+            save_record(&dir, &record)?;
+            changed(&dir);
+        }
+    }
+    initialized?;
+    if recovered {
+        Ok(())
+    } else {
+        Err(CodexxError::Config("更新未启动，部分路由尚未恢复".into()))
+    }
+}
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

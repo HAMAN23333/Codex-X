@@ -224,6 +224,12 @@
   white-space: pre-wrap;
 }
 
+.cx-update-notes .cx-update-log-path {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 @keyframes cx-update-progress-indeterminate {
   from { transform: translateX(-110%); }
   to { transform: translateX(300%); }

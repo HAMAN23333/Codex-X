@@ -436,6 +436,42 @@ fn failed_restore_keeps_the_listener_alive() {
 }
 
 #[test]
+fn failed_update_handoff_resumes_saved_routes_and_reopens_mutation_gate() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = Fixture::new();
+    let before = fixture.enable();
+    let auth = fs::read(crate::auth_path(&fixture.dir)).unwrap();
+    shutdown_all().unwrap();
+    assert!(!get_status(fixture.scope()).unwrap().running);
+    assert!(!fixture.text().contains("http://127.0.0.1:"));
+    resume_after_failed_update().unwrap();
+    let after = get_status(fixture.scope()).unwrap();
+    assert!(after.running && after.takeover_active);
+    assert_eq!(after.settings, before.settings);
+    assert_eq!(fs::read(crate::auth_path(&fixture.dir)).unwrap(), auth);
+    stop(&fixture);
+    assert!(!get_status(fixture.scope()).unwrap().running);
+}
+
+#[test]
+fn failed_update_recovery_reports_busy_port_without_erasing_saved_preferences() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = Fixture::new();
+    let before = fixture.enable();
+    shutdown_all().unwrap();
+    let occupied =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, fixture.port)).unwrap();
+    assert!(resume_after_failed_update().is_err());
+    let status = get_status(fixture.scope()).unwrap();
+    assert!(!status.running);
+    assert_eq!(status.settings, before.settings);
+    assert!(!fixture.text().contains("http://127.0.0.1:"));
+    drop(occupied);
+    resume_after_failed_update().unwrap();
+    assert!(get_status(fixture.scope()).unwrap().takeover_active);
+}
+
+#[test]
 fn persisted_directory_scopes_resolve_to_the_interactive_runtime_key() {
     let _guard = crate::app_db::test_db_guard();
     let fixture = Fixture::new();

@@ -35,6 +35,17 @@
   const resetRoutingHealth = new Set();
   let failoverMode = "normal";
   let providerBaseReadFailure = false;
+  const updaterEnabled = new URLSearchParams(location.search).has("updater");
+  let updateRequest = null;
+  function updateStage(event) { updateRequest?.onEvent.onmessage(event); }
+  function finishUpdate(failure = false) {
+    if (!updateRequest) return;
+    const request = updateRequest;
+    updateRequest = null;
+    if (failure) request.reject({ stage: "prepare", message: "Fixture：无法恢复连接配置，尚未启动安装程序。", logPath: "C:\\Users\\Fixture\\AppData\\Local\\Codex-X\\logs\\update.log" });
+    else request.resolve({ restartRequired: true });
+    render();
+  }
   const sharedProviderTables = '\n[mcp_servers.fixture_docs]\ncommand = "fixture-docs-server"\n'
     + '\n[mcp_servers.fixture_docs.env]\nFIXTURE_TIMEOUT = "1000"\n'
     + '\n[desktop]\nsansFontSize = 14\ncodeFontSize = 13\n'
@@ -856,7 +867,7 @@
       case "get_about_info": return {
         appVersion: "0.3.15", codexVersion: "fixture-cli", codexDir,
         projectUrl: "https://project.example.test/", githubRepo: "fixture/example",
-        nativeUpdaterSupported: false,
+        nativeUpdaterSupported: updaterEnabled,
       };
       case "get_startup_diagnostics": {
         if (new URLSearchParams(location.search).has("environmentError")) throw new Error("Fixture: environment check unavailable");
@@ -873,7 +884,18 @@
       case "check_app_update": return {
         latestVersion: "0.3.15", htmlUrl: "https://releases.example.test/", hasUpdate: false,
       };
-      case "plugin:updater|check": return null;
+      case "plugin:updater|check": return updaterEnabled ? {
+        rid: 123, currentVersion: "0.3.20", version: "0.3.21", date: "2026-09-22T00:00:00Z", body: "优化 Windows 在线更新。", rawJson: {},
+      } : null;
+      case "install_app_update": return new Promise((resolve, reject) => {
+        if (updateRequest) { reject({ stage: "install", message: "Fixture：更新已经进行中。" }); return; }
+        updateRequest = { resolve, reject, onEvent: args.onEvent };
+        updateStage({ event: "Started", data: { contentLength: 1024 * 1024 * 20 } });
+        updateStage({ event: "Progress", data: { chunkLength: 1024 * 1024 * 10 } });
+        render();
+      });
+      case "plugin:resources|close": return null;
+      case "plugin:process|restart": return null;
       case "refresh_builtin_prompts": return defer("sync", () => statuses);
       case "get_builtin_prompt_detail": {
         if (!details.has(args.templateId)) throw new Error("Unknown fixture template");
@@ -1032,6 +1054,19 @@
     panel.append(panelBody);
     const controls = document.createElement("div");
     controls.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin-top:6px";
+    if (updaterEnabled) {
+      for (const [label, action] of [
+        ["Fixture：验证更新", () => updateStage({ event: "Verifying" })],
+        ["Fixture：准备退出", () => updateStage({ event: "Preparing" })],
+        ["Fixture：启动安装", () => updateStage({ event: "Installing" })],
+        ["Fixture：安装已交接", () => { updateStage({ event: "HandedOff" }); updateRequest?.resolve({ restartRequired: false }); updateRequest = null; render(); }],
+        ["Fixture：更新准备失败", () => finishUpdate(true)],
+        ["Fixture：更新完成待重启", () => finishUpdate(false)],
+      ]) {
+        const button = document.createElement("button"); button.type = "button"; button.textContent = label;
+        button.addEventListener("click", action); controls.append(button);
+      }
+    }
     const transferSelect = document.createElement("select");
     transferSelect.setAttribute("aria-label", "Fixture：文件操作");
     for (const [value, label] of [["success", "文件操作成功"], ["cancel", "取消文件选择"], ["error", "文件操作失败"]]) {

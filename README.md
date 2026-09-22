@@ -118,7 +118,7 @@
   </tr>
   <tr>
     <td align="center"><b>跨平台使用</b></td>
-    <td align="left">提供 macOS Apple Silicon / Intel、Windows MSI / 便携版和 Linux 安装包；安装版可在应用内直接下载、校验并安装更新，便携版继续使用手动下载。</td>
+    <td align="left">提供 macOS Apple Silicon / Intel、Windows EXE / 便携版和 Linux 安装包；安装版可在应用内直接下载、校验并安装更新，便携版继续使用手动下载。</td>
   </tr>
 </table>
 </div>
@@ -335,7 +335,7 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`
-- Windows `.msi`
+- Windows `.exe`（安装到当前用户，后续更新无需管理员权限）
 - Windows Portable `.zip`
 - Linux `.deb` / `.rpm` / `.AppImage`
 - GitHub Releases 自动构建发布

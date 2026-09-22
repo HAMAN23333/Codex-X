@@ -45,7 +45,18 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": "all"
+    "targets": "all",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "template": "nsis/installer.nsi",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": false
+      }
+    }
   },
   "plugins": {
     "updater": {

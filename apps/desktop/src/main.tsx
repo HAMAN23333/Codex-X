@@ -22,7 +22,7 @@ import {
 } from "./components/AppDialogs";
 import { PageTransition } from "./components/PageTransition";
 import { cx } from "./components/ui";
-import { appUpdater, useAppUpdater } from "./appUpdater";
+import { appUpdater, isAppUpdateBusy, useAppUpdater } from "./appUpdater";
 import { providerProfilesMatch, type ProviderProfile } from "./providerProfiles";
 import { orderProviderRows } from "./providerRowOrder";
 import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
@@ -936,7 +936,9 @@ function App() {
   const currentInstructionId = instructionIdFromPath(state?.instructionFile, instructionTemplates);
   const releaseStatusLabel = React.useMemo(() => {
     if (updater.state.phase === "downloading") return lang === "zh" ? "下载中" : "Downloading";
-    if (updater.state.phase === "installing") return lang === "zh" ? "安装中" : "Installing";
+    if (updater.state.phase === "verifying") return lang === "zh" ? "验证中" : "Verifying";
+    if (updater.state.phase === "preparing") return lang === "zh" ? "准备更新" : "Preparing update";
+    if (updater.state.phase === "installing" || updater.state.phase === "handed-off") return lang === "zh" ? "安装中" : "Installing";
     if (updater.state.phase === "ready") return lang === "zh" ? "等待重启" : "Restart required";
     if (releaseInfo.status === "checking") return lang === "zh" ? "检查中" : "Checking";
     if (releaseInfo.status === "error") return lang === "zh" ? "失败" : "Failed";
@@ -3390,8 +3392,7 @@ function App() {
                         ? "success"
                         : "neutral",
                   checking: releaseInfo.status === "checking"
-                    || updater.state.phase === "downloading"
-                    || updater.state.phase === "installing",
+                    || isAppUpdateBusy(updater.state.phase),
                   canOpenReleases: Boolean(releaseInfo.htmlUrl),
                 }}
                 onOpenProject={() => openExternalUrl(aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`)}
