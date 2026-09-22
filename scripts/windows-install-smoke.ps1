@@ -89,7 +89,7 @@ try {
   $legacyMsi = Join-Path $Work 'Codex-X-0.3.20.msi'
   Invoke-WebRequest 'https://github.com/yynxxxxx/Codex-X/releases/download/v0.3.20/Codex-X-0.3.20-windows-x64.msi' -OutFile $legacyMsi
   if ((Get-FileHash $legacyMsi -Algorithm SHA256).Hash.ToLowerInvariant() -ne $LegacySha256) { throw 'Released MSI hash mismatch.' }
-  Invoke-Installer (Join-Path $env:SystemRoot 'System32\msiexec.exe') "/i `"$legacyMsi`" /qn /norestart /L*v `"$Work\legacy-install.log`""
+  Invoke-Installer (Join-Path $env:SystemRoot 'System32\msiexec.exe') "/i `"$legacyMsi`" INSTALLDIR=`"$env:ProgramFiles\Codex-X`" /qn /norestart /L*v `"$Work\legacy-install.log`""
   if ($LegacyProductCode -notin @(Related-Products)) { throw 'The genuine legacy MSI did not register.' }
   $oldDirectory = [Text.StringBuilder]::new(1024)
   [uint32]$oldDirectoryLength = 1024
@@ -139,7 +139,7 @@ try {
   foreach ($comObject in @($query, $summary, $database, $msiAutomation)) {
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
   }
-  Invoke-Installer (Join-Path $env:SystemRoot 'System32\msiexec.exe') "/i `"$rebootMsi`" /qn /norestart /L*v `"$Work\deferred-fixture-install.log`""
+  Invoke-Installer (Join-Path $env:SystemRoot 'System32\msiexec.exe') "/i `"$rebootMsi`" INSTALLDIR=`"$env:ProgramFiles\Codex-X`" /qn /norestart /L*v `"$Work\deferred-fixture-install.log`""
   if ($LegacyProductCode -notin @(Related-Products)) { throw 'The deferred-cleanup MSI fixture did not register.' }
   $beforeMigration = Get-Date
   Invoke-Installer $Installer '/S /UPDATE'

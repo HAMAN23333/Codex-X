@@ -118,6 +118,7 @@ Var CXPathDepth
 Var CXDestinationFull
 Var CXDestinationReal
 Var CXDirectoryIndex
+Var CXReservedPath
 !define CX_DIRECTORY_KEY "Software\${MANUFACTURER}\${PRODUCTNAME} Installer\LegacyDirectories"
 
 Function CXLog
@@ -125,7 +126,8 @@ Function CXLog
   Push $R8
   DetailPrint "$R9"
   FileOpen $R8 "$CXLogPath" a
-  FileWrite $R8 "$R9$\r$\n"
+  FileSeek $R8 0 END
+  FileWriteUTF16LE $R8 "$R9$\r$\n"
   FileClose $R8
   Pop $R8
   Pop $R9
@@ -267,6 +269,21 @@ Function CXValidateDestination
       Push "旧版安装目录记录不完整，已停止安装。 / The legacy directory record is incomplete."
       Call CXFail
     ${EndIf}
+    StrCpy $CXReservedPath $1
+    StrCpy $2 $0 5
+    ${If} $2 == "Path_"
+      ; Re-resolve the old lexical name as well: a junction may have changed
+      ; since cancellation. Keep the originally saved Real_ guard too.
+      StrCpy $CXPathInput $CXReservedPath
+      Call CXCanonicalDirectory
+      StrLen $2 $CXPathResult
+      StrCpy $3 $CXDestinationReal $2
+      ${If} $3 == $CXPathResult
+        Push "新版本不能安装到旧目录指向的位置。请选择独立目录。 / The chosen path resolves inside a legacy installation directory."
+        Call CXFail
+      ${EndIf}
+    ${EndIf}
+    StrCpy $1 $CXReservedPath
     StrLen $2 $1
     StrCpy $3 $CXDestinationFull $2
     StrCpy $4 $CXDestinationReal $2
@@ -291,7 +308,7 @@ Function CXInitialize
   IfErrors 0 +3
     MessageBox MB_ICONSTOP "无法创建安装日志。请检查当前用户目录的写入权限。 / Cannot create installer log."
     Quit
-  FileWrite $2 'Codex-X ${VERSION}: current-user installer$\r$\n'
+  FileWriteUTF16LE /BOM $2 'Codex-X ${VERSION}: current-user installer, NSIS x86 Unicode, target ${ARCH}$\r$\n'
   FileClose $2
   ; The actual wait is in EarlyChecks on the installation worker thread. Keep
   ; the handle now so a recycled PID cannot make us wait on an unrelated app.
@@ -334,6 +351,8 @@ Function CXDetectLegacyMsi
   StrCpy $CXLegacyProduct ""
   StrCpy $CXLegacyVersion ""
   System::Call 'msi::MsiEnumRelatedProductsW(w "${CODEXX_LEGACY_UPGRADE_CODE}",i 0,i 0,w .r0)i.r1'
+  Push "MSI enum: result=$1, product=$0, upgrade=${CODEXX_LEGACY_UPGRADE_CODE}"
+  Call CXLog
   ${If} $1 = 259
     Return
   ${EndIf}
@@ -345,6 +364,8 @@ Function CXDetectLegacyMsi
   ; Only the shipped, machine-wide MSI is supported for automatic migration.
   ; Query its machine context explicitly, including with alternate UAC creds.
   System::Call 'msi::MsiGetProductInfoExW(w "$CXLegacyProduct",p 0,i 4,w "VersionString",w .r0,*i ${NSIS_MAX_STRLEN})i.r1'
+  Push "MSI machine-context version: result=$1, version=$0, product=$CXLegacyProduct"
+  Call CXLog
   ${If} $1 != 0
     Push "旧版安装信息不完整 (Windows $1)。请先在系统设置中卸载旧版 Codex-X，再运行此安装包。 / Previous installation could not be verified."
     Call CXFail
