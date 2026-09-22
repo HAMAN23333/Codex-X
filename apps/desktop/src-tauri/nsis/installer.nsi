@@ -109,8 +109,16 @@ Var CXOldProcess
 Var CXWaitTicks
 Var CXExitCode
 Var CXMigrations
-Var CXBootIdentity
-!define CX_MIGRATION_KEY "Software\${MANUFACTURER}\${PRODUCTNAME}\Installer"
+Var CXLegacyDirectory
+Var CXPathInput
+Var CXPathFull
+Var CXPathSuffix
+Var CXPathResult
+Var CXPathDepth
+Var CXDestinationFull
+Var CXDestinationReal
+Var CXDirectoryIndex
+!define CX_DIRECTORY_KEY "Software\${MANUFACTURER}\${PRODUCTNAME} Installer\LegacyDirectories"
 
 Function CXLog
   Exch $R9
@@ -133,19 +141,144 @@ Function CXFail
   Quit
 FunctionEnd
 
-Function CXGetBootIdentity
-  ; Win32_OperatingSystem.LastBootUpTime is the documented Windows boot time.
-  ; Called only for one-time MSI migration / a pending migration, never during
-  ; ordinary NSIS updates. The bounded query cannot hang the installer.
-  nsExec::ExecToStack /TIMEOUT=15000 `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "try { [Console]::Write((Get-CimInstance -ClassName Win32_OperatingSystem -OperationTimeoutSec 10 -ErrorAction Stop).LastBootUpTime.ToFileTimeUtc()) } catch { exit 1 }"`
-  Pop $0
-  Pop $1
-  ${If} $0 != "0"
-  ${OrIf} $1 == ""
-    Push "无法确认 Windows 重启状态。请重启后重试，或联系支持并提供安装日志。 / Cannot verify the Windows boot state. Restart and retry."
+Function CXCanonicalDirectory
+  ; Resolve the nearest existing ancestor through a real directory handle.
+  ; Volume GUID names unify drive letters, junctions, symbolic links and 8.3
+  ; aliases. Append only the normalized, non-existent suffix afterwards.
+  System::Call 'shlwapi::PathIsRelativeW(w "$CXPathInput")i.r0'
+  ${If} $0 != 0
+    Push "安装目录必须是完整路径。 / An absolute installation path is required."
     Call CXFail
   ${EndIf}
-  StrCpy $CXBootIdentity $1
+  ClearErrors
+  GetFullPathName $CXPathFull "$CXPathInput"
+  ${If} ${Errors}
+    Push "无法读取安装目录。 / Cannot resolve the installation directory."
+    Call CXFail
+  ${EndIf}
+  StrLen $0 $CXPathFull
+  StrCpy $1 $CXPathFull 1 -1
+  ${If} $0 > 3
+  ${AndIf} $1 == "\"
+    StrCpy $CXPathFull $CXPathFull -1
+  ${EndIf}
+  StrCpy $CXPathSuffix ""
+  StrCpy $CXPathDepth 0
+  cx_resolve_ancestor:
+    System::Call 'kernel32::CreateFileW(w "$CXPathFull",i 0,i 7,p 0,i 3,i 0x02000000,p 0)p.r0 ?e'
+    Pop $1
+    ${If} $0 != -1
+      System::Call 'kernel32::GetFinalPathNameByHandleW(p r0,w .r2,i ${NSIS_MAX_STRLEN},i 1)i.r3'
+      System::Call 'kernel32::CloseHandle(p r0)'
+      ${If} $3 = 0
+      ${OrIf} $3 >= ${NSIS_MAX_STRLEN}
+        Push "无法确认安装目录的实际位置。请选择本机上的其他目录。 / Cannot verify the real directory; choose another local path."
+        Call CXFail
+      ${EndIf}
+      StrCpy $4 $2 1 -1
+      ${If} $4 == "\"
+        StrCpy $2 $2 -1
+      ${EndIf}
+      StrCpy $CXPathResult "$2$CXPathSuffix\"
+      Return
+    ${EndIf}
+    ${If} $1 != 2
+    ${AndIf} $1 != 3
+      Push "无法访问安装目录 (Windows $1)。请选择本机上的其他目录。 / Cannot access the installation directory."
+      Call CXFail
+    ${EndIf}
+    ${GetParent} "$CXPathFull" $2
+    ${GetFileName} "$CXPathFull" $3
+    ${If} $2 == ""
+    ${OrIf} $2 == $CXPathFull
+    ${OrIf} $3 == ""
+      Push "无法确认安装目录的上级位置。 / Cannot resolve the installation directory's parent."
+      Call CXFail
+    ${EndIf}
+    StrCpy $CXPathSuffix "\$3$CXPathSuffix"
+    StrCpy $CXPathFull $2
+    ; GetParent of C:\child can return C:, which is drive-relative to Win32.
+    StrLen $0 $CXPathFull
+    ${If} $0 = 2
+      StrCpy $CXPathFull "$CXPathFull\"
+    ${EndIf}
+    IntOp $CXPathDepth $CXPathDepth + 1
+    ${If} $CXPathDepth > 256
+      Push "安装路径层级过深。 / Installation path is too deeply nested."
+      Call CXFail
+    ${EndIf}
+    Goto cx_resolve_ancestor
+FunctionEnd
+
+Function CXRememberLegacyDirectory
+  System::Call 'msi::MsiGetProductInfoExW(w "$CXLegacyProduct",p 0,i 4,w "InstallLocation",w .r0,*i ${NSIS_MAX_STRLEN})i.r1'
+  ${If} $1 != 0
+  ${OrIf} $0 == ""
+    Push "无法读取旧版安装目录。请先在系统设置中卸载旧版，再安装新版本。 / Cannot verify the legacy installation directory."
+    Call CXFail
+  ${EndIf}
+  System::Call 'shlwapi::PathIsRelativeW(w r0)i.r1'
+  ${If} $1 != 0
+    Push "旧版安装目录不是有效的完整路径，已停止迁移。 / The legacy installation path is not absolute."
+    Call CXFail
+  ${EndIf}
+  GetFullPathName $CXLegacyDirectory "$0"
+  StrCpy $0 $CXLegacyDirectory 1 -1
+  ${If} $0 != "\"
+    StrCpy $CXLegacyDirectory "$CXLegacyDirectory\"
+  ${EndIf}
+  StrCpy $CXPathInput $CXLegacyDirectory
+  Call CXCanonicalDirectory
+  ; Retain both lexical and resolved names. A later junction change must not
+  ; redirect a delayed removal from the old lexical path into the new app.
+  ; Kept outside the normal uninstall key so an interrupted/retried migration
+  ; cannot forget these reserved paths. These values contain paths, no secrets.
+  ClearErrors
+  WriteRegStr HKCU "${CX_DIRECTORY_KEY}" "Path_$CXLegacyProduct" $CXLegacyDirectory
+  WriteRegStr HKCU "${CX_DIRECTORY_KEY}" "Real_$CXLegacyProduct" $CXPathResult
+  ${If} ${Errors}
+    Push "无法保存旧版安装目录，未卸载旧版。 / Cannot save the legacy directory for safe migration."
+    Call CXFail
+  ${EndIf}
+FunctionEnd
+
+Function CXValidateDestination
+  ; No filesystem scan is needed for normal fresh installs without history.
+  EnumRegValue $0 HKCU "${CX_DIRECTORY_KEY}" 0
+  ${If} $0 == ""
+    Return
+  ${EndIf}
+  GetFullPathName $CXDestinationFull "$INSTDIR"
+  StrCpy $0 $CXDestinationFull 1 -1
+  ${If} $0 != "\"
+    StrCpy $CXDestinationFull "$CXDestinationFull\"
+  ${EndIf}
+  StrCpy $CXPathInput $CXDestinationFull
+  Call CXCanonicalDirectory
+  StrCpy $CXDestinationReal $CXPathResult
+  StrCpy $CXDirectoryIndex 0
+  cx_check_reserved:
+    EnumRegValue $0 HKCU "${CX_DIRECTORY_KEY}" $CXDirectoryIndex
+    ${If} $0 == ""
+      Return
+    ${EndIf}
+    ReadRegStr $1 HKCU "${CX_DIRECTORY_KEY}" "$0"
+    ${If} $1 == ""
+      Push "旧版安装目录记录不完整，已停止安装。 / The legacy directory record is incomplete."
+      Call CXFail
+    ${EndIf}
+    StrLen $2 $1
+    StrCpy $3 $CXDestinationFull $2
+    StrCpy $4 $CXDestinationReal $2
+    ; NSIS StrCmp / LogicLib == are case insensitive. All names end in '\',
+    ; so sibling folders such as Codex-X-New do not falsely match Codex-X.
+    ${If} $3 == $1
+    ${OrIf} $4 == $1
+      Push "新版本需要安装到独立目录。请使用默认用户目录，不要选择旧版目录或它的子目录。 / Choose a separate directory, not the legacy MSI directory or its children."
+      Call CXFail
+    ${EndIf}
+    IntOp $CXDirectoryIndex $CXDirectoryIndex + 1
+    Goto cx_check_reserved
 FunctionEnd
 
 Function CXInitialize
@@ -192,15 +325,6 @@ Function CXInitialize
       Call CXFail
     ${EndIf}
   ${EndIf}
-  ReadRegStr $5 HKCU "${CX_MIGRATION_KEY}" "PendingBoot"
-  ${If} $5 != ""
-    Call CXGetBootIdentity
-    ${If} $CXBootIdentity == $5
-      Push "上次旧版迁移尚需 Windows 重启。请重启后再运行安装包。 / Restart Windows before continuing the previous MSI migration."
-      Call CXFail
-    ${EndIf}
-    DeleteRegValue HKCU "${CX_MIGRATION_KEY}" "PendingBoot"
-  ${EndIf}
   Call CXDetectLegacyMsi
 FunctionEnd
 
@@ -226,6 +350,7 @@ Function CXDetectLegacyMsi
     Call CXFail
   ${EndIf}
   StrCpy $CXLegacyVersion $0
+  Call CXRememberLegacyDirectory
   nsis_tauri_utils::SemverCompare "${VERSION}" $CXLegacyVersion
   Pop $0
   ${If} $0 = -1
@@ -300,16 +425,7 @@ Function CXMigrateLegacyMsi
     Push "发现异常的旧版安装记录，已停止安装。 / Too many legacy registrations; migration stopped."
     Call CXFail
   ${EndIf}
-  Call CXGetBootIdentity
-  ; Write before removal so cancellation of this process cannot lose the
-  ; reboot barrier after MSI has scheduled file deletion. Known clean outcomes
-  ; below clear it. Logging off alone does not bypass the boot-time check.
-  ClearErrors
-  WriteRegStr HKCU "${CX_MIGRATION_KEY}" "PendingBoot" $CXBootIdentity
-  ${If} ${Errors}
-    Push "无法保存旧版迁移状态，未卸载旧版。 / Cannot save the migration recovery state."
-    Call CXFail
-  ${EndIf}
+  Call CXValidateDestination
   SetDetailsView show
   Push "正在迁移旧版 $CXLegacyVersion（仅本次需要管理员授权）。 / Migrating the previous MSI installation; administrator approval is needed once."
   Call CXLog
@@ -329,7 +445,6 @@ Function CXMigrateLegacyMsi
   System::Free $0
   ${If} $1 = 0
   ${OrIf} $4 = 0
-    DeleteRegValue HKCU "${CX_MIGRATION_KEY}" "PendingBoot"
     Push "未完成管理员授权 (Windows $2)，旧版保持不变。请重新运行安装包并允许卸载旧版。 / Administrator approval was not completed."
     Call CXFail
   ${EndIf}
@@ -371,12 +486,10 @@ Function CXMigrateLegacyMsi
       Call CXFail
     ${EndIf}
     ${If} $CXExitCode = 1618
-      DeleteRegValue HKCU "${CX_MIGRATION_KEY}" "PendingBoot"
       Push "Windows 正在安装其他软件。请等待它完成，再重新运行 Codex-X 安装包。 / Another Windows installation is running. Wait for it to finish and retry."
       Call CXFail
     ${EndIf}
     ${If} $CXExitCode = 1602
-      DeleteRegValue HKCU "${CX_MIGRATION_KEY}" "PendingBoot"
       Push "已取消旧版卸载，未安装新版本。 / Previous-version removal was cancelled."
       Call CXFail
     ${EndIf}
@@ -385,19 +498,17 @@ Function CXMigrateLegacyMsi
       Push "旧版卸载失败 (Windows $CXExitCode)，未安装新版本。请查看安装日志。 / MSI removal failed; no second installation was created."
       Call CXFail
     ${EndIf}
-    ${If} $CXExitCode = 3010
-      ; Conservatively require completion after reboot before a new install.
-      ; Never risk the old MSI's pending removals deleting the new app.
-      Push "旧版已移除，但 Windows 需要重启。请重启后重新运行安装包；不会自动重启。 / Restart Windows, then run this installer again."
-      Call CXFail
-    ${EndIf}
     ; Verify the exact product really disappeared before touching new files.
     System::Call 'msi::MsiGetProductInfoExW(w "$CXLegacyProduct",p 0,i 4,w "VersionString",w .r0,*i ${NSIS_MAX_STRLEN})i.r1'
     ${If} $1 != 1605
       Push "Windows 仍保留旧版安装记录，已停止安装以避免重复。 / Previous MSI is still registered; migration stopped."
       Call CXFail
     ${EndIf}
-    DeleteRegValue HKCU "${CX_MIGRATION_KEY}" "PendingBoot"
+    Call CXValidateDestination
+    ${If} $CXExitCode = 3010
+      Push "旧版卸载完成；Windows 将稍后清理旧目录中的残留文件。新版本安装在独立目录，可继续使用，无需立即重启。 / Legacy cleanup is deferred; the new app can run from its separate directory."
+      Call CXLog
+    ${EndIf}
     Push "旧版 MSI 已安全移除。 / Previous MSI removed."
     Call CXLog
     Goto cx_migrate_next
@@ -801,6 +912,7 @@ FunctionEnd
 Section EarlyChecks
   Call CXWaitForOldApp
   Call CXWaitForRunningApp
+  Call CXValidateDestination
   Call CXMigrateLegacyMsi
   ; Abort silent installer if downgrades is disabled
   !if "${ALLOWDOWNGRADES}" == "false"
@@ -913,6 +1025,7 @@ Section WebView2
 SectionEnd
 
 Section Install
+  Call CXValidateDestination
   SetOutPath $INSTDIR
 
   !ifmacrodef NSIS_HOOK_PREINSTALL

@@ -18,6 +18,8 @@ using System.Text;
 public static class CodexXMsiSmoke {
   [DllImport("msi.dll", CharSet = CharSet.Unicode)]
   public static extern uint MsiEnumRelatedProducts(string code, uint reserved, uint index, StringBuilder product);
+  [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+  public static extern uint MsiGetProductInfoEx(string code, string sid, uint context, string property, StringBuilder value, ref uint length);
 }
 '@
 function Related-Products {
@@ -81,18 +83,6 @@ try {
   Assert-Installed
   Invoke-Installer $Installer '/S /UPDATE'
   Assert-Installed
-  # A 3010/incomplete migration barrier must survive immediate retries. Once
-  # the boot identity differs, it must be cleared and allow the install.
-  $pendingKey = 'HKCU:\Software\yynxxxxx\Codex-X\Installer'
-  New-Item -Force $pendingKey | Out-Null
-  $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToFileTimeUtc().ToString()
-  Set-ItemProperty $pendingKey PendingBoot $boot
-  Invoke-Installer $Installer '/S /UPDATE' 1
-  Assert-Installed
-  Set-ItemProperty $pendingKey PendingBoot 'previous-boot-smoke-fixture'
-  Invoke-Installer $Installer '/S /UPDATE'
-  if ((Get-ItemProperty $pendingKey -ErrorAction SilentlyContinue).PendingBoot) { throw 'Previous-boot marker was not cleared.' }
-  Assert-Installed
   Remove-TestNsis
 
   Write-Host 'Scenario 2: released v0.3.20 machine MSI -> current-user NSIS -> NSIS update.'
@@ -101,13 +91,65 @@ try {
   if ((Get-FileHash $legacyMsi -Algorithm SHA256).Hash.ToLowerInvariant() -ne $LegacySha256) { throw 'Released MSI hash mismatch.' }
   Invoke-Installer (Join-Path $env:SystemRoot 'System32\msiexec.exe') "/i `"$legacyMsi`" /qn /norestart /L*v `"$Work\legacy-install.log`""
   if ($LegacyProductCode -notin @(Related-Products)) { throw 'The genuine legacy MSI did not register.' }
-  # Deliberately keep the real MSI's HKCU manufacturer path to verify that the
-  # NSIS installer does not inherit a legacy Program Files directory.
+  $oldDirectory = [Text.StringBuilder]::new(1024)
+  [uint32]$oldDirectoryLength = 1024
+  $status = [CodexXMsiSmoke]::MsiGetProductInfoEx($LegacyProductCode, $null, 4, 'InstallLocation', $oldDirectory, [ref]$oldDirectoryLength)
+  if ($status -ne 0 -or $oldDirectory.Length -eq 0) { throw 'Could not read actual legacy MSI InstallLocation.' }
+  $oldPath = $oldDirectory.ToString().TrimEnd('\')
+  $oldExe = Join-Path $oldPath 'codex-x.exe'
+  $oldHash = (Get-FileHash $oldExe).Hash
+  # Guard the old directory, a non-existent child, and a junction alias. None
+  # may remove the registered MSI or overwrite its files.
+  Invoke-Installer $Installer "/S /UPDATE /D=$oldPath" 1
+  Invoke-Installer $Installer "/S /UPDATE /D=$oldPath\unsafe-child" 1
+  $alias = Join-Path $Work 'legacy-junction'
+  New-Item -ItemType Junction -Path $alias -Target $oldPath | Out-Null
+  try {
+    Invoke-Installer $Installer "/S /UPDATE /D=$alias\unsafe-child" 1
+  } finally {
+    [IO.Directory]::Delete($alias)
+  }
+  if ($LegacyProductCode -notin @(Related-Products) -or (Get-FileHash $oldExe).Hash -ne $oldHash) {
+    throw 'A refused overlapping installation changed the legacy app.'
+  }
+  # Keep the real MSI's HKCU manufacturer path to verify that NSIS does not
+  # inherit Program Files when the user accepts the default directory.
   Invoke-Installer $Installer '/S /UPDATE'
   Assert-Installed
   Invoke-Installer $Installer '/S /UPDATE'
   Assert-Installed
-  Write-Host 'Windows installation smoke tests passed; configuration sentinels unchanged.'
+  Remove-TestNsis
+
+  Write-Host 'Scenario 3: MSI returns 3010 after removal; separate NSIS install continues without reboot.'
+  # A separate fixture copy of the hash-verified released MSI requests a reboot
+  # only after REMOVE=ALL. /norestart prevents any OS reboot. This exercises the
+  # genuine Windows Installer 3010 result, not a mocked installer exit code.
+  $rebootMsi = Join-Path $Work 'legacy-deferred-cleanup-fixture.msi'
+  Copy-Item $legacyMsi $rebootMsi
+  $msiAutomation = New-Object -ComObject WindowsInstaller.Installer
+  $database = $msiAutomation.OpenDatabase($rebootMsi, 1)
+  $query = $database.OpenView('INSERT INTO `InstallExecuteSequence` (`Action`, `Condition`, `Sequence`) VALUES (''ScheduleReboot'', ''REMOVE="ALL"'', 6500)')
+  $query.Execute()
+  $query.Close()
+  $summary = $database.GetType().InvokeMember('SummaryInformation', [Reflection.BindingFlags]::GetProperty, $null, $database, @(1))
+  $newPackageCode = '{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'
+  [void]$summary.GetType().InvokeMember('Property', [Reflection.BindingFlags]::SetProperty, $null, $summary, @(9, $newPackageCode))
+  $summary.Persist()
+  $database.Commit()
+  foreach ($comObject in @($query, $summary, $database, $msiAutomation)) {
+    [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
+  }
+  Invoke-Installer (Join-Path $env:SystemRoot 'System32\msiexec.exe') "/i `"$rebootMsi`" /qn /norestart /L*v `"$Work\deferred-fixture-install.log`""
+  if ($LegacyProductCode -notin @(Related-Products)) { throw 'The deferred-cleanup MSI fixture did not register.' }
+  $beforeMigration = Get-Date
+  Invoke-Installer $Installer '/S /UPDATE'
+  Assert-Installed
+  $migrationLogs = @(Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Codex-X-updates\logs') -Filter 'install-*.log' |
+    Where-Object { $_.LastWriteTime -ge $beforeMigration -and $_.Name -notlike '*-msi-*' })
+  if (-not ($migrationLogs | Select-String -SimpleMatch 'MSI exit code: 3010')) { throw 'The deferred-cleanup scenario did not actually exercise MSI exit 3010.' }
+  Invoke-Installer $Installer '/S /UPDATE'
+  Assert-Installed
+  Write-Host 'Windows installation smoke tests passed; no reboot needed, configuration sentinels unchanged.'
 } finally {
   Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Codex-X-updates\logs') -Filter 'install-*.log' -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "--- $($_.Name) ---"
